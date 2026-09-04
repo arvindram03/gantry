@@ -24,7 +24,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 
 # Explicit naming so Alembic autogenerates stable constraint names.
 metadata = MetaData(
@@ -158,4 +158,23 @@ audit_log = Table(
     Column("detail", JSONB, nullable=False),
     Column("occurred_at", TIMESTAMP, nullable=False),
     Index("ix_audit_log_time", "occurred_at"),
+)
+
+
+tasks = Table(
+    "tasks",
+    metadata,
+    Column("operation", String(253), primary_key=True),
+    Column("node_id", String(64), primary_key=True),
+    Column("plan_version", Integer, nullable=False),
+    Column("depends_on", ARRAY(String), nullable=False, server_default="{}"),
+    Column("state", String(32), nullable=False),
+    Column("attempts", Integer, nullable=False, server_default="0"),
+    Column("lease_owner", String(128), nullable=True),
+    # A lease is the only thing standing between a dead worker and a stuck
+    # task: when it expires the task returns to the queue on its own.
+    Column("lease_expires_at", TIMESTAMP, nullable=True),
+    Column("last_error", Text, nullable=True),
+    ForeignKeyConstraint(["operation"], ["operations.name"], name="fk_tasks_operation"),
+    Index("ix_tasks_leasable", "operation", "state"),
 )

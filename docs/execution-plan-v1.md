@@ -146,7 +146,7 @@ The cost is real and I am not going to hide it. Four weeks does not buy four abs
 
 ### Day 5 — Mon+4 · Simulator over both operation types · **M0 review**
 
-- `WorkflowBackend` + Postgres leased queue: `SELECT ... FOR UPDATE SKIP LOCKED`, lease expiry with reclaim, at-least-once dispatch, bounded retries with jittered backoff.
+- `WorkflowBackend` with an in-memory implementation defining the leasing rules and a Postgres one reproducing them: `SELECT ... FOR UPDATE SKIP LOCKED`, lease expiry with reclaim, at-least-once dispatch, bounded retries, quarantine on exhaustion. Dependency readiness is evaluated in the same statement as the claim — checking first and claiming second leaves a window where a dependency regresses in between.
 - Fake source/target/engine adapters with **injectable faults**: worker crash, duplicate delivery, slow target, commit-then-crash-before-checkpoint (§8.7's hardest case), validation failure, verification failure.
 - Simulator runs **a fake Movement and a fake Analysis through the same lifecycle**, each producing a Result with populated provenance.
 
@@ -154,7 +154,9 @@ The cost is real and I am not going to hide it. Four weeks does not buy four abs
 
 > **If Analysis needs its own bespoke path through the engine, stop and refactor here.** That divergence costs a day now and a week on Day 16.
 
-**Decision point:** keep the leased queue or adopt Temporal.
+**M0 outcome — passed.** Both operation types complete through one engine with no bespoke path for Analysis. A worker killed after commit and before checkpoint replays and leaves one effect, not two. A verification failure yields `VERIFICATION_FAILED` with evidence rather than a crash.
+
+**Decision — the leased queue stays; Temporal is not adopted.** It satisfies leasing, expiry, reclaim, bounded retries and quarantine in ~150 lines of Postgres, and concurrent workers provably never receive the same task. Temporal would cost 2–3 days now to buy durable timers and long-running workflow state that nothing needs until the Migration workflow's rollback window in v1.1. The `WorkflowBackend` Protocol keeps the swap bounded. **Re-examine at Day 10 and no later** — after that, CDC and the adaptive controller lean on the scheduler.
 
 ---
 
