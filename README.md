@@ -1,8 +1,5 @@
 <p align="center">
-  <img
-    src="https://raw.githubusercontent.com/arvindram03/gantry/main/docs/assets/gantry-logo-512.jpg"
-    alt="Gantry"
-    width="260">
+  <img src="docs/assets/gantry-logo-512.jpg" alt="Gantry" width="260">
 </p>
 
 <p align="center">
