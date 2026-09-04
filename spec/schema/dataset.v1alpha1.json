@@ -1,0 +1,274 @@
+{
+  "$defs": {
+    "AccessBlock": {
+      "additionalProperties": false,
+      "properties": {
+        "agentPolicy": {
+          "$ref": "#/$defs/AgentAccessPolicy",
+          "default": "aggregate_or_masked"
+        }
+      },
+      "title": "AccessBlock",
+      "type": "object"
+    },
+    "AgentAccessPolicy": {
+      "description": "How much of a Dataset an agent may reach.\n\nDefault is `aggregate_or_masked`, matching the RFC's agent access defaults\n(rows deny, aggregates allow, metadata allow). Enforcement lands with the\nprogressive access ladder; the declaration lives here.",
+      "enum": [
+        "deny",
+        "aggregate_or_masked",
+        "allow"
+      ],
+      "title": "AgentAccessPolicy",
+      "type": "string"
+    },
+    "FieldBlock": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "maxLength": 253,
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "nullable": {
+          "default": true,
+          "title": "Nullable",
+          "type": "boolean"
+        },
+        "type": {
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "type"
+      ],
+      "title": "FieldBlock",
+      "type": "object"
+    },
+    "MetadataBlock": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "maxLength": 253,
+          "minLength": 1,
+          "pattern": "^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$",
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "MetadataBlock",
+      "type": "object"
+    },
+    "PhysicalBlock": {
+      "additionalProperties": false,
+      "properties": {
+        "adapter": {
+          "title": "Adapter",
+          "type": "string"
+        },
+        "estimatedBytes": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Estimatedbytes"
+        },
+        "estimatedRows": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Estimatedrows"
+        },
+        "reference": {
+          "title": "Reference",
+          "type": "string"
+        }
+      },
+      "required": [
+        "adapter",
+        "reference"
+      ],
+      "title": "PhysicalBlock",
+      "type": "object"
+    },
+    "SchemaBlock": {
+      "additionalProperties": false,
+      "description": "The manifest's `schema:` block.\n\nThe design document names the time field twice - `schema.timestamp` and\n`semantics.timeField`. `semantics.timeField` is canonical; `schema.timestamp`\nis accepted as an alias, and a conflict between the two is an error rather\nthan a silent precedence rule.",
+      "properties": {
+        "fields": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/FieldBlock"
+          },
+          "title": "Fields",
+          "type": "array"
+        },
+        "keys": {
+          "default": [],
+          "items": {
+            "maxLength": 253,
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Keys",
+          "type": "array"
+        },
+        "timestamp": {
+          "anyOf": [
+            {
+              "maxLength": 253,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Timestamp"
+        }
+      },
+      "title": "SchemaBlock",
+      "type": "object"
+    },
+    "SemanticsBlock": {
+      "additionalProperties": false,
+      "properties": {
+        "timeField": {
+          "anyOf": [
+            {
+              "maxLength": 253,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Timefield"
+        }
+      },
+      "title": "SemanticsBlock",
+      "type": "object"
+    },
+    "StatisticsBlock": {
+      "additionalProperties": false,
+      "properties": {
+        "changeRatePerSecond": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Changeratepersecond"
+        },
+        "rowCount": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Rowcount"
+        }
+      },
+      "title": "StatisticsBlock",
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "A parsed `kind: Dataset` document.",
+  "properties": {
+    "access": {
+      "$ref": "#/$defs/AccessBlock",
+      "default": {
+        "agentPolicy": "aggregate_or_masked"
+      }
+    },
+    "apiVersion": {
+      "title": "Apiversion",
+      "type": "string"
+    },
+    "kind": {
+      "const": "Dataset",
+      "title": "Kind",
+      "type": "string"
+    },
+    "metadata": {
+      "$ref": "#/$defs/MetadataBlock"
+    },
+    "physical": {
+      "$ref": "#/$defs/PhysicalBlock"
+    },
+    "schema": {
+      "$ref": "#/$defs/SchemaBlock",
+      "default": {
+        "fields": [],
+        "keys": [],
+        "timestamp": null
+      }
+    },
+    "semantics": {
+      "$ref": "#/$defs/SemanticsBlock",
+      "default": {
+        "timeField": null
+      }
+    },
+    "sensitiveFields": {
+      "default": [],
+      "items": {
+        "maxLength": 253,
+        "minLength": 1,
+        "type": "string"
+      },
+      "title": "Sensitivefields",
+      "type": "array"
+    },
+    "statistics": {
+      "$ref": "#/$defs/StatisticsBlock",
+      "default": {
+        "changeRatePerSecond": null,
+        "rowCount": null
+      }
+    }
+  },
+  "required": [
+    "apiVersion",
+    "kind",
+    "metadata",
+    "physical"
+  ],
+  "title": "Gantry Dataset",
+  "type": "object"
+}

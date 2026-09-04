@@ -1,0 +1,23 @@
+# The Postgres source table used by the v1 Movement demo.
+#
+# Discovery fills in `schema.fields` and `statistics` on Day 6; a manifest is
+# useful before then, and is versioned when discovery enriches it.
+apiVersion: gantry.dev/v1alpha1
+kind: Dataset
+
+metadata:
+  name: orders
+
+physical:
+  adapter: postgres
+  reference: public.orders
+
+schema:
+  keys:
+    - order_id
+
+semantics:
+  timeField: created_at
+
+access:
+  agentPolicy: aggregate_or_masked

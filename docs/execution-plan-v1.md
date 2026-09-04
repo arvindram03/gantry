@@ -117,7 +117,7 @@ The cost is real and I am not going to hide it. Four weeks does not buy four abs
 
 - **Shared vocabulary first** — every later module depends on these types: `Dataset`, `DatasetRef`, `Schema`, `Result`, `Provenance`, `Lineage`, `Checkpoint`, `SourcePosition`, `TimeWindow`.
 - Dataset spec per the RFC manifest: `physical` (adapter, reference, estimated rows/bytes), `schema` (time field, keys), `statistics`, `semantics`, `access.agentPolicy`, `sensitiveFields`.
-- Dataset registry backed by the metadata store: register, version, resolve by name, list. Manifests are versioned — a Result's provenance pins the manifest version it read.
+- Dataset registry behind a `DatasetRegistry` Protocol: register, version, resolve by name, list. Manifests are versioned and content-addressed, so registration is idempotent — a Result's provenance pins the version it read, and a replay that re-registers its inputs must not churn versions. **Sequencing correction:** the metadata store does not exist until Day 4, so Day 2 ships the Protocol with two implementations (in-memory for tests, JSON-file for the CLI) and Day 4 adds the Postgres one behind the same interface.
 - `gantry dataset ls | describe | register`.
 
 **Exit:** a Dataset registers, versions, and resolves by name. Manifest round-trips. `describe` returns metadata with no data access.
@@ -140,6 +140,7 @@ The cost is real and I am not going to hide it. Four weeks does not buy four abs
 - **Lifecycle engine** with six pluggable stages. Movement and Analysis register stage implementations; the engine owns sequencing, durability, retries, and the guarantee boundary.
 - Immutable, content-addressed `PlanVersion` with deterministic node IDs (stable hash) — this is what makes replay safe. §10 immutable fields cannot change without an explicit replan.
 - Optimistic concurrency so two workers cannot both advance one unit of work.
+- Postgres `DatasetRegistry` implementation behind the Day 2 Protocol, replacing the JSON-file store as the CLI default.
 
 **Exit:** golden-file test — identical input yields a byte-identical plan across runs and machines. Illegal transitions rejected. Audit row exists for every state change.
 
