@@ -10,6 +10,10 @@ name: gantry-dev
 # kafka      : CDC transport (KRaft, single node).
 # connect    : Kafka Connect + Debezium Postgres connector.
 # prometheus : scrapes the Gantry worker running on the host.
+#
+# Host ports are deliberately in a private range (154xx/19xxx) rather than
+# 5432-5435: the common range collides with other local database stacks.
+# Container-internal ports are unchanged.
 
 x-postgres-common: &postgres-common
   image: postgres:16-alpine
@@ -28,7 +32,7 @@ services:
   pg-source:
     <<: *postgres-common
     container_name: gantry-pg-source
-    ports: ["5433:5432"]
+    ports: ["15432:5432"]
     command:
       - postgres
       - -c
@@ -46,7 +50,7 @@ services:
   pg-target:
     <<: *postgres-common
     container_name: gantry-pg-target
-    ports: ["5434:5432"]
+    ports: ["15433:5432"]
     command:
       - postgres
       - -c
@@ -57,7 +61,7 @@ services:
   pg-meta:
     <<: *postgres-common
     container_name: gantry-pg-meta
-    ports: ["5435:5432"]
+    ports: ["15434:5432"]
     environment:
       POSTGRES_USER: gantry
       POSTGRES_PASSWORD: gantry
@@ -74,13 +78,13 @@ services:
     image: apache/kafka:3.8.0
     container_name: gantry-kafka
     restart: unless-stopped
-    ports: ["9092:9092"]
+    ports: ["19092:9092"]
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
-      KAFKA_LISTENERS: PLAINTEXT://:19092,CONTROLLER://:9093,EXTERNAL://:9092
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:19092,EXTERNAL://localhost:9092
+      KAFKA_LISTENERS: PLAINTEXT://:29092,CONTROLLER://:9093,EXTERNAL://:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,EXTERNAL://localhost:19092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
@@ -90,7 +94,7 @@ services:
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       CLUSTER_ID: gantry-dev-cluster-00001
     healthcheck:
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:19092 --list"]
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:29092 --list"]
       interval: 10s
       timeout: 10s
       retries: 20
@@ -100,12 +104,12 @@ services:
     image: quay.io/debezium/connect:2.7
     container_name: gantry-connect
     restart: unless-stopped
-    ports: ["8083:8083"]
+    ports: ["18083:8083"]
     depends_on:
       kafka: { condition: service_healthy }
       pg-source: { condition: service_healthy }
     environment:
-      BOOTSTRAP_SERVERS: kafka:19092
+      BOOTSTRAP_SERVERS: kafka:29092
       GROUP_ID: gantry-connect
       CONFIG_STORAGE_TOPIC: _connect_configs
       OFFSET_STORAGE_TOPIC: _connect_offsets
@@ -124,7 +128,7 @@ services:
     image: prom/prometheus:v2.54.1
     container_name: gantry-prometheus
     restart: unless-stopped
-    ports: ["9090:9090"]
+    ports: ["19090:9090"]
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     extra_hosts:
