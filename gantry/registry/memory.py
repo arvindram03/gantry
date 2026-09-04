@@ -24,7 +24,7 @@ class InMemoryDatasetRegistry:
         self._clock: Callable[[], datetime] = clock or _utc_now
         self._versions: dict[str, list[DatasetVersion]] = {}
 
-    def register(self, manifest: DatasetManifest) -> DatasetVersion:
+    async def register(self, manifest: DatasetManifest) -> DatasetVersion:
         history = self._versions.setdefault(manifest.name, [])
         if history and history[-1].content_hash == manifest.content_hash:
             return history[-1]
@@ -39,7 +39,7 @@ class InMemoryDatasetRegistry:
         history.append(version)
         return version
 
-    def get(self, ref: DatasetRef) -> DatasetVersion:
+    async def get(self, ref: DatasetRef) -> DatasetVersion:
         history = self._versions.get(ref.name)
         if not history:
             raise DatasetNotFoundError(ref.name)
@@ -49,11 +49,11 @@ class InMemoryDatasetRegistry:
             raise DatasetVersionNotFoundError(ref.name, ref.version, len(history))
         return history[ref.version - 1]
 
-    def versions(self, name: str) -> Sequence[DatasetVersion]:
+    async def versions(self, name: str) -> Sequence[DatasetVersion]:
         history = self._versions.get(name)
         if not history:
             raise DatasetNotFoundError(name)
         return tuple(history)
 
-    def list(self) -> Sequence[DatasetVersion]:
+    async def list(self) -> Sequence[DatasetVersion]:
         return tuple(history[-1] for _, history in sorted(self._versions.items()))

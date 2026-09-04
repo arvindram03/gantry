@@ -26,7 +26,9 @@ S = OperationState
 _TRANSITIONS: dict[OperationState, frozenset[OperationState]] = {
     S.DRAFT: frozenset({S.PLANNED, S.FAILED}),
     S.PLANNED: frozenset({S.GENERATED, S.FAILED, S.PAUSED}),
-    S.GENERATED: frozenset({S.VALIDATED, S.FAILED, S.PAUSED}),
+    # DRAFT is reachable from here because a validation failure is repairable
+    # input for a planner, not a dead end.
+    S.GENERATED: frozenset({S.VALIDATED, S.DRAFT, S.FAILED, S.PAUSED}),
     # Validation failure is a normal outcome that feeds agentic repair, so it
     # returns to DRAFT rather than dead-ending.
     S.VALIDATED: frozenset({S.EXECUTING, S.DRAFT, S.FAILED, S.PAUSED}),

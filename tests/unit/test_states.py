@@ -125,7 +125,7 @@ def test_every_state_has_a_transition_entry() -> None:
 
 def test_no_transition_targets_draft_except_repair() -> None:
     origins = {state for state in S if S.DRAFT in allowed_transitions(state)}
-    assert origins == {S.VALIDATED}
+    assert origins == {S.GENERATED, S.VALIDATED}
 
 
 def test_agents_are_a_recognised_actor_but_not_a_special_case() -> None:

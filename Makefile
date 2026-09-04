@@ -1,7 +1,7 @@
 .DEFAULT_GOAL := help
 COMPOSE := docker compose -f deploy/docker/docker-compose.yml
 
-.PHONY: help install check fmt lint type test test-int test-chaos dev-up dev-down dev-logs seed clean
+.PHONY: help install check fmt lint type test test-int test-chaos migrate dev-up dev-down dev-logs seed clean
 
 help: ## Show available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "};{printf "  \033[36m%-12s\033[0m %s\n",$$1,$$2}'
@@ -26,7 +26,10 @@ type: ## Typecheck (strict)
 test: ## Unit tests
 	uv run pytest
 
-test-int: dev-up ## Integration tests against the local stack
+migrate: ## Apply metadata store migrations
+	uv run alembic upgrade head
+
+test-int: dev-up migrate ## Integration tests against the local stack
 	uv run pytest -m integration
 
 test-chaos: dev-up ## Fault-injection tests

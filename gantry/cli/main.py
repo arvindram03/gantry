@@ -6,6 +6,7 @@ reads as a build checklist rather than pretending to work.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
 from typing import Annotated
@@ -153,11 +154,11 @@ def dataset_register(spec: SpecArg, registry: RegistryOpt = None) -> None:
 
     store = _registry(registry)
     try:
-        before = len(store.versions(manifest.name))
+        before = len(asyncio.run(store.versions(manifest.name)))
     except RegistryError:
         before = 0
 
-    registered = store.register(manifest)
+    registered = asyncio.run(store.register(manifest))
     verb = "unchanged" if registered.version == before else "registered"
     console.print(
         f"[green]{verb}[/green] {registered.name}@{registered.version} "
@@ -168,7 +169,7 @@ def dataset_register(spec: SpecArg, registry: RegistryOpt = None) -> None:
 @dataset_app.command("ls")
 def dataset_ls(registry: RegistryOpt = None) -> None:
     """List registered Datasets, showing the latest version of each."""
-    entries = _registry(registry).list()
+    entries = asyncio.run(_registry(registry).list())
     if not entries:
         console.print("[dim]no datasets registered[/dim]")
         return
@@ -200,7 +201,7 @@ def dataset_describe(
     no data is read.
     """
     try:
-        entry = _registry(registry).get(_parse_ref(name))
+        entry = asyncio.run(_registry(registry).get(_parse_ref(name)))
     except RegistryError as exc:
         _fail(str(exc))
         return
@@ -214,7 +215,7 @@ def dataset_versions(
 ) -> None:
     """List every version of one Dataset."""
     try:
-        history = _registry(registry).versions(name)
+        history = asyncio.run(_registry(registry).versions(name))
     except RegistryError as exc:
         _fail(str(exc))
         return

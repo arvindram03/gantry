@@ -6,10 +6,14 @@ cannot truncate the registry - the same rule the durable store will follow, at
 a much smaller scale.
 
 Single-process only: there is no locking. Concurrency arrives with Postgres.
+
+File access runs in a worker thread so this store can sit behind the same async
+interface as the durable one without blocking the event loop.
 """
 
 from __future__ import annotations
 
+import asyncio
 import builtins
 import json
 import os
@@ -41,8 +45,8 @@ class JsonFileDatasetRegistry:
     def path(self) -> Path:
         return self._path
 
-    def register(self, manifest: DatasetManifest) -> DatasetVersion:
-        store = self._load()
+    async def register(self, manifest: DatasetManifest) -> DatasetVersion:
+        store = await asyncio.to_thread(self._load)
         history = store.setdefault(manifest.name, [])
         if history and history[-1].content_hash == manifest.content_hash:
             return history[-1]
@@ -55,11 +59,12 @@ class JsonFileDatasetRegistry:
             registered_at=self._clock(),
         )
         history.append(version)
-        self._save(store)
+        await asyncio.to_thread(self._save, store)
         return version
 
-    def get(self, ref: DatasetRef) -> DatasetVersion:
-        history = self._load().get(ref.name)
+    async def get(self, ref: DatasetRef) -> DatasetVersion:
+        store = await asyncio.to_thread(self._load)
+        history = store.get(ref.name)
         if not history:
             raise DatasetNotFoundError(ref.name)
         if ref.version is None:
@@ -68,14 +73,16 @@ class JsonFileDatasetRegistry:
             raise DatasetVersionNotFoundError(ref.name, ref.version, len(history))
         return history[ref.version - 1]
 
-    def versions(self, name: str) -> Sequence[DatasetVersion]:
-        history = self._load().get(name)
+    async def versions(self, name: str) -> Sequence[DatasetVersion]:
+        store = await asyncio.to_thread(self._load)
+        history = store.get(name)
         if not history:
             raise DatasetNotFoundError(name)
         return tuple(history)
 
-    def list(self) -> Sequence[DatasetVersion]:
-        return tuple(history[-1] for _, history in sorted(self._load().items()))
+    async def list(self) -> Sequence[DatasetVersion]:
+        store = await asyncio.to_thread(self._load)
+        return tuple(history[-1] for _, history in sorted(store.items()))
 
     def _load(self) -> dict[str, builtins.list[DatasetVersion]]:
         if not self._path.is_file():

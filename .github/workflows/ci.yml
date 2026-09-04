@@ -40,6 +40,8 @@ jobs:
       - run: uv sync --all-extras
       - name: Start stack
         run: docker compose -f deploy/docker/docker-compose.yml up -d --wait
+      - name: Apply migrations
+        run: uv run alembic upgrade head
       - run: uv run pytest -m integration
       - name: Chaos tests
         run: uv run pytest -m chaos
