@@ -17,8 +17,9 @@ from enum import StrEnum
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from gantry.core.names import ResourceName
+from gantry.core.verification import VerificationRequirement
 from gantry.spec.apiversion import CANONICAL_API_VERSION, normalize_api_version
-from gantry.spec.verification import VerificationRequirement, normalize_requirements
+from gantry.spec.verification import normalize_requirements
 
 
 class OperationKind(StrEnum):

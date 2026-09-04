@@ -18,8 +18,17 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from gantry.analysis.model import Analysis as DomainAnalysis
+from gantry.analysis.model import AnalysisLimits as DomainLimits
+from gantry.analysis.model import ExecutionEngine as DomainEngine
+from gantry.analysis.model import FieldNormalization as DomainNormalization
+from gantry.analysis.model import Join as DomainJoin
+from gantry.analysis.model import TemporalJoin as DomainTemporalJoin
+from gantry.analysis.model import TemporalJoinStrategy as DomainTemporalStrategy
 from gantry.core.durations import DurationError, parse_duration
 from gantry.core.names import FieldName, ResourceName
+from gantry.core.sizes import parse_byte_size
+from gantry.core.timewindow import TimeWindow
 from gantry.spec.operation import LimitsBlock, OperationSpec
 
 KIND = "Analysis"
@@ -228,3 +237,67 @@ class AnalysisSpec(OperationSpec):
     @property
     def input_names(self) -> tuple[str, ...]:
         return tuple(item.dataset for item in self.inputs)
+
+    def to_analysis(self) -> DomainAnalysis:
+        """Convert to the domain model the compiler and planner work against.
+
+        The same seam as `MovementSpec.to_movement`: spec field names stop here.
+        """
+        window: TimeWindow | None = None
+        if self.window is not None and self.window.start is not None:
+            # Sliding windows belong to continuous mode, which v1 rejects.
+            window = TimeWindow(start=self.window.start, end=_require_end(self.window))
+
+        return DomainAnalysis(
+            name=self.metadata.name,
+            objective=None if self.objective is None else self.objective.explain,
+            inputs=self.input_names,
+            window=window,
+            normalize=tuple(
+                DomainNormalization(canonical=canonical, aliases=block.aliases)
+                for canonical, block in sorted(self.normalize.fields.items())
+            ),
+            joins=tuple(
+                DomainJoin(
+                    left=join.left,
+                    right=join.right,
+                    on=join.on,
+                    temporal=(
+                        None
+                        if join.temporal is None
+                        else DomainTemporalJoin(
+                            strategy=DomainTemporalStrategy(join.temporal.strategy.value),
+                            max_distance_seconds=(
+                                None
+                                if join.temporal.max_distance is None
+                                else int(join.temporal.max_distance.total_seconds())
+                            ),
+                        )
+                    ),
+                )
+                for join in self.joins
+            ),
+            signals=self.signals,
+            engine=DomainEngine(self.execution.engine.value),
+            verification=self.verify,
+            limits=DomainLimits(
+                max_concurrency=self.limits.max_concurrency,
+                max_retries=self.limits.max_retries,
+                max_bytes_scanned=(
+                    None
+                    if self.execution.max_bytes_scanned is None
+                    else parse_byte_size(self.execution.max_bytes_scanned)
+                ),
+                timeout_seconds=(
+                    None
+                    if self.execution.timeout is None
+                    else int(self.execution.timeout.total_seconds())
+                ),
+            ),
+        )
+
+
+def _require_end(window: WindowBlock) -> datetime:
+    if window.end is None:  # pragma: no cover - validation guarantees this
+        raise ValueError("an absolute window requires both start and end")
+    return window.end

@@ -10,6 +10,12 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
+from gantry.core.verification import (
+    JoinCoverageCheck,
+    NullRateCheck,
+    RowExpansionCheck,
+    TemporalAlignmentCheck,
+)
 from gantry.spec import (
     AnalysisSpec,
     CheckName,
@@ -22,12 +28,6 @@ from gantry.spec import (
     load_movement_spec,
     load_spec,
     spec_json_schema,
-)
-from gantry.spec.verification import (
-    JoinCoverageCheck,
-    NullRateCheck,
-    RowExpansionCheck,
-    TemporalAlignmentCheck,
 )
 
 EXAMPLES = Path(__file__).resolve().parents[2] / "spec" / "examples"

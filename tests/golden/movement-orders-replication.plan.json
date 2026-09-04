@@ -1,0 +1,132 @@
+{
+  "guarantee_fingerprint": "sha256:735a8217aca63dff96c37608dfa039dfa0e8d474465b5f451c9015947b113d60",
+  "nodes": [
+    {
+      "depends_on": [],
+      "id": "4ca00b5709c79eea",
+      "kind": "discover",
+      "params": {},
+      "scope": null,
+      "stage": "plan"
+    },
+    {
+      "depends_on": [
+        "4ca00b5709c79eea"
+      ],
+      "id": "f341b3725c57c9b9",
+      "kind": "start_cdc",
+      "params": {},
+      "scope": null,
+      "stage": "execute"
+    },
+    {
+      "depends_on": [
+        "4ca00b5709c79eea"
+      ],
+      "id": "988bb93964d83850",
+      "kind": "create_schema",
+      "params": {},
+      "scope": "customers",
+      "stage": "execute"
+    },
+    {
+      "depends_on": [
+        "988bb93964d83850"
+      ],
+      "id": "8c65d78e6b194f71",
+      "kind": "snapshot_partition",
+      "params": {
+        "partition_column": "customer_id",
+        "partition_strategy": "range",
+        "write_mode": "upsert"
+      },
+      "scope": "customers",
+      "stage": "execute"
+    },
+    {
+      "depends_on": [
+        "8c65d78e6b194f71"
+      ],
+      "id": "78e2a3763cdef2fa",
+      "kind": "verify_dataset",
+      "params": {
+        "checks": "chunk_checksum,primary_key_unique,row_count"
+      },
+      "scope": "customers",
+      "stage": "verify"
+    },
+    {
+      "depends_on": [
+        "4ca00b5709c79eea"
+      ],
+      "id": "f42a2bdfac9a15b7",
+      "kind": "create_schema",
+      "params": {},
+      "scope": "orders",
+      "stage": "execute"
+    },
+    {
+      "depends_on": [
+        "8c65d78e6b194f71",
+        "f42a2bdfac9a15b7"
+      ],
+      "id": "83d0f80995656b95",
+      "kind": "snapshot_partition",
+      "params": {
+        "partition_column": "created_at",
+        "partition_strategy": "time_range",
+        "write_mode": "upsert"
+      },
+      "scope": "orders",
+      "stage": "execute"
+    },
+    {
+      "depends_on": [
+        "83d0f80995656b95"
+      ],
+      "id": "947a64fc846a8b99",
+      "kind": "verify_dataset",
+      "params": {
+        "checks": "chunk_checksum,foreign_key_integrity,row_count"
+      },
+      "scope": "orders",
+      "stage": "verify"
+    },
+    {
+      "depends_on": [
+        "83d0f80995656b95",
+        "8c65d78e6b194f71",
+        "f341b3725c57c9b9"
+      ],
+      "id": "735b98174e887845",
+      "kind": "apply_cdc",
+      "params": {},
+      "scope": null,
+      "stage": "execute"
+    },
+    {
+      "depends_on": [
+        "735b98174e887845"
+      ],
+      "id": "51955e7261281c55",
+      "kind": "wait_for_lag",
+      "params": {},
+      "scope": null,
+      "stage": "execute"
+    },
+    {
+      "depends_on": [
+        "51955e7261281c55",
+        "78e2a3763cdef2fa",
+        "947a64fc846a8b99"
+      ],
+      "id": "f8ee6a406cbdc3bb",
+      "kind": "finalize",
+      "params": {},
+      "scope": null,
+      "stage": "result"
+    }
+  ],
+  "operation": "orders-replication",
+  "operation_type": "movement"
+}

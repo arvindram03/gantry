@@ -15,8 +15,20 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from gantry.core.durations import DurationError, parse_duration
 from gantry.core.names import FieldName, ResourceName
+from gantry.core.verification import VerificationRequirement
+from gantry.movement.model import CdcConfig as DomainCdc
+from gantry.movement.model import Endpoint as DomainEndpoint
+from gantry.movement.model import Movement as DomainMovement
+from gantry.movement.model import MovementDataset as DomainDataset
+from gantry.movement.model import MovementMode as DomainMovementMode
+from gantry.movement.model import Ordering as DomainOrdering
+from gantry.movement.model import OrderingScope as DomainOrderingScope
+from gantry.movement.model import Partitioning as DomainPartitioning
+from gantry.movement.model import PartitionStrategy as DomainPartitionStrategy
+from gantry.movement.model import RuntimeLimits as DomainLimits
+from gantry.movement.model import WriteMode as DomainWriteMode
 from gantry.spec.operation import LimitsBlock, OperationSpec
-from gantry.spec.verification import VerificationRequirement, normalize_requirements
+from gantry.spec.verification import normalize_requirements
 
 KIND = "Movement"
 
@@ -311,3 +323,72 @@ class MovementSpec(OperationSpec):
     def has_migration_blocks(self) -> bool:
         """Whether the spec carries Migration-workflow blocks on a Movement."""
         return self.cutover is not None or self.rollback is not None
+
+    def to_movement(self) -> DomainMovement:
+        """Convert to the domain model the runtime plans against.
+
+        Cutover and rollback are deliberately dropped: they are Migration
+        workflow concerns, and a Movement does not imply a cutover. This is the
+        seam that keeps spec format changeable - everything downstream sees the
+        domain model, not these field names.
+        """
+        return DomainMovement(
+            name=self.metadata.name,
+            source=DomainEndpoint(
+                adapter=self.source.adapter, connection_ref=self.source.connection_ref
+            ),
+            destination=DomainEndpoint(
+                adapter=self.destination.adapter,
+                connection_ref=self.destination.connection_ref,
+            ),
+            mode=DomainMovementMode(self.strategy.mode.value),
+            datasets=tuple(
+                DomainDataset(
+                    name=dataset.name,
+                    source=dataset.source,
+                    target=dataset.target,
+                    depends_on=dataset.depends_on,
+                    key_columns=dataset.key.columns,
+                    ordering=DomainOrdering(
+                        scope=DomainOrderingScope(dataset.ordering.scope.value),
+                        version_field=dataset.ordering.version_field,
+                    ),
+                    partitioning=(
+                        None
+                        if dataset.partitioning is None
+                        else DomainPartitioning(
+                            strategy=DomainPartitionStrategy(dataset.partitioning.strategy.value),
+                            column=dataset.partitioning.column,
+                            rows_per_partition=dataset.partitioning.rows_per_partition,
+                            interval_seconds=(
+                                None
+                                if dataset.partitioning.interval is None
+                                else int(dataset.partitioning.interval.total_seconds())
+                            ),
+                            buckets=dataset.partitioning.buckets,
+                        )
+                    ),
+                    write_mode=DomainWriteMode(dataset.write.mode.value),
+                    verification=dataset.verification.required,
+                )
+                for dataset in self.datasets
+            ),
+            cdc=(
+                None
+                if self.cdc is None
+                else DomainCdc(
+                    adapter=self.cdc.adapter,
+                    checkpoint_type=(
+                        None if self.cdc.checkpoint is None else self.cdc.checkpoint.type
+                    ),
+                )
+            ),
+            limits=DomainLimits(
+                max_concurrency=self.runtime.max_concurrency,
+                max_retries=self.runtime.max_retries,
+                source_rows_per_second=self.runtime.rate_limits.source_rows_per_second,
+                target_rows_per_second=self.runtime.rate_limits.target_rows_per_second,
+                target_cpu_max_percent=self.runtime.policies.target_cpu_max_percent,
+                source_cpu_max_percent=self.runtime.policies.source_cpu_max_percent,
+            ),
+        )

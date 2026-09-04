@@ -99,8 +99,13 @@ class DatasetManifest(BaseModel):
 
         Sorted keys and no insignificant whitespace, so the hash depends on
         content rather than on field ordering or formatting.
+
+        Defaults are excluded so the payload carries only what was actually
+        declared. That makes additive schema changes hash-stable: adding an
+        optional field to this model would otherwise change every registered
+        manifest's hash and re-version every Dataset in the registry.
         """
-        payload: dict[str, object] = self.model_dump(mode="json")
+        payload: dict[str, object] = self.model_dump(mode="json", exclude_defaults=True)
         return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
     @property

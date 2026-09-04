@@ -7,6 +7,7 @@ Movement and Analysis are siblings over a shared `OperationSpec` base, and both
 carry the same verification vocabulary.
 """
 
+from gantry.core.verification import CheckName, VerificationRequirement
 from gantry.spec.analysis import AnalysisSpec, ExecutionEngine
 from gantry.spec.apiversion import (
     CANONICAL_API_VERSION,
@@ -33,7 +34,6 @@ from gantry.spec.loader import (
 )
 from gantry.spec.movement import MovementSpec, OrderingScope, StrategyMode
 from gantry.spec.operation import OperationKind, OperationSpec
-from gantry.spec.verification import CheckName, VerificationRequirement
 
 __all__ = [
     "CANONICAL_API_VERSION",
