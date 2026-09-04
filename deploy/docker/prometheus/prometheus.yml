@@ -1,0 +1,9 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  # Gantry workers run on the host during development, not in compose.
+  - job_name: gantry
+    static_configs:
+      - targets: ["host.docker.internal:9464"]

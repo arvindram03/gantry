@@ -1,0 +1,49 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_FROZEN: "1"
+
+jobs:
+  check:
+    name: lint · type · unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - run: uv sync --all-extras
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy gantry
+      - run: uv run pytest --cov=gantry --cov-report=term-missing
+
+  integration:
+    name: integration · chaos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - run: uv sync --all-extras
+      - name: Start stack
+        run: docker compose -f deploy/docker/docker-compose.yml up -d --wait
+      - run: uv run pytest -m integration
+      - name: Chaos tests
+        run: uv run pytest -m chaos
+      - name: Stack logs on failure
+        if: failure()
+        run: docker compose -f deploy/docker/docker-compose.yml logs --tail=200
+      - name: Tear down
+        if: always()
+        run: docker compose -f deploy/docker/docker-compose.yml down -v
