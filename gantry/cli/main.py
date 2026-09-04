@@ -16,15 +16,19 @@ from rich.console import Console
 from rich.table import Table
 
 from gantry import __version__
+from gantry.adapters.source.postgres import PostgresSourceAdapter
+from gantry.adapters.source.seed import seed as seed_source
 from gantry.core.dataset import DatasetRef, DatasetVersion
 from gantry.core.sizes import format_byte_size
 from gantry.registry.base import DatasetRegistry
+from gantry.registry.discovery import DiscoveryReport, discover_into_registry
 from gantry.registry.errors import RegistryError
 from gantry.registry.jsonfile import DEFAULT_REGISTRY_PATH, JsonFileDatasetRegistry
 from gantry.spec.apiversion import CANONICAL_API_VERSION, is_deprecated_api_version
 from gantry.spec.errors import SpecError
 from gantry.spec.loader import SUPPORTED_KINDS, load_dataset_spec, load_spec, spec_json_schema
 from gantry.spec.movement import MovementSpec
+from gantry.state.database import create_engine
 
 app = typer.Typer(
     name="gantry",
@@ -47,6 +51,13 @@ console = Console()
 err_console = Console(stderr=True)
 
 REGISTRY_ENV_VAR = "GANTRY_REGISTRY"
+SOURCE_URL_ENV = "GANTRY_SOURCE_URL"
+DEFAULT_SOURCE_URL = "postgresql+asyncpg://gantry:gantry@localhost:15432/gantry"
+
+
+def _source_url() -> str:
+    return os.environ.get(SOURCE_URL_ENV, DEFAULT_SOURCE_URL)
+
 
 SpecArg = Annotated[Path, typer.Argument(help="Path to a spec file.")]
 RegistryOpt = Annotated[
@@ -133,10 +144,65 @@ def status(name: Annotated[str, typer.Argument(help="Operation name.")]) -> None
     _pending("status", "Day 10")
 
 
+SourceUrlOpt = Annotated[
+    str | None,
+    typer.Option("--source-url", help=f"Source database (env {SOURCE_URL_ENV})."),
+]
+
+
 @app.command()
-def seed(rows: Annotated[int, typer.Option(help="Rows to generate.")] = 1_000_000) -> None:
+def seed(
+    rows: Annotated[int, typer.Option(help="Orders to generate.")] = 1_000_000,
+    source_url: SourceUrlOpt = None,
+) -> None:
     """Seed the source database with synthetic orders."""
-    _pending("seed", "Day 6")
+    engine = create_engine(source_url or _source_url())
+
+    # One event loop for the whole command: a second asyncio.run() would try to
+    # dispose connections created in a loop that no longer exists.
+    async def run() -> int:
+        try:
+            return await seed_source(engine, orders=rows)
+        finally:
+            await engine.dispose()
+
+    console.print(f"[green]seeded[/green] {asyncio.run(run()):,} orders")
+
+
+@app.command()
+def discover(
+    source_url: SourceUrlOpt = None,
+    registry: RegistryOpt = None,
+    schema: Annotated[list[str] | None, typer.Option("--schema", help="Schemas to scan.")] = None,
+    profile: Annotated[bool, typer.Option(help="Also profile discovered datasets.")] = True,
+) -> None:
+    """Discover a source and register what it holds as Datasets."""
+    engine = create_engine(source_url or _source_url())
+    adapter = PostgresSourceAdapter(engine)
+    store = _registry(registry)
+
+    async def run() -> DiscoveryReport:
+        try:
+            return await discover_into_registry(
+                adapter, store, schemas=tuple(schema or ["public"]), profile=profile
+            )
+        finally:
+            await engine.dispose()
+
+    report = asyncio.run(run())
+    for version in report.registered:
+        manifest = version.manifest
+        rows = manifest.physical.estimated_rows
+        console.print(
+            f"[green]registered[/green] {version.name}@{version.version}  "
+            f"[dim]{len(manifest.dataset_schema.fields)} fields, "
+            f"key={'/'.join(manifest.dataset_schema.keys) or '-'}, "
+            f"~{rows:,} rows[/dim]"
+            if rows is not None
+            else f"[green]registered[/green] {version.name}@{version.version}"
+        )
+    if report.profiled:
+        console.print(f"[dim]profiled {len(report.registered)} datasets[/dim]")
 
 
 @dataset_app.command("register")

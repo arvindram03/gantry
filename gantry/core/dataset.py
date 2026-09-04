@@ -56,13 +56,28 @@ class PhysicalRef(BaseModel):
 
 
 class DatasetStatistics(BaseModel):
-    """Profile output. Populated by discovery and profiling, empty until then."""
+    """Profile output. Populated by discovery and profiling, empty until then.
+
+    Everything here is estimated from sampled statistics rather than a full
+    scan. A profile that has to read a 100M-row table to describe it is not a
+    profile, it is a migration.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     change_rate_per_second: float | None = Field(default=None, ge=0)
     row_count: int | None = Field(default=None, ge=0)
     profiled_at: datetime | None = None
+
+    # Partition planning needs the key range and how many distinct values sit
+    # in it: equal key spans are not equal row counts when a key is skewed.
+    key_min: str | None = None
+    key_max: str | None = None
+    distinct_keys: int | None = Field(default=None, ge=0)
+    null_rates: dict[FieldName, float] = {}
+    # True when the planner's own statistics were missing or stale, so callers
+    # can tell "no skew" from "no information".
+    stale_statistics: bool = False
 
 
 class DatasetManifest(BaseModel):
@@ -104,8 +119,16 @@ class DatasetManifest(BaseModel):
         declared. That makes additive schema changes hash-stable: adding an
         optional field to this model would otherwise change every registered
         manifest's hash and re-version every Dataset in the registry.
+
+        `statistics.profiled_at` is excluded for a different reason: it records
+        when we looked, not what we saw. Hashing it would mint a new version on
+        every profiling run of an unchanged table.
         """
-        payload: dict[str, object] = self.model_dump(mode="json", exclude_defaults=True)
+        payload: dict[str, object] = self.model_dump(
+            mode="json",
+            exclude_defaults=True,
+            exclude={"statistics": {"profiled_at"}},
+        )
         return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
     @property

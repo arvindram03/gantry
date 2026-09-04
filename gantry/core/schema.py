@@ -21,6 +21,36 @@ class FieldSchema(BaseModel):
     nullable: bool = True
 
 
+class ForeignKey(BaseModel):
+    """A referential constraint discovered on the source.
+
+    Carried because two things need it: `foreign_key_integrity` verification,
+    and the dependency ordering that decides which dataset must move first.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    columns: tuple[FieldName, ...]
+    references: str
+    referenced_columns: tuple[FieldName, ...]
+
+
+class Index(BaseModel):
+    """An index on the source.
+
+    The target does not necessarily want these during a migration - secondary
+    indexes are usually deferred until after the bulk load - but the plan has
+    to know they exist before it can decide.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    name: str
+    columns: tuple[FieldName, ...]
+    unique: bool = False
+    primary: bool = False
+
+
 class DatasetSchema(BaseModel):
     """Keys, time semantics and (once discovered) fields.
 
@@ -33,6 +63,8 @@ class DatasetSchema(BaseModel):
     keys: tuple[FieldName, ...] = ()
     time_field: FieldName | None = None
     fields: tuple[FieldSchema, ...] = ()
+    foreign_keys: tuple[ForeignKey, ...] = ()
+    indexes: tuple[Index, ...] = ()
 
     @model_validator(mode="after")
     def _check_consistency(self) -> DatasetSchema:
