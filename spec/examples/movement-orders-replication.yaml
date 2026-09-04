@@ -1,0 +1,103 @@
+# The Movement example from the design document, section 11.
+#
+# Note `cutover:` and `rollback:` below. Those belong to the Migration workflow
+# rather than to Movement - a Movement does not imply a cutover. They parse
+# here for compatibility and are reported as deprecated placement.
+apiVersion: gantry.dev/v1alpha1
+kind: Movement
+
+metadata:
+  name: orders-replication
+
+source:
+  adapter: oracle
+  connectionRef: oracle-prod
+
+destination:
+  adapter: postgres
+  connectionRef: postgres-prod
+
+strategy:
+  mode: snapshot_then_stream
+
+datasets:
+  - name: customers
+    source: CRM.CUSTOMERS
+    target: public.customers
+
+    key:
+      columns: [customer_id]
+
+    ordering:
+      scope: key
+      versionField: source_lsn
+
+    partitioning:
+      strategy: range
+      column: customer_id
+      rowsPerPartition: 5000000
+
+    write:
+      mode: upsert
+
+    verification:
+      required:
+        - row_count
+        - chunk_checksum
+        - primary_key_unique
+
+  - name: orders
+    source: ERP.ORDERS
+    target: public.orders
+
+    dependsOn:
+      - customers
+
+    key:
+      columns: [order_id]
+
+    ordering:
+      scope: key
+      versionField: source_lsn
+
+    partitioning:
+      strategy: time_range
+      column: created_at
+      interval: 1d
+
+    write:
+      mode: upsert
+
+    verification:
+      required:
+        - row_count
+        - chunk_checksum
+        - foreign_key_integrity
+
+cdc:
+  adapter: debezium
+  checkpoint:
+    type: source_lsn
+
+runtime:
+  maxConcurrency: 32
+  maxRetries: 10
+
+  rateLimits:
+    sourceRowsPerSecond: 100000
+    targetRowsPerSecond: 80000
+
+  policies:
+    targetCpuMaxPercent: 70
+    sourceCpuMaxPercent: 60
+
+cutover:
+  gates:
+    allPartitionsVerified: true
+    maxCdcLag: 2s
+    criticalVerificationFailures: 0
+    requireApproval: true
+
+rollback:
+  window: 24h
+  sourceRemainsAuthoritative: true

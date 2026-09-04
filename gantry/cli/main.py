@@ -22,7 +22,8 @@ from gantry.registry.errors import RegistryError
 from gantry.registry.jsonfile import DEFAULT_REGISTRY_PATH, JsonFileDatasetRegistry
 from gantry.spec.apiversion import CANONICAL_API_VERSION, is_deprecated_api_version
 from gantry.spec.errors import SpecError
-from gantry.spec.loader import dataset_json_schema, load_dataset_spec
+from gantry.spec.loader import SUPPORTED_KINDS, load_dataset_spec, load_spec, spec_json_schema
+from gantry.spec.movement import MovementSpec
 
 app = typer.Typer(
     name="gantry",
@@ -90,7 +91,7 @@ def version() -> None:
 def validate(spec: SpecArg) -> None:
     """Validate a spec file."""
     try:
-        parsed = load_dataset_spec(spec)
+        parsed = load_spec(spec)
     except SpecError as exc:
         _fail(str(exc))
         return
@@ -99,6 +100,16 @@ def validate(spec: SpecArg) -> None:
         err_console.print(
             f"[yellow]warning:[/yellow] apiVersion {parsed.api_version!r} is deprecated; "
             f"use {CANONICAL_API_VERSION!r}"
+        )
+    if isinstance(parsed, MovementSpec) and parsed.has_migration_blocks:
+        blocks = [
+            name
+            for name, present in (("cutover", parsed.cutover), ("rollback", parsed.rollback))
+            if present is not None
+        ]
+        err_console.print(
+            f"[yellow]warning:[/yellow] {', '.join(blocks)} on a Movement is deprecated; "
+            f"these belong to the Migration workflow. A Movement does not imply a cutover."
         )
     console.print(f"[green]ok[/green] {spec}: {parsed.kind} {parsed.metadata.name}")
 
@@ -241,12 +252,17 @@ def _print_manifest(entry: DatasetVersion) -> None:
         console.print(f"  sensitive    {', '.join(manifest.sensitive_fields)}")
 
 
-@schema_app.command("dataset")
-def schema_dataset(
+@schema_app.command("show")
+def schema_show(
+    kind: Annotated[str, typer.Argument(help=f"One of: {', '.join(SUPPORTED_KINDS)}.")],
     out: Annotated[Path | None, typer.Option("--out", help="Write to a file.")] = None,
 ) -> None:
-    """Emit the Dataset JSON Schema, generated from the models."""
-    rendered = dataset_json_schema()
+    """Emit a spec JSON Schema, generated from the models."""
+    try:
+        rendered = spec_json_schema(kind)
+    except SpecError as exc:
+        _fail(str(exc))
+        return
     if out is None:
         typer.echo(rendered, nl=False)
         return

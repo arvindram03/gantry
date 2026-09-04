@@ -135,8 +135,26 @@ def test_registry_path_from_environment(tmp_path: Path, monkeypatch: pytest.Monk
     assert registry.is_file()
 
 
-def test_schema_command_emits_generated_json(tmp_path: Path) -> None:
-    out = tmp_path / "dataset.json"
-    result = runner.invoke(app, ["schema", "dataset", "--out", str(out)])
+@pytest.mark.parametrize("kind", ["Dataset", "Movement", "Analysis"])
+def test_schema_command_emits_generated_json(tmp_path: Path, kind: str) -> None:
+    out = tmp_path / f"{kind}.json"
+    result = runner.invoke(app, ["schema", "show", kind, "--out", str(out)])
     assert result.exit_code == 0
-    assert json.loads(out.read_text())["title"] == "Gantry Dataset"
+    assert json.loads(out.read_text())["title"] == f"Gantry {kind}"
+
+
+def test_schema_command_rejects_unknown_kind() -> None:
+    result = runner.invoke(app, ["schema", "show", "Nonsense"])
+    assert result.exit_code == 1
+
+
+def test_validate_warns_about_migration_blocks_on_a_movement() -> None:
+    example = EXAMPLES / "movement-orders-replication.yaml"
+    result = runner.invoke(app, ["validate", str(example)])
+    assert result.exit_code == 0
+    assert "Migration workflow" in result.stderr
+
+
+def test_validate_accepts_every_example() -> None:
+    for path in sorted(EXAMPLES.glob("*.yaml")):
+        assert runner.invoke(app, ["validate", str(path)]).exit_code == 0, path

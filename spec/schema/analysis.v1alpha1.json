@@ -1,0 +1,638 @@
+{
+  "$defs": {
+    "AnalysisMode": {
+      "enum": [
+        "batch",
+        "continuous"
+      ],
+      "title": "AnalysisMode",
+      "type": "string"
+    },
+    "ChunkChecksumCheck": {
+      "additionalProperties": false,
+      "description": "Key-ranged checksums must agree, computed in the engine.",
+      "properties": {
+        "check": {
+          "const": "chunk_checksum",
+          "default": "chunk_checksum",
+          "title": "Check",
+          "type": "string"
+        }
+      },
+      "title": "ChunkChecksumCheck",
+      "type": "object"
+    },
+    "ExecutionBlock": {
+      "additionalProperties": false,
+      "properties": {
+        "engine": {
+          "$ref": "#/$defs/ExecutionEngine",
+          "default": "auto"
+        },
+        "maxBytesScanned": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Maxbytesscanned"
+        },
+        "timeout": {
+          "anyOf": [
+            {
+              "format": "duration",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Timeout"
+        }
+      },
+      "title": "ExecutionBlock",
+      "type": "object"
+    },
+    "ExecutionEngine": {
+      "description": "Engines an Analysis may compile onto.\n\n`AUTO` resolves from the physical adapters of the input Datasets. v1 ships\nPostgres and DuckDB; the rest are named so specs written against them fail\nwith \"not supported in v1\" rather than \"unknown value\".",
+      "enum": [
+        "auto",
+        "postgres",
+        "duckdb",
+        "clickhouse",
+        "bigquery",
+        "snowflake",
+        "spark",
+        "flink"
+      ],
+      "title": "ExecutionEngine",
+      "type": "string"
+    },
+    "ForeignKeyIntegrityCheck": {
+      "additionalProperties": false,
+      "properties": {
+        "check": {
+          "const": "foreign_key_integrity",
+          "default": "foreign_key_integrity",
+          "title": "Check",
+          "type": "string"
+        }
+      },
+      "title": "ForeignKeyIntegrityCheck",
+      "type": "object"
+    },
+    "InputBlock": {
+      "additionalProperties": false,
+      "properties": {
+        "dataset": {
+          "maxLength": 253,
+          "minLength": 1,
+          "pattern": "^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$",
+          "title": "Dataset",
+          "type": "string"
+        }
+      },
+      "required": [
+        "dataset"
+      ],
+      "title": "InputBlock",
+      "type": "object"
+    },
+    "JoinBlock": {
+      "additionalProperties": false,
+      "properties": {
+        "left": {
+          "maxLength": 253,
+          "minLength": 1,
+          "pattern": "^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$",
+          "title": "Left",
+          "type": "string"
+        },
+        "on": {
+          "items": {
+            "maxLength": 253,
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "On",
+          "type": "array"
+        },
+        "right": {
+          "maxLength": 253,
+          "minLength": 1,
+          "pattern": "^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$",
+          "title": "Right",
+          "type": "string"
+        },
+        "temporal": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TemporalJoinBlock"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "left",
+        "right",
+        "on"
+      ],
+      "title": "JoinBlock",
+      "type": "object"
+    },
+    "JoinCoverageCheck": {
+      "additionalProperties": false,
+      "description": "Minimum fraction of left rows that must find a match.",
+      "properties": {
+        "check": {
+          "const": "join_coverage",
+          "default": "join_coverage",
+          "title": "Check",
+          "type": "string"
+        },
+        "min": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Min",
+          "type": "number"
+        }
+      },
+      "required": [
+        "min"
+      ],
+      "title": "JoinCoverageCheck",
+      "type": "object"
+    },
+    "LimitsBlock": {
+      "additionalProperties": false,
+      "description": "Resource bounds enforced regardless of operation type.\n\nMovement adds throughput rate limits; Analysis adds scan and cost bounds.\nConcurrency, retries and timeout mean the same thing for both.",
+      "properties": {
+        "maxConcurrency": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Maxconcurrency"
+        },
+        "maxRetries": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Maxretries"
+        }
+      },
+      "title": "LimitsBlock",
+      "type": "object"
+    },
+    "MetadataBlock": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "maxLength": 253,
+          "minLength": 1,
+          "pattern": "^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$",
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "MetadataBlock",
+      "type": "object"
+    },
+    "NormalizeBlock": {
+      "additionalProperties": false,
+      "description": "Canonical field names and the source spellings that map onto them.",
+      "properties": {
+        "fields": {
+          "additionalProperties": {
+            "$ref": "#/$defs/NormalizeFieldBlock"
+          },
+          "default": {},
+          "propertyNames": {
+            "maxLength": 253,
+            "minLength": 1
+          },
+          "title": "Fields",
+          "type": "object"
+        }
+      },
+      "title": "NormalizeBlock",
+      "type": "object"
+    },
+    "NormalizeFieldBlock": {
+      "additionalProperties": false,
+      "properties": {
+        "aliases": {
+          "items": {
+            "maxLength": 253,
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Aliases",
+          "type": "array"
+        }
+      },
+      "required": [
+        "aliases"
+      ],
+      "title": "NormalizeFieldBlock",
+      "type": "object"
+    },
+    "NullRateCheck": {
+      "additionalProperties": false,
+      "description": "Maximum fraction of nulls permitted in a field.",
+      "properties": {
+        "check": {
+          "const": "null_rate",
+          "default": "null_rate",
+          "title": "Check",
+          "type": "string"
+        },
+        "field": {
+          "maxLength": 253,
+          "minLength": 1,
+          "title": "Field",
+          "type": "string"
+        },
+        "max": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Max",
+          "type": "number"
+        }
+      },
+      "required": [
+        "field",
+        "max"
+      ],
+      "title": "NullRateCheck",
+      "type": "object"
+    },
+    "ObjectiveBlock": {
+      "additionalProperties": false,
+      "properties": {
+        "explain": {
+          "title": "Explain",
+          "type": "string"
+        }
+      },
+      "required": [
+        "explain"
+      ],
+      "title": "ObjectiveBlock",
+      "type": "object"
+    },
+    "OutputBlock": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "default": "AnalysisResult",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "title": "OutputBlock",
+      "type": "object"
+    },
+    "PrimaryKeyUniqueCheck": {
+      "additionalProperties": false,
+      "properties": {
+        "check": {
+          "const": "primary_key_unique",
+          "default": "primary_key_unique",
+          "title": "Check",
+          "type": "string"
+        }
+      },
+      "title": "PrimaryKeyUniqueCheck",
+      "type": "object"
+    },
+    "RowCountCheck": {
+      "additionalProperties": false,
+      "description": "Source and target row counts must agree.",
+      "properties": {
+        "check": {
+          "const": "row_count",
+          "default": "row_count",
+          "title": "Check",
+          "type": "string"
+        }
+      },
+      "title": "RowCountCheck",
+      "type": "object"
+    },
+    "RowExpansionCheck": {
+      "additionalProperties": false,
+      "description": "Bounds how far a join may multiply rows.\n\nThe clearest expression of the guarantee boundary: an engine can report\nsuccess on a join that expands 84M rows to 1.7B, and this check is what\nrejects it.",
+      "properties": {
+        "check": {
+          "const": "row_expansion",
+          "default": "row_expansion",
+          "title": "Check",
+          "type": "string"
+        },
+        "max": {
+          "exclusiveMinimum": 0,
+          "title": "Max",
+          "type": "number"
+        }
+      },
+      "required": [
+        "max"
+      ],
+      "title": "RowExpansionCheck",
+      "type": "object"
+    },
+    "TemporalAlignmentCheck": {
+      "additionalProperties": false,
+      "description": "Maximum time skew tolerated between joined signals.",
+      "properties": {
+        "check": {
+          "const": "temporal_alignment",
+          "default": "temporal_alignment",
+          "title": "Check",
+          "type": "string"
+        },
+        "maxDifference": {
+          "format": "duration",
+          "title": "Maxdifference",
+          "type": "string"
+        }
+      },
+      "required": [
+        "maxDifference"
+      ],
+      "title": "TemporalAlignmentCheck",
+      "type": "object"
+    },
+    "TemporalJoinBlock": {
+      "additionalProperties": false,
+      "properties": {
+        "maxDistance": {
+          "anyOf": [
+            {
+              "format": "duration",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Maxdistance"
+        },
+        "strategy": {
+          "$ref": "#/$defs/TemporalJoinStrategy"
+        }
+      },
+      "required": [
+        "strategy"
+      ],
+      "title": "TemporalJoinBlock",
+      "type": "object"
+    },
+    "TemporalJoinStrategy": {
+      "enum": [
+        "nearest_preceding",
+        "nearest_following",
+        "nearest"
+      ],
+      "title": "TemporalJoinStrategy",
+      "type": "string"
+    },
+    "WindowBlock": {
+      "additionalProperties": false,
+      "description": "An absolute window, or a sliding one for continuous mode.",
+      "properties": {
+        "duration": {
+          "anyOf": [
+            {
+              "format": "duration",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Duration"
+        },
+        "end": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "End"
+        },
+        "start": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Start"
+        },
+        "type": {
+          "anyOf": [
+            {
+              "const": "sliding",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Type"
+        }
+      },
+      "title": "WindowBlock",
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "A parsed `kind: Analysis` document.",
+  "properties": {
+    "apiVersion": {
+      "title": "Apiversion",
+      "type": "string"
+    },
+    "execution": {
+      "$ref": "#/$defs/ExecutionBlock",
+      "default": {
+        "engine": "auto",
+        "maxBytesScanned": null,
+        "timeout": null
+      }
+    },
+    "inputs": {
+      "items": {
+        "$ref": "#/$defs/InputBlock"
+      },
+      "minItems": 1,
+      "title": "Inputs",
+      "type": "array"
+    },
+    "joins": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/JoinBlock"
+      },
+      "title": "Joins",
+      "type": "array"
+    },
+    "kind": {
+      "const": "Analysis",
+      "title": "Kind",
+      "type": "string"
+    },
+    "limits": {
+      "$ref": "#/$defs/LimitsBlock",
+      "default": {
+        "maxConcurrency": null,
+        "maxRetries": null
+      }
+    },
+    "metadata": {
+      "$ref": "#/$defs/MetadataBlock"
+    },
+    "mode": {
+      "$ref": "#/$defs/AnalysisMode",
+      "default": "batch"
+    },
+    "normalize": {
+      "$ref": "#/$defs/NormalizeBlock",
+      "default": {
+        "fields": {}
+      }
+    },
+    "objective": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ObjectiveBlock"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "output": {
+      "$ref": "#/$defs/OutputBlock",
+      "default": {
+        "kind": "AnalysisResult"
+      }
+    },
+    "signals": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "title": "Signals",
+      "type": "array"
+    },
+    "verify": {
+      "default": [],
+      "items": {
+        "discriminator": {
+          "mapping": {
+            "chunk_checksum": "#/$defs/ChunkChecksumCheck",
+            "foreign_key_integrity": "#/$defs/ForeignKeyIntegrityCheck",
+            "join_coverage": "#/$defs/JoinCoverageCheck",
+            "null_rate": "#/$defs/NullRateCheck",
+            "primary_key_unique": "#/$defs/PrimaryKeyUniqueCheck",
+            "row_count": "#/$defs/RowCountCheck",
+            "row_expansion": "#/$defs/RowExpansionCheck",
+            "temporal_alignment": "#/$defs/TemporalAlignmentCheck"
+          },
+          "propertyName": "check"
+        },
+        "oneOf": [
+          {
+            "$ref": "#/$defs/RowCountCheck"
+          },
+          {
+            "$ref": "#/$defs/ChunkChecksumCheck"
+          },
+          {
+            "$ref": "#/$defs/PrimaryKeyUniqueCheck"
+          },
+          {
+            "$ref": "#/$defs/ForeignKeyIntegrityCheck"
+          },
+          {
+            "$ref": "#/$defs/RowExpansionCheck"
+          },
+          {
+            "$ref": "#/$defs/JoinCoverageCheck"
+          },
+          {
+            "$ref": "#/$defs/NullRateCheck"
+          },
+          {
+            "$ref": "#/$defs/TemporalAlignmentCheck"
+          }
+        ]
+      },
+      "title": "Verify",
+      "type": "array"
+    },
+    "window": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/WindowBlock"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    }
+  },
+  "required": [
+    "apiVersion",
+    "metadata",
+    "kind",
+    "inputs"
+  ],
+  "title": "Gantry Analysis",
+  "type": "object"
+}

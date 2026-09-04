@@ -1,0 +1,884 @@
+{
+  "$defs": {
+    "CdcBlock": {
+      "additionalProperties": false,
+      "properties": {
+        "adapter": {
+          "title": "Adapter",
+          "type": "string"
+        },
+        "checkpoint": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CheckpointBlock"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "adapter"
+      ],
+      "title": "CdcBlock",
+      "type": "object"
+    },
+    "CheckpointBlock": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "title": "CheckpointBlock",
+      "type": "object"
+    },
+    "ChunkChecksumCheck": {
+      "additionalProperties": false,
+      "description": "Key-ranged checksums must agree, computed in the engine.",
+      "properties": {
+        "check": {
+          "const": "chunk_checksum",
+          "default": "chunk_checksum",
+          "title": "Check",
+          "type": "string"
+        }
+      },
+      "title": "ChunkChecksumCheck",
+      "type": "object"
+    },
+    "CutoverBlock": {
+      "additionalProperties": false,
+      "properties": {
+        "gates": {
+          "$ref": "#/$defs/CutoverGatesBlock",
+          "default": {
+            "allPartitionsVerified": null,
+            "criticalVerificationFailures": null,
+            "maxCdcLag": null,
+            "requireApproval": null
+          }
+        }
+      },
+      "title": "CutoverBlock",
+      "type": "object"
+    },
+    "CutoverGatesBlock": {
+      "additionalProperties": false,
+      "properties": {
+        "allPartitionsVerified": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Allpartitionsverified"
+        },
+        "criticalVerificationFailures": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Criticalverificationfailures"
+        },
+        "maxCdcLag": {
+          "anyOf": [
+            {
+              "format": "duration",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Maxcdclag"
+        },
+        "requireApproval": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Requireapproval"
+        }
+      },
+      "title": "CutoverGatesBlock",
+      "type": "object"
+    },
+    "DatasetVerificationBlock": {
+      "additionalProperties": false,
+      "description": "Per-dataset verification, in the Movement spelling.",
+      "properties": {
+        "required": {
+          "default": [],
+          "items": {
+            "discriminator": {
+              "mapping": {
+                "chunk_checksum": "#/$defs/ChunkChecksumCheck",
+                "foreign_key_integrity": "#/$defs/ForeignKeyIntegrityCheck",
+                "join_coverage": "#/$defs/JoinCoverageCheck",
+                "null_rate": "#/$defs/NullRateCheck",
+                "primary_key_unique": "#/$defs/PrimaryKeyUniqueCheck",
+                "row_count": "#/$defs/RowCountCheck",
+                "row_expansion": "#/$defs/RowExpansionCheck",
+                "temporal_alignment": "#/$defs/TemporalAlignmentCheck"
+              },
+              "propertyName": "check"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/$defs/RowCountCheck"
+              },
+              {
+                "$ref": "#/$defs/ChunkChecksumCheck"
+              },
+              {
+                "$ref": "#/$defs/PrimaryKeyUniqueCheck"
+              },
+              {
+                "$ref": "#/$defs/ForeignKeyIntegrityCheck"
+              },
+              {
+                "$ref": "#/$defs/RowExpansionCheck"
+              },
+              {
+                "$ref": "#/$defs/JoinCoverageCheck"
+              },
+              {
+                "$ref": "#/$defs/NullRateCheck"
+              },
+              {
+                "$ref": "#/$defs/TemporalAlignmentCheck"
+              }
+            ]
+          },
+          "title": "Required",
+          "type": "array"
+        }
+      },
+      "title": "DatasetVerificationBlock",
+      "type": "object"
+    },
+    "EndpointBlock": {
+      "additionalProperties": false,
+      "properties": {
+        "adapter": {
+          "title": "Adapter",
+          "type": "string"
+        },
+        "connectionRef": {
+          "title": "Connectionref",
+          "type": "string"
+        }
+      },
+      "required": [
+        "adapter",
+        "connectionRef"
+      ],
+      "title": "EndpointBlock",
+      "type": "object"
+    },
+    "ForeignKeyIntegrityCheck": {
+      "additionalProperties": false,
+      "properties": {
+        "check": {
+          "const": "foreign_key_integrity",
+          "default": "foreign_key_integrity",
+          "title": "Check",
+          "type": "string"
+        }
+      },
+      "title": "ForeignKeyIntegrityCheck",
+      "type": "object"
+    },
+    "JoinCoverageCheck": {
+      "additionalProperties": false,
+      "description": "Minimum fraction of left rows that must find a match.",
+      "properties": {
+        "check": {
+          "const": "join_coverage",
+          "default": "join_coverage",
+          "title": "Check",
+          "type": "string"
+        },
+        "min": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Min",
+          "type": "number"
+        }
+      },
+      "required": [
+        "min"
+      ],
+      "title": "JoinCoverageCheck",
+      "type": "object"
+    },
+    "KeyBlock": {
+      "additionalProperties": false,
+      "properties": {
+        "columns": {
+          "items": {
+            "maxLength": 253,
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Columns",
+          "type": "array"
+        }
+      },
+      "required": [
+        "columns"
+      ],
+      "title": "KeyBlock",
+      "type": "object"
+    },
+    "MetadataBlock": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "maxLength": 253,
+          "minLength": 1,
+          "pattern": "^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$",
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "MetadataBlock",
+      "type": "object"
+    },
+    "MovementDatasetBlock": {
+      "additionalProperties": false,
+      "description": "One dataset moved by this Movement.\n\n`source` and `target` are physical references. Registering these as Dataset\nresources happens at plan time, so a Movement spec stays self-contained.",
+      "properties": {
+        "dependsOn": {
+          "default": [],
+          "items": {
+            "maxLength": 253,
+            "minLength": 1,
+            "pattern": "^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$",
+            "type": "string"
+          },
+          "title": "Dependson",
+          "type": "array"
+        },
+        "key": {
+          "$ref": "#/$defs/KeyBlock"
+        },
+        "name": {
+          "maxLength": 253,
+          "minLength": 1,
+          "pattern": "^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$",
+          "title": "Name",
+          "type": "string"
+        },
+        "ordering": {
+          "$ref": "#/$defs/OrderingBlock",
+          "default": {
+            "scope": "none",
+            "versionField": null
+          }
+        },
+        "partitioning": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PartitioningBlock"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "source": {
+          "title": "Source",
+          "type": "string"
+        },
+        "target": {
+          "title": "Target",
+          "type": "string"
+        },
+        "verification": {
+          "$ref": "#/$defs/DatasetVerificationBlock",
+          "default": {
+            "required": []
+          }
+        },
+        "write": {
+          "$ref": "#/$defs/WriteBlock",
+          "default": {
+            "mode": "upsert"
+          }
+        }
+      },
+      "required": [
+        "name",
+        "source",
+        "target",
+        "key"
+      ],
+      "title": "MovementDatasetBlock",
+      "type": "object"
+    },
+    "NullRateCheck": {
+      "additionalProperties": false,
+      "description": "Maximum fraction of nulls permitted in a field.",
+      "properties": {
+        "check": {
+          "const": "null_rate",
+          "default": "null_rate",
+          "title": "Check",
+          "type": "string"
+        },
+        "field": {
+          "maxLength": 253,
+          "minLength": 1,
+          "title": "Field",
+          "type": "string"
+        },
+        "max": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Max",
+          "type": "number"
+        }
+      },
+      "required": [
+        "field",
+        "max"
+      ],
+      "title": "NullRateCheck",
+      "type": "object"
+    },
+    "OrderingBlock": {
+      "additionalProperties": false,
+      "description": "Ordering scope and the field used to reject stale writes.\n\nScope defaults to `key`, and the resolved value is written into the plan -\nan implicit ordering guarantee is not a guarantee.",
+      "properties": {
+        "scope": {
+          "$ref": "#/$defs/OrderingScope",
+          "default": "key"
+        },
+        "versionField": {
+          "anyOf": [
+            {
+              "maxLength": 253,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Versionfield"
+        }
+      },
+      "title": "OrderingBlock",
+      "type": "object"
+    },
+    "OrderingScope": {
+      "description": "Ordering boundaries from the design document's section 8.3.\n\nOrdering is scoped explicitly so a migration does not accidentally pay for\nglobal ordering it never needed.",
+      "enum": [
+        "global",
+        "partition",
+        "key",
+        "transaction",
+        "none"
+      ],
+      "title": "OrderingScope",
+      "type": "string"
+    },
+    "PartitionStrategy": {
+      "enum": [
+        "range",
+        "time_range",
+        "hash"
+      ],
+      "title": "PartitionStrategy",
+      "type": "string"
+    },
+    "PartitioningBlock": {
+      "additionalProperties": false,
+      "properties": {
+        "buckets": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Buckets"
+        },
+        "column": {
+          "maxLength": 253,
+          "minLength": 1,
+          "title": "Column",
+          "type": "string"
+        },
+        "interval": {
+          "anyOf": [
+            {
+              "format": "duration",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Interval"
+        },
+        "rowsPerPartition": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Rowsperpartition"
+        },
+        "strategy": {
+          "$ref": "#/$defs/PartitionStrategy"
+        }
+      },
+      "required": [
+        "strategy",
+        "column"
+      ],
+      "title": "PartitioningBlock",
+      "type": "object"
+    },
+    "PrimaryKeyUniqueCheck": {
+      "additionalProperties": false,
+      "properties": {
+        "check": {
+          "const": "primary_key_unique",
+          "default": "primary_key_unique",
+          "title": "Check",
+          "type": "string"
+        }
+      },
+      "title": "PrimaryKeyUniqueCheck",
+      "type": "object"
+    },
+    "RateLimitsBlock": {
+      "additionalProperties": false,
+      "properties": {
+        "sourceRowsPerSecond": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sourcerowspersecond"
+        },
+        "targetRowsPerSecond": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Targetrowspersecond"
+        }
+      },
+      "title": "RateLimitsBlock",
+      "type": "object"
+    },
+    "RollbackBlock": {
+      "additionalProperties": false,
+      "properties": {
+        "sourceRemainsAuthoritative": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sourceremainsauthoritative"
+        },
+        "window": {
+          "anyOf": [
+            {
+              "format": "duration",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Window"
+        }
+      },
+      "title": "RollbackBlock",
+      "type": "object"
+    },
+    "RowCountCheck": {
+      "additionalProperties": false,
+      "description": "Source and target row counts must agree.",
+      "properties": {
+        "check": {
+          "const": "row_count",
+          "default": "row_count",
+          "title": "Check",
+          "type": "string"
+        }
+      },
+      "title": "RowCountCheck",
+      "type": "object"
+    },
+    "RowExpansionCheck": {
+      "additionalProperties": false,
+      "description": "Bounds how far a join may multiply rows.\n\nThe clearest expression of the guarantee boundary: an engine can report\nsuccess on a join that expands 84M rows to 1.7B, and this check is what\nrejects it.",
+      "properties": {
+        "check": {
+          "const": "row_expansion",
+          "default": "row_expansion",
+          "title": "Check",
+          "type": "string"
+        },
+        "max": {
+          "exclusiveMinimum": 0,
+          "title": "Max",
+          "type": "number"
+        }
+      },
+      "required": [
+        "max"
+      ],
+      "title": "RowExpansionCheck",
+      "type": "object"
+    },
+    "RuntimeBlock": {
+      "additionalProperties": false,
+      "properties": {
+        "maxConcurrency": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Maxconcurrency"
+        },
+        "maxRetries": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Maxretries"
+        },
+        "policies": {
+          "$ref": "#/$defs/RuntimePoliciesBlock",
+          "default": {
+            "sourceCpuMaxPercent": null,
+            "targetCpuMaxPercent": null
+          }
+        },
+        "rateLimits": {
+          "$ref": "#/$defs/RateLimitsBlock",
+          "default": {
+            "sourceRowsPerSecond": null,
+            "targetRowsPerSecond": null
+          }
+        }
+      },
+      "title": "RuntimeBlock",
+      "type": "object"
+    },
+    "RuntimePoliciesBlock": {
+      "additionalProperties": false,
+      "properties": {
+        "sourceCpuMaxPercent": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "maximum": 100,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sourcecpumaxpercent"
+        },
+        "targetCpuMaxPercent": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "maximum": 100,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Targetcpumaxpercent"
+        }
+      },
+      "title": "RuntimePoliciesBlock",
+      "type": "object"
+    },
+    "StrategyBlock": {
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/StrategyMode"
+        }
+      },
+      "required": [
+        "mode"
+      ],
+      "title": "StrategyBlock",
+      "type": "object"
+    },
+    "StrategyMode": {
+      "enum": [
+        "snapshot",
+        "stream",
+        "snapshot_then_stream"
+      ],
+      "title": "StrategyMode",
+      "type": "string"
+    },
+    "TemporalAlignmentCheck": {
+      "additionalProperties": false,
+      "description": "Maximum time skew tolerated between joined signals.",
+      "properties": {
+        "check": {
+          "const": "temporal_alignment",
+          "default": "temporal_alignment",
+          "title": "Check",
+          "type": "string"
+        },
+        "maxDifference": {
+          "format": "duration",
+          "title": "Maxdifference",
+          "type": "string"
+        }
+      },
+      "required": [
+        "maxDifference"
+      ],
+      "title": "TemporalAlignmentCheck",
+      "type": "object"
+    },
+    "WriteBlock": {
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/WriteMode",
+          "default": "upsert"
+        }
+      },
+      "title": "WriteBlock",
+      "type": "object"
+    },
+    "WriteMode": {
+      "enum": [
+        "upsert",
+        "insert",
+        "merge"
+      ],
+      "title": "WriteMode",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "A parsed `kind: Movement` document.",
+  "properties": {
+    "apiVersion": {
+      "title": "Apiversion",
+      "type": "string"
+    },
+    "cdc": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CdcBlock"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "cutover": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CutoverBlock"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "datasets": {
+      "items": {
+        "$ref": "#/$defs/MovementDatasetBlock"
+      },
+      "minItems": 1,
+      "title": "Datasets",
+      "type": "array"
+    },
+    "destination": {
+      "$ref": "#/$defs/EndpointBlock"
+    },
+    "kind": {
+      "const": "Movement",
+      "title": "Kind",
+      "type": "string"
+    },
+    "metadata": {
+      "$ref": "#/$defs/MetadataBlock"
+    },
+    "rollback": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RollbackBlock"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "runtime": {
+      "$ref": "#/$defs/RuntimeBlock",
+      "default": {
+        "maxConcurrency": null,
+        "maxRetries": null,
+        "policies": {
+          "sourceCpuMaxPercent": null,
+          "targetCpuMaxPercent": null
+        },
+        "rateLimits": {
+          "sourceRowsPerSecond": null,
+          "targetRowsPerSecond": null
+        }
+      }
+    },
+    "source": {
+      "$ref": "#/$defs/EndpointBlock"
+    },
+    "strategy": {
+      "$ref": "#/$defs/StrategyBlock"
+    },
+    "verify": {
+      "default": [],
+      "items": {
+        "discriminator": {
+          "mapping": {
+            "chunk_checksum": "#/$defs/ChunkChecksumCheck",
+            "foreign_key_integrity": "#/$defs/ForeignKeyIntegrityCheck",
+            "join_coverage": "#/$defs/JoinCoverageCheck",
+            "null_rate": "#/$defs/NullRateCheck",
+            "primary_key_unique": "#/$defs/PrimaryKeyUniqueCheck",
+            "row_count": "#/$defs/RowCountCheck",
+            "row_expansion": "#/$defs/RowExpansionCheck",
+            "temporal_alignment": "#/$defs/TemporalAlignmentCheck"
+          },
+          "propertyName": "check"
+        },
+        "oneOf": [
+          {
+            "$ref": "#/$defs/RowCountCheck"
+          },
+          {
+            "$ref": "#/$defs/ChunkChecksumCheck"
+          },
+          {
+            "$ref": "#/$defs/PrimaryKeyUniqueCheck"
+          },
+          {
+            "$ref": "#/$defs/ForeignKeyIntegrityCheck"
+          },
+          {
+            "$ref": "#/$defs/RowExpansionCheck"
+          },
+          {
+            "$ref": "#/$defs/JoinCoverageCheck"
+          },
+          {
+            "$ref": "#/$defs/NullRateCheck"
+          },
+          {
+            "$ref": "#/$defs/TemporalAlignmentCheck"
+          }
+        ]
+      },
+      "title": "Verify",
+      "type": "array"
+    }
+  },
+  "required": [
+    "apiVersion",
+    "metadata",
+    "kind",
+    "source",
+    "destination",
+    "strategy",
+    "datasets"
+  ],
+  "title": "Gantry Movement",
+  "type": "object"
+}

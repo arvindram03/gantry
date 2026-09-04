@@ -100,9 +100,15 @@ def test_unknown_field_is_rejected_rather_than_ignored() -> None:
         parse(MINIMAL + "sensitiveFieldz: [oops]\n")
 
 
-def test_wrong_kind_names_supported_kinds() -> None:
+def test_unknown_kind_names_supported_kinds() -> None:
     with pytest.raises(UnsupportedKindError, match="Dataset"):
-        parse(MINIMAL.replace("kind: Dataset", "kind: Movement"))
+        parse(MINIMAL.replace("kind: Dataset", "kind: Migration"))
+
+
+def test_dataset_loader_rejects_another_supported_kind() -> None:
+    movement = MINIMAL.replace("kind: Dataset", "kind: Movement")
+    with pytest.raises(UnsupportedKindError, match="Dataset"):
+        load_dataset_spec("<test>", text=movement)
 
 
 @pytest.mark.parametrize(

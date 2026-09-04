@@ -1,0 +1,67 @@
+# The Analysis example from the design document's RFC extension.
+#
+# The same lifecycle as a Movement: plan, generate an engine artifact, validate
+# it, execute it, verify the output, produce a Result. The `verify:` block is
+# what separates a completed job from a trustworthy one - an engine can report
+# SUCCESS on a join that expands 84M rows to 1.7B, and rowExpansion rejects it.
+apiVersion: gantry.dev/v1alpha1
+kind: Analysis
+
+metadata:
+  name: checkout-latency-regression
+
+objective:
+  explain: checkout latency regression
+
+inputs:
+  - dataset: application_logs
+  - dataset: traces
+  - dataset: deploy_events
+  - dataset: postgres_metrics
+
+window:
+  start: "2026-09-03T00:00:00Z"
+  end: "2026-09-04T00:00:00Z"
+
+normalize:
+  fields:
+    request_id:
+      aliases: [request_id, trace_id]
+    service:
+      aliases: [service_name, app]
+
+joins:
+  - left: application_logs
+    right: traces
+    on: [request_id]
+
+  - left: traces
+    right: deploy_events
+    on: [service]
+    temporal:
+      strategy: nearest_preceding
+      maxDistance: 24h
+
+signals:
+  - p95_latency
+  - error_rate
+  - database_wait_time
+  - timeout_count
+  - database_calls_per_request
+
+execution:
+  engine: auto
+
+verify:
+  - rowExpansion:
+      max: 1.1
+  - joinCoverage:
+      min: 0.95
+  - nullRate:
+      field: trace_id
+      max: 0.05
+  - temporalAlignment:
+      maxDifference: 5m
+
+output:
+  kind: AnalysisResult
