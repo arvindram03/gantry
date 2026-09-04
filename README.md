@@ -1,6 +1,13 @@
-# Gantry
+<p align="center">
+  <img
+    src="https://raw.githubusercontent.com/arvindram03/gantry/main/docs/assets/gantry-logo-512.jpg"
+    alt="Gantry"
+    width="260">
+</p>
 
-**Open-source reliability and execution layer for data movement and analysis.**
+<p align="center">
+  <strong>Open-source reliability and execution layer for data movement and analysis.</strong>
+</p>
 
 Gantry sits above the transport and processing infrastructure you already run. It does not
 own the bytes on the wire — it owns the execution contract around them: checkpoints, replay,
