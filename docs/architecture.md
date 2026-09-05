@@ -27,11 +27,24 @@ The line is precise: **control flows through Gantry; data does not.** Issuing a
 statement and waiting for it is submission. Holding the rows in a queue is being
 the mover, and that is what goes.
 
-**The default job is a SQL script running in a container** that connects to the
-source and target itself. It is the strongest job kind — the commit boundary is
-written into the script Gantry generated, and checkpoints stay partition-granular
-because container startup is seconds. Beam is for what SQL cannot reach: another
-engine, or scale beyond one server.
+Three separable things, because they change on different schedules:
+
+| | What it is | Today |
+|---|---|---|
+| **Job** | *what* to run — generated, content-addressed | a SQL script, a Beam pipeline |
+| **Packaging** | *how* it is made runnable | an OCI container image |
+| **Runner** | *where* it runs | local Docker, later Kubernetes |
+
+Packaging will change when the industry moves, so `image` appears nowhere in the
+core model — a job carries a packaging *descriptor*, and a runner declares what
+it can run. The default job is a SQL script: the commit boundary is written into
+the script Gantry generated, and checkpoints stay partition-granular because
+startup is seconds. Beam is for what SQL cannot reach.
+
+The same applies to Analysis, which today runs its compiled SQL inside Gantry's
+process. Making it a packaged job is what allows engines Gantry cannot reach
+from its own process, and is why these interfaces are named `Job`, `Packaging`
+and `Runner` rather than after Movement.
 
 Adapters do not go away. Gantry still connects to databases to discover, profile,
 verify and read positions — all bounded queries, and a checksum over ten million

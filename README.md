@@ -561,7 +561,7 @@ feature list, not after.
 | [rfcs/0000-gantry.md](docs/rfcs/0000-gantry.md) | the design document and its revisions |
 | [execution-plan-v1.md](docs/execution-plan-v1.md) | how v1 was built, day by day, with what each day found |
 | [execution-plan-migration.md](docs/execution-plan-migration.md) | how v1.1 was built: Migration as a workflow over Movements |
-| [execution-plan-external-execution.md](docs/execution-plan-external-execution.md) | what v1.2 would do: Movement as a job someone else runs, and Gantry out of the data path |
+| [execution-plan-external-execution.md](docs/execution-plan-external-execution.md) | what v1.2 would do: jobs, packaging and runners — Gantry stops running work in its own process |
 
 ## Status
 

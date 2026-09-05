@@ -1,86 +1,95 @@
-# Gantry v1.2 — Movement as a Job
+# Gantry v1.2 — Jobs, Packaging, and Runners
 
-**Status:** Draft 4 — jobs run in containers; no `postgres_fdw`, no relay
+**Status:** Draft 5 — three separable things; a container is today's answer to one of them
 **Source of truth:** `gantry-spec.md` (RFC 0) §5, §8, §17
 **Predecessors:** [`execution-plan-v1.md`](execution-plan-v1.md) → `v0.1.0`,
 [`execution-plan-migration.md`](execution-plan-migration.md) → `v0.2.0`
 **Window:** 8 working days
-**Target release:** `v0.3.0` — Gantry stops moving data
+**Target release:** `v0.3.0` — Gantry stops running work in its own process
 
 ---
 
 ## 0. The principle
 
-> **Gantry never moves data.** It plans the work, **generates a job**, submits
-> it to an executor, observes it finish, verifies the outcome, and checkpoints
-> what verified.
+> **Gantry never runs the work.** An Operation compiles to a **job**, the job is
+> **packaged** into something runnable, and a **runner** runs it. Gantry submits,
+> observes, verifies, and checkpoints what verified.
 
-**The default job is a SQL script running in a container.** The container
-connects to the source and the target and runs the script. Gantry submits it and
-watches; it never holds a data connection.
+That is one sentence for both Operation types. A Movement compiles to a script
+that copies partitions; an Analysis compiles to a query. Neither should execute
+inside Gantry, and today both do.
 
 **The relay goes.** v1's `_pipe_copy` streams one `COPY` into another through a
 bounded queue *inside the Gantry worker*, making a single Python process the
 throughput ceiling and putting a crash **in** the data path. It is deleted.
 
+### Three things, deliberately separate
+
+| | What it is | Today | Tomorrow |
+|---|---|---|---|
+| **Job** | *what* to run — generated, content-addressed | a SQL script, a Beam pipeline | anything compiled from a spec |
+| **Packaging** | *how* it is made runnable | an OCI container image | a WASM module, a JAR, a function, a plain script |
+| **Runner** | *where* it runs | local Docker | Kubernetes, ECS, Cloud Run, Dataflow, Nomad |
+
+**The reason to separate them is that they change on different schedules.** Job
+formats change when Gantry learns to compile something new. Packaging changes
+when the industry moves — and it will. Runners change per deployment, often
+several times in one organisation.
+
+The concrete design consequence, and the thing most likely to be got wrong:
+
+> **`image` must not appear in any core signature.** A job carries a *packaging
+> descriptor*; `container` is one member of a discriminated union, and a runner
+> declares which packagings it can run and refuses the rest.
+
+If `str` image references leak into the job model, the plan has quietly decided
+that packaging is containers forever.
+
 ### It is still a relay — that is fine, and the difference is the whole point
 
-The containerised script pipes `COPY … TO STDOUT` into `COPY … FROM STDIN`.
-Bytes pass through *something*. What changed is what that something is:
+The default packaged job pipes `COPY … TO STDOUT` into `COPY … FROM STDIN`.
+Bytes pass through *something*. What changed is what:
 
-| | v1 relay | containerised job |
+| | v1 relay | packaged job |
 |---|---|---|
-| The mover is | the Gantry worker | a disposable container |
-| Scaling it means | scaling Gantry | running more containers |
+| The mover is | the Gantry worker | a disposable unit |
+| Scaling it means | scaling Gantry | running more of them |
 | Its crash takes down | the orchestrator | one unit of work |
-| It is scheduled by | nothing — it is just there | the executor, with its own resources |
+| It is scheduled by | nothing — it is just there | the runner, with its own resources |
 
 An orchestrator that is also the bottleneck cannot schedule around itself.
-Moving the relay into the job is not a cosmetic change of address.
-
-### Two axes, not one
-
-| | What it is | Examples |
-|---|---|---|
-| **Job** | *what* to run, generated and content-addressed | a SQL script, a Beam pipeline |
-| **Executor** | *where* to run it | Docker, Kubernetes Jobs, Dataflow |
-
-A SQL-script job runs on Docker locally and Kubernetes in production without
-being regenerated. A Beam job needs a Beam runner. Keeping the axes separate is
-what stops "run it on Kubernetes" from becoming a fork of the job format.
 
 ### What Gantry connects to a database for, and what it does not
 
-"No bytes through Gantry" invites an obvious objection — *verification reads
-every row*. It does not:
+"Gantry runs nothing" invites an obvious objection — *verification reads every
+row*. It does not:
 
 | Purpose | What crosses the wire | Through Gantry |
 |---|---|---|
 | discover, profile | catalog rows, planner statistics | yes — bounded, tiny |
 | **verify** | **one checksum and one count per chunk**, computed in the engine | yes — one row per chunk |
 | positions, checkpoints | a single LSN | yes |
-| **bulk movement** | **every row** | **never** |
+| **the work itself** | **every row** | **never** |
 
 Adapters stay exactly as they are for the first three. They are the control
-plane, they are bounded by construction, and a checksum over ten million rows
-returns one number. The rule is not "Gantry opens no connections" — it is
-**Gantry never carries a payload proportional to the data**.
+plane and bounded by construction. The rule is not "Gantry opens no connections"
+— it is **Gantry never carries a payload proportional to the data**.
 
 ### What Gantry keeps, whatever runs the job
 
-- **partitioning** — the plan decides the unit of work, never the executor
-- **the commit boundary** — defined by the script Gantry generated
-- **verification** — the acceptance test, run from outside the mover
+- **partitioning** — the plan decides the unit of work, never the runner
+- **the commit boundary** — defined by the job Gantry generated
+- **verification** — the acceptance test, run from outside the work
 - **checkpoints** — written only against verified work
-- **provenance** — including the job itself
+- **provenance** — including the job and the packaging that ran it
 
-An executor that wants to decide any of these is a replacement, not an executor.
+A runner that wants to decide any of these is a replacement, not a runner.
 
 ---
 
 ## 1. The default job, concretely
 
-A SQL script per partition, run by `psql` in a container:
+A SQL script per partition, packaged as a container, run by `psql`:
 
 ```sh
 psql "$SOURCE" -v ON_ERROR_STOP=1 \
@@ -90,46 +99,66 @@ psql "$SOURCE" -v ON_ERROR_STOP=1 \
 
 **`--single-transaction` with `ON_ERROR_STOP=1` is what makes the exit code a
 commit signal.** Any error aborts and rolls back; a zero exit means the
-transaction committed. So:
+transaction committed:
 
 > **exit 0 ⟹ committed.** Non-zero ⟹ rolled back, *or* killed after commit and
-> before exit — which is safe, because the write is idempotent and re-running
-> converges.
+> before exit — safe, because the write is idempotent and re-running converges.
 
-That gives the `sql` kind the strongest properties of any job kind:
+That is a property of *the job*, not of containers. Repackage the same script as
+a WASM module or a Nomad task and it still holds, which is the test of whether
+the layers were separated properly.
 
 | Job kind | Commit boundary | Checkpoint unit | What a checkpoint asserts |
 |---|---|---|---|
-| `sql` in a container — **default** | Gantry's, written into the script | **partition** | committed **and** verified |
+| `sql` — **default** | Gantry's, written into the job | **partition** | committed **and** verified |
 | `beam` (Dataflow batch) | the runner's; no user checkpoint | partition **group** | committed **and** verified |
-| arbitrary container | none — exit code only | whatever it was given | **verified**, and nothing else |
+| arbitrary code | none — exit status only | whatever it was given | **verified**, and nothing else |
 
-Partition granularity survives because **container startup is seconds, not
-minutes**. That is the whole reason one job per partition is affordable here and
-absurd on Dataflow.
+Partition granularity survives because **startup is seconds**. That is why one
+job per partition is affordable here and absurd on Dataflow — and it is a
+property of the *runner*, so a slower runner moves the guarantee, which the
+table has to say.
 
-### The executor interface
+### The interfaces
 
 ```text
-submit(job)  -> handle      # idempotent: resubmitting adopts, never duplicates
-poll(handle) -> state       # pending | running | done | failed
+package(job)          -> package      # a descriptor, not an image string
+submit(package)       -> handle       # idempotent: resubmitting adopts
+poll(handle)          -> state        # pending | running | done | failed
 ```
 
-Then, identically for every kind:
+Then, identically for every job kind, packaging and runner:
 
 ```text
 submit  →  poll to terminal  →  verify the unit  →  checkpoint what verified
 ```
 
 **Nothing is checkpointed on a terminal state alone.** Exit 0 is a mover saying
-it finished. This project exists not to take that class of claim at face value,
-and verification costs nothing extra: `verify_dataset` already runs every check
-at partition scope at the end of a Movement, so verifying a unit when its job
-finishes is the same scan volume moved earlier — and earlier stops a doomed
+it finished, and this project exists not to take that class of claim at face
+value. Verification costs nothing extra: `verify_dataset` already runs every
+check at partition scope at the end of a Movement, so verifying a unit when its
+job finishes is the same scan volume moved earlier — and earlier stops a doomed
 movement at unit 2 of 40 rather than after all 40 are paid for.
 
 **Repair does not need checkpoints.** It needs partition bounds, which live in
-the plan. A single-partition job repairs, under any executor.
+the plan. A single-partition job repairs, under any runner.
+
+### Analysis is the same shape, and is sequenced second
+
+An Analysis compiles to SQL and today runs through `EngineAdapter.execute` in
+Gantry's process. Under this principle it is a packaged job like any other, and
+that is what makes engines Gantry cannot reach from its own process — Spark, a
+warehouse behind a gateway — possible at all.
+
+**v1.2 builds the abstraction Operation-agnostic and implements Movement on it.**
+Analysis follows in v1.3 without redesign. Naming the interfaces after Movement
+would be the cheap mistake here: they are `Job`, `Packaging` and `Runner`, not
+`MovementJob`.
+
+The one thing that must be decided now rather than later: an Analysis returns
+*results* — bounded aggregates by design, but a returned payload nonetheless.
+Whether those come back through the runner's output or through a written
+artifact is a v1.3 question, and the interface should not foreclose either.
 
 ---
 
@@ -201,20 +230,29 @@ the per-kind guarantee table filled in as far as it can be before code exists.
 
 ## 3. Days 1–2 — the seam, and the default job kind
 
-### Day 1 — `MovementJob`, `JobExecutor`, and a Docker executor
+### Day 1 — `Job`, `Packaging`, `Runner`
 
-- **[A]** `MovementJob` as a generated artifact: kind, body, unit, content hash.
-  Compiled at Generate, retained, referenced from the `MovementResult`.
-  Retrofitting provenance is how provenance ends up incomplete.
-- **[A]** `JobExecutor` protocol — `submit` / `poll` — and a Docker
-  implementation. Credentials reach the container as environment or mounted
-  secrets and **never appear in the job body**, which is retained and readable.
+Named for what they are, not for the Operation that happens to use them first.
+
+- **[A]** `Job` as a generated artifact: kind, body, unit, content hash.
+  Compiled at Generate, retained, referenced from the Result. Retrofitting
+  provenance is how provenance ends up incomplete.
+- **[A]** `Packaging` as a **discriminated union**, with `container` its only
+  member today. The union is the point: adding `wasm` later must not touch the
+  job model or the runner protocol.
+- **[A]** `Runner` protocol — `submit` / `poll` — plus `supports(packaging)`, so
+  a runner refuses what it cannot run rather than failing at launch. A local
+  Docker implementation.
+- **[A]** **No `image: str` anywhere outside the container packaging module.**
+  Worth a test that greps for it — this is the assumption that will otherwise
+  leak everywhere and be expensive to remove.
 - **[A]** The worker drives the interface uniformly and must not learn which
-  executor ran. Anything that leaks is the seam in the wrong place.
-- **[B]** `execution:` on a Movement spec, defaulting to `sql`.
+  runner ran. Anything that leaks is the seam in the wrong place.
+- **[B]** `execution:` on an Operation spec, defaulting to `sql`.
 
 **Exit:** a Movement compiles to a retained job artifact and the worker submits
-and polls it through the interface.
+and polls it through the interface — with nothing in the worker, the job model
+or the protocol that names a container.
 
 ### Day 2 — The SQL script job, and the relay's deletion
 
@@ -224,6 +262,12 @@ and polls it through the interface.
 - **[A]** The script is **readable**. It is retained as provenance and an
   operator will eventually run one by hand to work out what happened; SQL that
   reads like machine output wastes the artifact.
+- **[A]** Credentials reach the running job through the packaging's own secret
+  mechanism and **never appear in the job body**, which is retained and meant to
+  be read. Asserted by a test, not by care.
+- **[B]** The packaging's identity — an image digest, for containers — is part
+  of the job's content hash. A package changing underneath a replay must be a
+  *different job*, not the same one behaving differently.
 - **[A]** **Run the whole chaos suite against it.** New fixtures, **no new
   assertions** — the guarantees are the same guarantees.
 - **[A]** **Only once that passes: delete `_pipe_copy` and the relay.** In that
@@ -341,7 +385,7 @@ answers rather than intentions.
 | # | Cut | Why it is safe |
 |---|---|---|
 | 0 | **Beam entirely** | The containerised `sql` job alone delivers the principle and removes the relay. It costs the reach claim, which the docs must then not make |
-| 0b | The Kubernetes executor | Docker proves the interface; Kubernetes is a deployment target, not a correctness claim |
+| 0b | The Kubernetes runner | Docker proves the interface; Kubernetes is a deployment target, not a correctness claim |
 | 1 | Flink runner | Direct proves the contract; distribution is a scale claim, not a correctness one |
 | 2 | The non-Postgres target (Day 5) | Costs the reach claim entirely — say so in the docs rather than implying it |
 | 3 | Beam-side checksums | Fall back to "verification unsupported on this target", named explicitly |
@@ -364,8 +408,9 @@ however long the replacement takes.
 | **Handing execution outside becomes handing over the contract** | **Critical** | **Medium** | §1 lists what stays Gantry's: partitioning, the commit boundary, verification, checkpoints, provenance. An executor that wants to decide any of them is a replacement, not an executor |
 | The `sql` kind is slower than the relay was | Medium | **Confirmed: ~30%** | Measured on Day 0 and published. The principle costs throughput here; pretending otherwise would be the dishonesty this release exists to correct |
 | **Container startup makes one-job-per-partition too slow** | **High** | Medium | The partition-granular guarantee rests entirely on it. Measure on Day 0; if it is seconds the design holds, and if it is not, `sql` inherits Beam's grouping problem and the guarantee table says so |
-| Credentials leak into a retained job artifact | **Critical** | Medium | The body is provenance and is meant to be read. Secrets reach the container as environment or mounts and never appear in the body — asserted by a test, not by care |
-| A container image nobody pinned changes underneath a replay | High | Medium | The image digest is part of the job's content hash, so a changed image is a different job rather than the same one behaving differently |
+| Credentials leak into a retained job artifact | **Critical** | Medium | The body is provenance and is meant to be read. Secrets reach the job through the packaging's own mechanism and never appear in the body — asserted by a test, not by care |
+| A package nobody pinned changes underneath a replay | High | Medium | The packaging's identity is part of the job's content hash, so a changed package is a different job rather than the same one behaving differently |
+| **Containers leak into the core model** | **High** | **High** | The likeliest failure of this design, and the quietest. `image: str` in a signature decides that packaging is containers forever. Enforced by a test, not by review |
 | The default job kind is chosen by convenience rather than by guarantee | Medium | Low | `sql` is the default because it is the strongest kind — partition-granular, commit boundary retained. If that stops being true, the default moves |
 | Deleting the relay before its replacement is proven | **Critical** | Low | Day 2's ordering is explicit and is in the never-cut list |
 | Cross-language transforms drag in a Java expansion service | High | **High** | Prove the JDBC path on Day 0. If it needs a Java sidecar, that is a stack change and belongs in the same decision as the architecture |
@@ -394,6 +439,10 @@ however long the replacement takes.
       and what Gantry does read (catalog, statistics, one checksum per chunk) is
       bounded by construction rather than by the size of the data
 - [ ] No credential appears in a retained job body
+- [ ] Nothing outside the container packaging module names an image, a registry
+      or a container at all
+- [ ] The interfaces are `Job`, `Packaging` and `Runner` — not `MovementJob`,
+      and not `ContainerRunner`
 - [ ] `_pipe_copy` and the relay are deleted, and the chaos suite passed against
       the `sql` executor first
 - [ ] Every Movement retains the job that moved its data, and the
@@ -414,13 +463,19 @@ cost.
 than Day 8 is what Day 0 is for. Note what it would not undo: the `sql` kind is
 what removes Gantry from the data path, and it stands whether or not Beam ships.
 
-**Where the container runs in production.** Docker is the development answer
-and Kubernetes Jobs the obvious production one, but ECS, Cloud Run Jobs and
-Nomad are all the same shape. The executor interface is two methods precisely so
-this can be answered later without reopening the job format — but "later" is a
-real dependency on whoever deploys Gantry, and it should be said out loud rather
-than discovered.
+**Where jobs run in production.** Docker is the development answer and
+Kubernetes Jobs the obvious production one, but ECS, Cloud Run Jobs and Nomad
+are the same shape. The runner protocol is small precisely so this can be
+answered later without reopening the job format — but "later" is a real
+dependency on whoever deploys Gantry, and it should be said out loud rather than
+discovered.
 
-**What the image contains.** A `psql` client is enough for the default job, and
-"enough" is worth defending: every tool added to that image is a thing that runs
-next to production credentials.
+**What the package contains.** A `psql` client is enough for the default job,
+and "enough" is worth defending: every tool added is a thing that runs next to
+production credentials.
+
+**Whether a second packaging is built before it is needed.** The union exists so
+that adding one is cheap, and building a speculative second member to prove the
+abstraction is the classic way to get an abstraction shaped by two examples
+rather than by the problem. The honest test is narrower: no `image` outside one
+module, and a runner that refuses a packaging it does not support.
