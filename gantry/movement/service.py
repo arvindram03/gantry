@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from sqlalchemy.ext.asyncio import AsyncEngine
+from temporalio.client import Client as TemporalClient
 
 from gantry.adapters.source.postgres import PostgresSourceAdapter
 from gantry.core.dataset import DatasetManifest, DatasetVersion
@@ -27,9 +28,11 @@ from gantry.movement.result import MovementResult
 from gantry.registry.base import DatasetRegistry
 from gantry.results.store import ResultStore
 from gantry.scheduler.backend import TaskState, WorkflowBackend
+from gantry.scheduler.temporal.runner import connect, movement_worker, start_movement
 from gantry.scheduler.worker import Worker
 from gantry.state.checkpoints import CheckpointStore
 from gantry.state.operations import OperationStore
+from gantry.state.plans import PlanStore
 
 
 @dataclass(frozen=True)
@@ -67,6 +70,7 @@ class MovementService:
         checkpoints: CheckpointStore,
         registry: DatasetRegistry,
         results: ResultStore,
+        plans: PlanStore,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._source_engine = source_engine
@@ -76,6 +80,7 @@ class MovementService:
         self._checkpoints = checkpoints
         self._registry = registry
         self._results = results
+        self._plans = plans
         self._clock: Callable[[], datetime] = clock or _utc_now
         # Populated by plan(); run() needs the Dataset versions the plan was
         # compiled against, because a Result's provenance pins them.
@@ -110,9 +115,13 @@ class MovementService:
                 plan_version=plan.version,
             )
 
-        await self._backend_factory(movement.name).submit(plan)
         self._pins = tuple(DatasetPin.from_version(version) for version in registered)
         self._manifests = manifests
+
+        # The plan has to outlive this process: a Temporal activity worker, or
+        # any other worker, reconstructs it rather than recompiling.
+        await self._plans.put(plan, self._pins)
+        await self._backend_factory(movement.name).submit(plan)
         return plan
 
     async def run(
@@ -180,7 +189,10 @@ class MovementService:
             created_at=finished,
             rows_inserted=report.rows_written,
             partitions_total=_partition_count(plan),
-            partitions_complete=progress.tasks_done,
+            # Completed *partitions*, not completed tasks: a plan also carries
+            # discovery and schema nodes, and counting those made a Movement
+            # appear to have finished more partitions than it has.
+            partitions_complete=await self._completed_partitions(movement.name, plan),
             started_at=started,
             finished_at=finished,
         )
@@ -196,6 +208,15 @@ class MovementService:
                     reason="every partition complete; verification pending",
                 )
         return result
+
+    async def _completed_partitions(self, name: str, plan: PlanVersion) -> int:
+        partition_nodes = {
+            node.id for node in plan.nodes if node.kind is NodeKind.SNAPSHOT_PARTITION
+        }
+        tasks = await self._backend_factory(name).tasks(name)
+        return sum(
+            1 for task in tasks if task.state is TaskState.DONE and task.node_id in partition_nodes
+        )
 
     async def progress(self, name: str, plan: PlanVersion | None = None) -> Progress:
         record = await self._operations.get(name)
@@ -231,6 +252,96 @@ class MovementService:
         await self._operations.transition(
             name, OperationState.FAILED, actor=ActorKind.OPERATOR, reason=reason
         )
+
+    async def run_on_temporal(
+        self,
+        movement: Movement,
+        plan: PlanVersion,
+        *,
+        targets: Mapping[str, str],
+        client: TemporalClient | None = None,
+        max_concurrency: int = 8,
+    ) -> MovementResult:
+        """Execute the plan through Temporal instead of the leased queue.
+
+        The runtime's guarantees do not move: the activity still commits before
+        it checkpoints, and still depends on the write being idempotent, because
+        Temporal delivers at-least-once exactly as the queue did. What moves is
+        who owns dispatch, retries and timeouts.
+        """
+        started = self._clock()
+        connection = client or await connect()
+
+        await self._advance_to_executing(movement.name)
+
+        async with movement_worker(
+            connection,
+            plans=self._plans,
+            registry=self._registry,
+            checkpoints=self._checkpoints,
+            source_engine=self._source_engine,
+            target_engine=self._target_engine,
+            max_concurrent_activities=max_concurrency,
+        ):
+            handle = await start_movement(
+                connection, plan, targets=targets, max_concurrency=max_concurrency
+            )
+            outcome = await handle.result()
+
+        finished = self._clock()
+        result = MovementResult(
+            name=f"{movement.name}.movement",
+            status=ResultStatus.OK if not outcome.failed else ResultStatus.FAILED,
+            provenance=Provenance(
+                generated_at=finished,
+                operation=movement.name,
+                plan_version=plan.version,
+                lineage=Lineage(inputs=self._pins),
+                checkpoints=tuple(await self._checkpoints.all(movement.name)),
+            ),
+            created_at=finished,
+            rows_inserted=outcome.rows_changed,
+            partitions_total=_partition_count(plan),
+            partitions_complete=sum(
+                1
+                for node in plan.nodes
+                if node.kind is NodeKind.SNAPSHOT_PARTITION and node.id in set(outcome.completed)
+            ),
+            started_at=started,
+            finished_at=finished,
+        )
+        await self._results.put(result)
+
+        if not outcome.failed:
+            current = await self._operations.get(movement.name)
+            if current.state is OperationState.EXECUTING:
+                await self._operations.transition(
+                    movement.name,
+                    OperationState.VERIFYING,
+                    actor=ActorKind.RUNTIME,
+                    reason="every partition complete; verification pending",
+                )
+        return result
+
+    async def _advance_to_executing(self, name: str) -> None:
+        """Walk the operation forward to EXECUTING, whatever state it is in."""
+        record = await self._operations.get(name)
+        if record.state is OperationState.PAUSED:
+            await self._operations.transition(
+                name, OperationState.EXECUTING, actor=ActorKind.OPERATOR, reason="run requested"
+            )
+            return
+        for step in (
+            OperationState.PLANNED,
+            OperationState.GENERATED,
+            OperationState.VALIDATED,
+            OperationState.EXECUTING,
+        ):
+            record = await self._operations.get(name)
+            if _precedes(record.state, step):
+                await self._operations.transition(
+                    name, step, actor=ActorKind.RUNTIME, reason="advancing to execute"
+                )
 
 
 _ORDER = (

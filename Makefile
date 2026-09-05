@@ -35,7 +35,7 @@ test-int: dev-up migrate ## Integration tests against the local stack
 test-chaos: dev-up migrate ## Fault-injection tests, including a real kill -9
 	PYTHONPATH=tests/integration/helpers uv run pytest -m chaos
 
-dev-up: ## Start the local stack and wait for health
+dev-up: ## Start the local stack (postgres x3, kafka, debezium, temporal, prometheus)
 	$(COMPOSE) up -d --wait
 
 dev-down: ## Stop the stack and remove volumes

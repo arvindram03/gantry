@@ -48,7 +48,7 @@ Requires [uv](https://docs.astral.sh/uv/) and Docker.
 
 ```bash
 make install    # dependencies + pre-commit hooks
-make dev-up     # local stack: postgres x3, kafka, debezium, prometheus
+make dev-up     # local stack: postgres x3, kafka, debezium, temporal, prometheus
 make check      # lint, strict typecheck, unit tests
 make test-int   # integration tests against the stack
 ```

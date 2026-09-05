@@ -124,6 +124,56 @@ services:
       retries: 20
       start_period: 30s
 
+  temporal-init:
+    # Docker creates a named volume root-owned when the mount path does not
+    # already exist in the image, which leaves the unprivileged server unable
+    # to create its SQLite file. One chown, once, rather than running the
+    # server as root.
+    image: busybox:1.36
+    container_name: gantry-temporal-init
+    command: ["sh", "-c", "chown -R 1000:1000 /data"]
+    volumes:
+      - temporal-data:/data
+    restart: "no"
+
+  temporal:
+    # The CLI's dev server, not the full auto-setup stack: one binary, no
+    # Cassandra, no Elasticsearch. Persistence is a SQLite file on a volume -
+    # an in-memory server would undercut the point of durable execution the
+    # moment the container restarted.
+    #
+    # This is explicitly a development server. A production deployment is a
+    # different topology, and that decision is out of scope for v1.
+    image: temporalio/temporal:latest
+    container_name: gantry-temporal
+    restart: unless-stopped
+    command:
+      - server
+      - start-dev
+      - --ip
+      - 0.0.0.0
+      - --db-filename
+      - /home/temporal/data/temporal.db
+      - --namespace
+      - gantry
+      - --log-level
+      - warn
+    ports:
+      - "17233:7233"
+      - "18233:8233"
+    user: "1000:1000"
+    depends_on:
+      temporal-init:
+        condition: service_completed_successfully
+    volumes:
+      - temporal-data:/home/temporal/data
+    healthcheck:
+      test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "localhost:7233"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+
   prometheus:
     image: prom/prometheus:v2.54.1
     container_name: gantry-prometheus
@@ -140,6 +190,7 @@ services:
       retries: 20
 
 volumes:
+  temporal-data:
   pg-source-data:
   pg-target-data:
   pg-meta-data:

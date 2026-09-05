@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import os
 from collections.abc import Sequence
+from enum import StrEnum
 from pathlib import Path
 from typing import Annotated
 
@@ -45,6 +46,7 @@ from gantry.spec.movement import MovementSpec
 from gantry.state.checkpoints import PostgresCheckpointStore
 from gantry.state.database import DATABASE_URL_ENV, create_engine, database_url
 from gantry.state.operations import OperationStore, UnknownOperationError
+from gantry.state.plans import PostgresPlanStore
 from gantry.state.registry import PostgresDatasetRegistry
 
 app = typer.Typer(
@@ -66,6 +68,19 @@ app.add_typer(schema_app)
 
 console = Console()
 err_console = Console(stderr=True)
+
+
+class ExecutionBackend(StrEnum):
+    """Which scheduler executes a Movement.
+
+    Temporal is the default. The leased queue remains available: it is tested,
+    needs no extra infrastructure, and is the fallback while Temporal proves
+    itself on real runs.
+    """
+
+    TEMPORAL = "temporal"
+    QUEUE = "queue"
+
 
 REGISTRY_ENV_VAR = "GANTRY_REGISTRY"
 SOURCE_URL_ENV = "GANTRY_SOURCE_URL"
@@ -175,6 +190,7 @@ def _service(
         checkpoints=PostgresCheckpointStore(meta),
         registry=PostgresDatasetRegistry(meta),
         results=PostgresResultStore(meta),
+        plans=PostgresPlanStore(meta),
     )
     return service, (source, target, meta)
 
@@ -218,6 +234,10 @@ def plan(
 @app.command()
 def start(
     spec: SpecArg,
+    backend: Annotated[
+        ExecutionBackend,
+        typer.Option("--backend", help="Who owns dispatch, retries and timeouts."),
+    ] = ExecutionBackend.TEMPORAL,
     source_url: SourceUrlOpt = None,
     target_url: TargetUrlOpt = None,
     meta_url: MetaUrlOpt = None,
@@ -235,6 +255,8 @@ def start(
     async def run() -> MovementResult:
         try:
             compiled = await service.plan(movement)
+            if backend is ExecutionBackend.TEMPORAL:
+                return await service.run_on_temporal(movement, compiled, targets=targets)
             return await service.run(movement, compiled, targets=targets)
         finally:
             await _dispose(engines)

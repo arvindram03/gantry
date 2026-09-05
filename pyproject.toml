@@ -23,13 +23,14 @@ dependencies = [
 postgres = ["asyncpg>=0.29", "psycopg[binary]>=3.2"]
 kafka = ["aiokafka>=0.11"]
 duckdb = ["duckdb>=1.1"]
+temporal = ["temporalio>=1.8"]
 telemetry = [
     "opentelemetry-api>=1.27",
     "opentelemetry-sdk>=1.27",
     "opentelemetry-exporter-otlp>=1.27",
     "prometheus-client>=0.21",
 ]
-all = ["gantry[postgres,kafka,duckdb,telemetry]"]
+all = ["gantry[postgres,kafka,duckdb,telemetry,temporal]"]
 
 [project.scripts]
 gantry = "gantry.cli.main:app"

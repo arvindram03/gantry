@@ -78,6 +78,10 @@ plan_versions = Table(
     Column("content_hash", String(71), nullable=False),
     Column("guarantee_fingerprint", String(71), nullable=False),
     Column("plan", JSONB, nullable=False),
+    # The Dataset versions this plan was compiled against. Execution resolves
+    # manifests through these rather than reading whatever is latest, so a
+    # rediscovery between planning and execution cannot change what runs.
+    Column("dataset_pins", JSONB, nullable=False, server_default="[]"),
     Column("created_at", TIMESTAMP, nullable=False),
     ForeignKeyConstraint(["operation"], ["operations.name"], name="fk_plan_versions_operation"),
     CheckConstraint("version >= 1", name="version_positive"),
