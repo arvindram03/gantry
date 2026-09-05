@@ -182,17 +182,61 @@ Caveats, because it is one run on one machine: loopback rather than a real
 network, narrow rows, and no staging-plus-merge. The like-for-like number with
 the apply step is Day 0 work.
 
-### What Day 0 must actually measure
+### Day 0 results — Docker, local, 1M narrow rows
 
-- **[A]** **Container startup to first row**, on Docker and on Kubernetes. This
-  is the number that decides whether one job per partition is affordable, and
-  the whole partition-granular guarantee rests on it.
-- **[A]** The script end to end *with* staging and merge, against v1's relay
-  numbers, so the comparison in `docs/benchmarks.md` is honest.
-- **[A]** Concurrency: how many containers the executor will run at once, and
-  what that does to the source.
-- **[B]** Image size and cold-pull cost. A 900 MB image pulled per partition is
-  a startup cost nobody predicted.
+**Measured, not assumed:**
+
+| | Result |
+|---|---|
+| Container startup to first query (warm image) | **0.22 s** steady, 0.27 s mean over 5 runs |
+| One job, 1M rows: COPY pipe + staging + upsert merge | **6.30 s** — ~159k rows/sec |
+| Eight concurrent partition jobs, 1M rows total | **4.41 s** — ~227k rows/sec |
+| v1 relay, for reference (published, includes more work) | ~125k rows/sec |
+
+**One job per partition is affordable, and by a wide margin.** At 0.22 s of
+startup, sixty-one partitions costs about thirteen seconds of overhead in total.
+The partition-granular checkpoint guarantee survives — and the contrast with
+Dataflow, where the same choice costs minutes per job, is roughly three orders
+of magnitude. It is the runner, not the job, that decides this.
+
+**The exit code is a reliable commit signal**, tested on both sides:
+
+| Failure | Container exit | Rows committed |
+|---|---|---|
+| target-side error after inserting 500,000 rows | **1** | **0** — rolled back |
+| source-side error (table does not exist) | **1** | 0 |
+
+### Two things the plan had wrong, found by running it
+
+**`COPY … FROM STDIN` must be passed with `-c`, never inside a `-f` script.** In
+a script file psql reads the COPY data from *the file itself*, not from process
+stdin, so the obvious formulation fails with `COPY file signature not
+recognized`. The job generator emits a sequence of `-c` flags under one
+`--single-transaction`, which also keeps the whole unit in one transaction.
+
+**`set -o pipefail` is required, and works in the image's shell.** Verified:
+`false | true` returns 1 with it and 0 without. Today a source-side failure is
+caught anyway, because a truncated binary `COPY` stream has no trailer and the
+target rejects it — but that is a property of the *format*, and a job whose
+correctness rests on the wire format rather than on its own exit handling is one
+format change away from silently succeeding.
+
+### What Day 0 has not measured
+
+Stated so the numbers above are not read as more than they are: Kubernetes
+startup, Dataflow submission, cold image pull, real source↔target network
+latency, and wide-row or text-heavy tables. All one machine, warm images, Docker
+loopback.
+
+### What Day 0 must still measure
+
+- **[A]** Kubernetes startup to first query. If it is seconds rather than
+  fractions of one, one job per partition is still fine; if it is tens, the
+  guarantee table gains a per-runner row.
+- **[A]** Cold image pull. `postgres:16-alpine` is 411 MB, and a pull per
+  partition on a cold node is a startup cost nobody predicted.
+- **[B]** Concurrency beyond eight, and what it does to the source. Eight
+  concurrent jobs gave 1.4× the single-job throughput; the knee is unmeasured.
 
 ### The `beam` job kind: the runner has answered half of it
 
@@ -223,8 +267,10 @@ workers per job, against per-project quotas on concurrent jobs and creation rate
 The first is what job-based execution introduces and the relay never had: there,
 a dead worker killed the copy. Here the work carries on unwatched.
 
-**Exit:** container startup measured, a decision on one-job-per-partition, and
-the per-kind guarantee table filled in as far as it can be before code exists.
+**Exit — met for the local runner.** Startup measured at 0.22 s,
+one-job-per-partition confirmed affordable, exit codes confirmed as a commit
+signal on both failure sides, and two script-generation constraints found by
+running it rather than by reasoning about it. Kubernetes and Dataflow remain.
 
 ---
 
@@ -257,8 +303,12 @@ or the protocol that names a container.
 ### Day 2 — The SQL script job, and the relay's deletion
 
 - **[A]** Generate the script per partition, with `--single-transaction` and
-  `ON_ERROR_STOP=1` so **exit 0 means committed**. Bounds come from the plan,
-  never recomputed — recomputing lets a partition move under a replay.
+  `ON_ERROR_STOP=1` so **exit 0 means committed**, `set -o pipefail` so a
+  source-side failure cannot be masked by a successful target stage, and
+  `COPY … FROM STDIN` passed via `-c` rather than `-f`. All three are Day 0
+  findings, and all three are silent when wrong.
+- **[A]** Bounds come from the plan, never recomputed — recomputing lets a
+  partition move under a replay.
 - **[A]** The script is **readable**. It is retained as provenance and an
   operator will eventually run one by hand to work out what happened; SQL that
   reads like machine output wastes the artifact.

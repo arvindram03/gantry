@@ -210,3 +210,37 @@ lag under production topology, replication, or load.
 ## Not yet measured
 
 - Adaptive concurrency under target pressure (v1.1)
+
+## v1.2 Day 0 — packaged jobs vs the relay
+
+Docker, one machine, warm images, loopback networking, 1M narrow rows. Not a
+production measurement; the point was to decide an architecture, and it did.
+
+| Path | 1M rows | rows/sec |
+|---|---|---|
+| Containerised job: COPY pipe + staging + upsert merge | **6.30 s** | ~159k |
+| The same, split across 8 concurrent partition jobs | **4.41 s** | ~227k |
+| v1 relay (from the rehearsal; includes planning and verification) | 8.1 s | ~125k |
+
+Transport only, for the choice between mechanisms:
+
+| Transport | 1M rows | rows/sec |
+|---|---|---|
+| `COPY … TO STDOUT \| COPY … FROM STDIN` | 1.81 s | ~552k |
+| `postgres_fdw`, `fetch_size 50000` | 2.60 s | ~385k |
+| `postgres_fdw`, default `fetch_size 100` | — | ~280k |
+
+**`postgres_fdw` was rejected on these numbers**, not on taste: it is ~30%
+slower than a `COPY` pipe and needs an extension, a foreign server, a user
+mapping and the privileges for each. Its default `fetch_size` of 100 rows per
+round trip is badly wrong for bulk work and would matter more over a real
+network than over loopback.
+
+**Container startup: 0.22 s** steady-state, 0.27 s mean over five runs. This is
+the number the partition-granular checkpoint guarantee rests on — sixty-one
+partitions costs about thirteen seconds of startup in total. The same choice on
+Dataflow costs minutes per job, which is why the checkpoint unit differs by
+runner and the guarantee table has to say so.
+
+**What these numbers are not.** No Kubernetes, no Dataflow, no cold image pull,
+no real network latency between source and target, and narrow rows only.
