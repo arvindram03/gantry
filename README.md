@@ -1,12 +1,27 @@
 <p align="center">
-  <img src="docs/assets/gantry-logo-512.jpg" alt="Gantry" width="260">
+  <img src="docs/assets/gantry-logo-512.jpg" alt="Gantry" width="220">
+</p>
+
+<h1 align="center">Gantry</h1>
+
+<h3 align="center">
+  The reliability and execution layer for data movement and analysis
+</h3>
+
+<p align="center">
+  <em>An engine reporting <code>SUCCESS</code> is not a correct result. Verification decides.</em>
 </p>
 
 <p align="center">
-  <strong>Open-source reliability and execution layer for data movement and analysis.</strong>
+  <img alt="license" src="https://img.shields.io/badge/license-Apache--2.0-blue">
+  <img alt="python" src="https://img.shields.io/badge/python-3.12%2B-blue">
+  <img alt="version" src="https://img.shields.io/badge/version-v0.1.0-green">
+  <img alt="status" src="https://img.shields.io/badge/status-pre--production-orange">
 </p>
 
-Gantry sits above the transport and processing infrastructure you already run. It does not
+---
+
+Gantry sits **above** the transport and processing infrastructure you already run. It does not
 own the bytes on the wire — it owns the execution contract around them: checkpoints, replay,
 ordering boundaries, idempotency, verification, policy, provenance and recovery.
 
@@ -28,6 +43,42 @@ expanding    ENGINE: SUCCESS  GANTRY: FAILED  rowExpansion 2.0000x   → finding
 ```
 
 Same SQL, same engine, same data. One of them means something.
+
+## What Gantry is not
+
+Read this before the feature list. Most disappointment with a tool comes from expecting it to
+be a different tool.
+
+| Gantry is **not** | What you actually want | Where Gantry fits |
+|---|---|---|
+| **A database or warehouse** | PostgreSQL, Snowflake, BigQuery, DuckDB | Gantry stores no customer rows. Its metadata store holds plans, checkpoints, verifications and provenance — never your data. |
+| **A query engine** | PostgreSQL, DuckDB, Spark | Gantry *compiles onto* engines. They own scans, joins and aggregation; Gantry owns submission, limits, verification and provenance. |
+| **An orchestrator or scheduler** | Airflow, Dagster, Temporal, cron | Gantry runs *on* Temporal by default. It is the thing your orchestrator calls, not a replacement for it. |
+| **A CDC tool** | Debezium, Kafka | Gantry drives real Debezium over real Kafka. What it adds is owning the applied position itself, so correctness does not depend on connector bookkeeping. |
+| **A BI or visualisation layer** | Looker, Metabase, Superset | Gantry produces a `Result` — structured, verified, with provenance. Rendering it is someone else's job. |
+| **An AI agent** | Claude, an in-house planner, a human | Gantry is what an agent *calls*. There is no model inside it. It decides plenty — what verifies, what is permitted — but deterministically, in code, the same way every time. |
+
+**And two things it explicitly does not claim:**
+
+**It does not make an LLM trustworthy.** It makes what an LLM does with your data *checkable*
+— and refusable. An agent can propose anything; it cannot widen a guarantee, skip a
+verification, reach past the access ladder, or mark its own work verified. Those are functions
+it calls, not instructions it reads.
+
+**It does not assert cause.** Gantry reports correlation with the basis for its confidence
+stated — measured, statistical, or a model's opinion, labelled as such. "The deploy caused
+the regression" is a claim it will not make for you.
+
+**And one limit of v1 specifically:** the source and target adapters are **PostgreSQL only**.
+Engines are PostgreSQL and DuckDB, CDC is Debezium over Kafka, and the scheduler is Temporal
+or a built-in Postgres queue. The adapter interfaces are small and documented in
+[docs/adapters.md](docs/adapters.md), but if your data is in Oracle or MySQL today, v1 does
+not move it yet.
+
+Everything else v1 does *not* guarantee is written down in
+[docs/guarantees.md](docs/guarantees.md) — including the gaps its own rehearsal found, and
+the one place a Movement still half-runs instead of refusing. That document is meant to be
+read before the feature list, not after.
 
 ## When do you need Gantry?
 
@@ -68,14 +119,10 @@ history is manual archaeology.
 
 - You already have a warehouse-native tool that covers your case end to end
 - Your data is small enough that a full re-copy and a full re-check are cheap
-- You are looking for a scheduler or an orchestrator — Gantry is not one, and
-  it runs *on* Temporal rather than replacing it
-- You want a query engine — Gantry compiles onto PostgreSQL and DuckDB rather
-  than competing with them
-
-**What Gantry is not.** It does not store your data, replace your database or
-warehouse, replace your orchestrator, or make an LLM trustworthy. It makes what
-an LLM (or a person, or a cron job) does with your data *checkable*.
+  every time — verification is only worth automating when checking is expensive
+- Nothing downstream of the number matters much, so being wrong is recoverable
+- What you are missing is a scheduler, a query engine or a warehouse — see
+  [What Gantry is not](#what-gantry-is-not) above
 
 ## The model
 
