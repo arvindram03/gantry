@@ -16,6 +16,7 @@ from temporalio.client import Client as TemporalClient
 
 from gantry.adapters.source.postgres import PostgresSourceAdapter
 from gantry.core.dataset import DatasetManifest, DatasetVersion
+from gantry.core.evidence import VerificationResult
 from gantry.core.operation import OperationState, OperationType
 from gantry.core.provenance import DatasetPin, Lineage, Provenance
 from gantry.core.results import ResultStatus
@@ -23,6 +24,7 @@ from gantry.lifecycle.plan import NodeKind, PlanVersion
 from gantry.lifecycle.states import ActorKind
 from gantry.movement.executor import MovementExecutor
 from gantry.movement.model import Movement
+from gantry.movement.partitioning import Partition, PartitionMethod
 from gantry.movement.planner import compile_movement
 from gantry.movement.result import MovementResult
 from gantry.registry.base import DatasetRegistry
@@ -33,6 +35,8 @@ from gantry.scheduler.worker import Worker
 from gantry.state.checkpoints import CheckpointStore
 from gantry.state.operations import OperationStore
 from gantry.state.plans import PlanStore
+from gantry.state.verifications import VerificationStore
+from gantry.verification.runner import MovementVerificationRunner, VerificationReport
 
 
 @dataclass(frozen=True)
@@ -71,6 +75,7 @@ class MovementService:
         registry: DatasetRegistry,
         results: ResultStore,
         plans: PlanStore,
+        verifications: VerificationStore | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._source_engine = source_engine
@@ -81,6 +86,7 @@ class MovementService:
         self._registry = registry
         self._results = results
         self._plans = plans
+        self._verifications = verifications
         self._clock: Callable[[], datetime] = clock or _utc_now
         # Populated by plan(); run() needs the Dataset versions the plan was
         # compiled against, because a Result's provenance pins them.
@@ -172,13 +178,16 @@ class MovementService:
         report = await worker.run()
 
         progress = await self.progress(movement.name, plan)
+        # `report` is the worker's; this is the verification pass.
+        verification = await self.verify(movement, plan, targets=targets)
         finished = self._clock()
 
         result = MovementResult(
             # A dot, not a slash: result names are ResourceNames, and a slash is not
             # a legal character in one.
             name=f"{movement.name}.movement",
-            status=ResultStatus.OK if progress.tasks_pending == 0 else ResultStatus.FAILED,
+            status=_status_for(progress.tasks_pending != 0, verification),
+            verification=verification.results,
             provenance=Provenance(
                 generated_at=finished,
                 operation=movement.name,
@@ -198,7 +207,7 @@ class MovementService:
         )
         await self._results.put(result)
 
-        if progress.tasks_pending == 0 and progress.tasks_quarantined == 0:
+        if progress.tasks_pending == 0 and progress.tasks_quarantined == 0 and verification.passed:
             current = await self._operations.get(movement.name)
             if current.state is OperationState.EXECUTING:
                 await self._operations.transition(
@@ -306,10 +315,12 @@ class MovementService:
             )
             outcome = await handle.result()
 
+        report = await self.verify(movement, plan, targets=targets)
         finished = self._clock()
         result = MovementResult(
             name=f"{movement.name}.movement",
-            status=ResultStatus.OK if not outcome.failed else ResultStatus.FAILED,
+            status=_status_for(bool(outcome.failed), report),
+            verification=report.results,
             provenance=Provenance(
                 generated_at=finished,
                 operation=movement.name,
@@ -330,7 +341,7 @@ class MovementService:
         )
         await self._results.put(result)
 
-        if not outcome.failed:
+        if not outcome.failed and report.passed:
             current = await self._operations.get(movement.name)
             if current.state is OperationState.EXECUTING:
                 await self._operations.transition(
@@ -361,6 +372,39 @@ class MovementService:
                     name, step, actor=ActorKind.RUNTIME, reason="advancing to execute"
                 )
 
+    async def verify(
+        self, movement: Movement, plan: PlanVersion, *, targets: Mapping[str, str]
+    ) -> VerificationReport:
+        """Run the checks the spec declared, at dataset and partition scope.
+
+        Verification is a stage, not a report produced afterwards. A Movement
+        that finished every partition is not a Movement whose output can be
+        trusted, and this is where the difference is decided.
+        """
+        runner = MovementVerificationRunner(
+            source_engine=self._source_engine, target_engine=self._target_engine
+        )
+        results: list[VerificationResult] = []
+
+        for dataset in movement.datasets:
+            manifest = self._manifests.get(dataset.name) or self._manifests.get(dataset.source)
+            if manifest is None or not dataset.verification:
+                continue
+            bound = dataset.model_copy(update={"target": targets.get(dataset.name, dataset.target)})
+            report = await runner.verify_dataset(
+                movement,
+                bound,
+                manifest,
+                plan_version=plan.version,
+                partitions=_partitions_for(plan, dataset.name),
+            )
+            results.extend(report.results)
+
+        combined = VerificationReport(results=tuple(results))
+        if self._verifications is not None:
+            await self._verifications.record(combined.results)
+        return combined
+
 
 _ORDER = (
     OperationState.DRAFT,
@@ -379,3 +423,44 @@ def _precedes(current: OperationState, target: OperationState) -> bool:
 
 def _partition_count(plan: PlanVersion) -> int:
     return sum(1 for node in plan.nodes if node.kind is NodeKind.SNAPSHOT_PARTITION)
+
+
+def _status_for(execution_failed: bool, report: VerificationReport) -> ResultStatus:
+    """Distinguish work that did not finish from work that cannot be trusted.
+
+    An engine reporting success is not the same as a correct result, so a
+    Movement that completed every partition and failed verification is
+    VERIFICATION_FAILED, not FAILED.
+    """
+    if execution_failed:
+        return ResultStatus.FAILED
+    if not report.passed:
+        return ResultStatus.VERIFICATION_FAILED
+    return ResultStatus.OK
+
+
+def _partitions_for(plan: PlanVersion, dataset: str) -> tuple[Partition, ...]:
+    """Rebuild a dataset's partitions from the plan.
+
+    Read back rather than recomputed, so verification covers exactly the
+    partitions that were copied.
+    """
+    partitions: list[Partition] = []
+    for node in plan.nodes:
+        if node.kind is not NodeKind.SNAPSHOT_PARTITION or not node.scope:
+            continue
+        if not node.scope.startswith(f"{dataset}/") and node.scope != dataset:
+            continue
+        if "partition_column" not in node.params:
+            continue
+        partitions.append(
+            Partition(
+                dataset=dataset,
+                index=int(node.params.get("partition_index", "0")),
+                column=node.params["partition_column"],
+                lo=node.params.get("lo"),
+                hi=node.params.get("hi"),
+                method=PartitionMethod(node.params.get("partition_method", "single")),
+            )
+        )
+    return tuple(partitions)

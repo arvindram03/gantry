@@ -48,6 +48,8 @@ from gantry.state.database import DATABASE_URL_ENV, create_engine, database_url
 from gantry.state.operations import OperationStore, UnknownOperationError
 from gantry.state.plans import PostgresPlanStore
 from gantry.state.registry import PostgresDatasetRegistry
+from gantry.state.verifications import PostgresVerificationStore
+from gantry.verification.runner import VerificationReport
 
 app = typer.Typer(
     name="gantry",
@@ -191,6 +193,7 @@ def _service(
         registry=PostgresDatasetRegistry(meta),
         results=PostgresResultStore(meta),
         plans=PostgresPlanStore(meta),
+        verifications=PostgresVerificationStore(meta),
     )
     return service, (source, target, meta)
 
@@ -273,6 +276,59 @@ def start(
         f"   checkpoints {len(result.provenance.checkpoints)}"
         f"   inputs pinned {len(result.provenance.lineage.inputs)}"
     )
+
+    if result.verification:
+        passed = sum(1 for finding in result.verification if finding.passed)
+        console.print(f"  verification   {passed}/{len(result.verification)} checks passed")
+    for finding in result.blocking_failures:
+        err_console.print(f"  [red]{finding.describe()}[/red]")
+
+
+@app.command()
+def verify(
+    spec: SpecArg,
+    source_url: SourceUrlOpt = None,
+    target_url: TargetUrlOpt = None,
+    meta_url: MetaUrlOpt = None,
+) -> None:
+    """Check the target against the source without moving anything.
+
+    Separate from `start` because re-running a snapshot repairs what it checks:
+    an idempotent upsert restores missing rows, so a copy can never report the
+    damage it just fixed. Asking whether what is there is correct has to be its
+    own question.
+    """
+    try:
+        movement = load_movement_spec(spec).to_movement()
+    except SpecError as exc:
+        _fail(str(exc))
+        return
+
+    service, engines = _service(source_url, target_url, meta_url)
+    targets = {dataset.name: dataset.target for dataset in movement.datasets}
+
+    async def run() -> VerificationReport:
+        try:
+            compiled = await service.plan(movement)
+            return await service.verify(movement, compiled, targets=targets)
+        finally:
+            await _dispose(engines)
+
+    report = asyncio.run(run())
+    passed = sum(1 for finding in report.results if finding.passed)
+    style = "green" if report.passed else "red"
+    console.print(
+        f"[{style}]{'verified' if report.passed else 'VERIFICATION FAILED'}[/{style}] "
+        f"{passed}/{len(report.results)} checks passed"
+    )
+    for finding in report.blocking:
+        err_console.print(f"  [red]{finding.describe()}[/red]")
+        if finding.source_result or finding.target_result:
+            err_console.print(
+                f"    [dim]source={finding.source_result} target={finding.target_result}[/dim]"
+            )
+    if not report.passed:
+        raise typer.Exit(code=1)
 
 
 @app.command()

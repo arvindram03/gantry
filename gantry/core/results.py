@@ -12,6 +12,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
+from gantry.core.evidence import VerificationResult
 from gantry.core.names import ResourceName
 from gantry.core.provenance import Provenance
 
@@ -53,6 +54,11 @@ class Result(BaseModel):
     status: ResultStatus
     provenance: Provenance
     created_at: datetime
+    # Verification findings are carried on the Result rather than looked up
+    # beside it: a Result that cannot show why it is trustworthy is not
+    # evidence of anything. Shared by both operation types, because a row-count
+    # comparison and a row-expansion bound are the same kind of statement.
+    verification: tuple[VerificationResult, ...] = ()
 
     @model_validator(mode="after")
     def _require_tz(self) -> Result:
@@ -63,3 +69,8 @@ class Result(BaseModel):
     @property
     def is_trustworthy(self) -> bool:
         return self.status is ResultStatus.OK
+
+    @property
+    def blocking_failures(self) -> tuple[VerificationResult, ...]:
+        """Findings severe enough to stop a cutover."""
+        return tuple(finding for finding in self.verification if finding.blocks_cutover)
