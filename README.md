@@ -1,5 +1,5 @@
 <p>
-  <img src="docs/assets/gantry-logo-512.jpg" alt="Gantry" width="110">
+  <img src="docs/assets/gantry-logo.jpg" alt="Gantry" width="110">
 </p>
 
 <h1>Gantry - Reliability and execution layer for data</h1>
