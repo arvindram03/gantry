@@ -16,15 +16,17 @@ from gantry.spec.errors import (
     SpecValidationError,
     UnsupportedKindError,
 )
+from gantry.spec.migration import MigrationSpec
 from gantry.spec.movement import MovementSpec
 from gantry.spec.yaml_compat import safe_load
 
-AnySpec = DatasetSpec | MovementSpec | AnalysisSpec
+AnySpec = DatasetSpec | MovementSpec | AnalysisSpec | MigrationSpec
 
-_SPEC_TYPES: dict[str, type[DatasetSpec] | type[MovementSpec] | type[AnalysisSpec]] = {
+_SPEC_TYPES: dict[str, type[AnySpec]] = {
     "Dataset": DatasetSpec,
     "Movement": MovementSpec,
     "Analysis": AnalysisSpec,
+    "Migration": MigrationSpec,
 }
 
 SUPPORTED_KINDS: tuple[str, ...] = tuple(_SPEC_TYPES)
@@ -57,6 +59,11 @@ def load_movement_spec(source: Path | str, text: str | None = None) -> MovementS
 def load_analysis_spec(source: Path | str, text: str | None = None) -> AnalysisSpec:
     """Parse a `kind: Analysis` document, rejecting any other kind."""
     return _load_as(source, text, "Analysis", AnalysisSpec)
+
+
+def load_migration_spec(source: Path | str, text: str | None = None) -> MigrationSpec:
+    """Parse a `kind: Migration` document, rejecting any other kind."""
+    return _load_as(source, text, "Migration", MigrationSpec)
 
 
 def _load_as[SpecT: BaseModel](
