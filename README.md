@@ -1,29 +1,9 @@
-<p align="center">
-  <img src="docs/assets/gantry-logo-512.jpg" alt="Gantry" width="220">
-</p>
+<img src="docs/assets/gantry-logo-512.jpg" alt="Gantry" width="110" align="left" style="margin-right: 12px;">
 
-<h1 align="center">Gantry</h1>
-
-<h3 align="center">
-  The reliability and execution layer for data movement and analysis
-</h3>
-
-<p align="center">
-  <em>An engine reporting <code>SUCCESS</code> is not a correct result. Verification decides.</em>
-</p>
-
-<p align="center">
-  <img alt="license" src="https://img.shields.io/badge/license-Apache--2.0-blue">
-  <img alt="python" src="https://img.shields.io/badge/python-3.12%2B-blue">
-  <img alt="version" src="https://img.shields.io/badge/version-v0.1.0-green">
-  <img alt="status" src="https://img.shields.io/badge/status-pre--production-orange">
-</p>
-
----
-
-Gantry sits **above** the transport and processing infrastructure you already run. It does not
+<h1 style="margin-left: 122px;">Reliability and execution layer for data</h1>
+<p>Gantry sits <strong>above</strong> the transport and processing infrastructure you already run. It does not
 own the bytes on the wire — it owns the execution contract around them: checkpoints, replay,
-ordering boundaries, idempotency, verification, policy, provenance and recovery.
+ordering boundaries, idempotency, verification, policy, provenance and recovery. An engine reporting <code>SUCCESS</code> is not a correct result. Verification decides.</p>
 
 > Agents may plan and re-plan. Deterministic infrastructure enforces guarantees.
 
