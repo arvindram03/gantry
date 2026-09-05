@@ -555,8 +555,61 @@ drives the public surfaces and already found five real bugs by doing so.
 9. Roll back → source authoritative, reason recorded
 10. Re-cut over → finalize → audit report
 
-**Exit:** two consecutive clean runs from a fresh `make dev-up`. **And measure the Movement
-diff** — the number that answers the question this plan exists to ask.
+**Exit: met.** Two consecutive clean runs, `make rehearse-migration`:
+
+```text
+step                                                            seconds  proved
+1. seed and register                                                8.7  200,000 orders, 1,000,000 customers
+2. prepare refuses an incompatible target before anything moves     1.3  refused, named the column, moved no rows, stayed replannable
+3. movement runs and reconciliation opens the door to cutover      10.8  2 dataset(s) agreed at a stated watermark
+4. a corrupted row is localised, repaired, and reconciles clean      4.7  located one row in 15 comparisons
+5. cutover refused: a gate fails, and nobody has approved            4.4  a failing gate refused by name; approval blocks
+6. approved cutover opens the rollback window                        3.5  cut over at lsn=38109237360, source authoritative
+7. divergence is reported, not acted on; rollback is on command      3.4  reported without acting; rolled back from the cutover position
+8. re-cut over, wait out the window, finalize, audit                21.0  finalize refused early then completed; audit holds 10 decisions
+total                                                               57.8
+```
+
+It is a **suite of the existing script** rather than a second one — `--suite {v1,migration,all}`
+— because the v1 sequence proves the guarantees and this one proves the workflow composed over
+them. Both still pass; `make rehearse` and `make rehearse-migration` run them separately and
+`make rehearse-all` back to back.
+
+### Two deviations, both stated rather than papered over
+
+**Step 6 refuses on `schemaCompatible`, not CDC lag.** The demo migration is snapshot-only, so
+its lag gate is legitimately `disabled` — forcing a lag reading nobody took would demonstrate
+the wrong thing. The refusal is driven by a gate that genuinely applies.
+
+**The rehearsal's rollback window is five seconds, not a day.** `migration-rehearsal.yaml`
+differs from the shipped example in that one field. The window's *duration* is policy; what is
+on trial is the mechanism — that it holds, that it reports divergence without acting, and that
+`finalize` refuses until it elapses. Waiting a real day proves nothing extra, and the step
+still waits the window out rather than simulating it.
+
+### Two bugs in the rehearsal itself
+
+A **hardcoded key**. Step 4 corrupted `order_id = 1777777`, which does not exist at rehearsal
+scale — so reconciliation agreed, and *a reconciliation that agrees because nothing was broken
+looks exactly like one that agrees because everything is right*. The victim key is derived from
+the data now, and taken from the middle of the range so the drill-down has to halve.
+
+**Rich wrapping broke a check** for the second time in this project. `"operator (rehearsal)"`
+arrived split across two lines and the assertion failed on output that was correct. It asserts
+on tokens that survive wrapping now. (The first was Day 3, where `[...]` was swallowed as
+markup.) Grepping rendered output is convenient and brittle; where a check matters, it should
+not depend on terminal width.
+
+### The measurement
+
+**No change to `gantry/movement/` or `gantry/verification/` this day**, and cumulatively across
+the whole plan: **35 lines, in one function.** Those lines fixed a v1 bug — Movements never
+reaching `COMPLETED` — that composing a workflow *exposed* rather than caused.
+
+The hypothesis this plan existed to test was RFC 0 §5.2: *migration is a workflow composed from
+Movements, not a fundamental abstraction*. Seven days of building one, through prepare,
+reconcile, gates, cutover, rollback and finalize, needed 35 lines from the primitive
+underneath. **The claim holds.**
 
 ### Day 8 — Docs and release
 

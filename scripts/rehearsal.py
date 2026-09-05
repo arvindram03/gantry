@@ -28,7 +28,7 @@ import re
 import subprocess
 import sys
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -295,6 +295,219 @@ def agent_access(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------- helpers
 
 
+# ------------------------------------------------------- the migration suite
+
+MIGRATION_SPEC = ROOT / "spec/examples/migration-rehearsal.yaml"
+MIGRATION_NAME = "orders-rehearsal"
+
+
+def _clear_migration(name: str) -> None:
+    psql(
+        META_URL,
+        f"DELETE FROM migration_transitions WHERE migration = '{name}';"
+        f"DELETE FROM migrations WHERE name = '{name}'",
+    )
+
+
+def _break_target(statement: str) -> None:
+    psql(TARGET_URL, statement)
+
+
+def migration_prepare(args: argparse.Namespace) -> None:
+    with step(2, "prepare refuses an incompatible target before anything moves") as proved:
+        _clear_migration(MIGRATION_NAME)
+        _clear_operation(MOVEMENT_NAME)
+        gantry("migration", "plan", str(MIGRATION_SPEC))
+
+        before = _target_rows()
+        _break_target("ALTER TABLE public.orders ALTER COLUMN amount TYPE numeric(6,2)")
+
+        output = gantry(
+            "migration", "start", str(MIGRATION_SPEC), "--backend", args.backend, expect=1
+        )
+        require("not ready" in output, f"prepare did not refuse:\n{output}")
+        require("amount" in output, f"the refusal did not name the column:\n{output}")
+
+        after = _target_rows()
+        require(after == before, f"rows moved despite a refusal: {before} -> {after}")
+
+        state = _migration_state()
+        require(state == "planned", f"expected planned after a refusal, got {state!r}")
+        proved.append("refused, named the column, moved no rows, stayed replannable")
+
+
+def migration_snapshot(args: argparse.Namespace) -> None:
+    with step(3, "movement runs and reconciliation opens the door to cutover") as proved:
+        _break_target("ALTER TABLE public.orders ALTER COLUMN amount TYPE numeric(12,2)")
+        output = gantry("migration", "start", str(MIGRATION_SPEC), "--backend", args.backend)
+
+        require("ready_for_cutover" in output, f"did not reach cutover:\n{output}")
+        agreed = output.count("agrees")
+        require(agreed >= 1, f"nothing reconciled:\n{output}")
+        proved.append(f"{agreed} dataset(s) agreed at a stated watermark")
+
+
+def migration_localise(args: argparse.Namespace) -> None:
+    with step(4, "a corrupted row is localised, repaired, and reconciles clean") as proved:
+        # Derived, not hardcoded. A fixed key silently stops corrupting
+        # anything the moment the rehearsal runs at a smaller scale, and a
+        # reconciliation that agrees because nothing was broken looks exactly
+        # like one that agrees because everything is right.
+        victim = _mid_key()
+        _break_target(f"UPDATE public.orders SET amount = amount + 1 WHERE order_id = {victim}")
+
+        output = gantry("migration", "reconcile", str(MIGRATION_SPEC), expect=1)
+        require("disagrees" in output, f"corruption went unnoticed:\n{output}")
+        require(str(victim) in output, f"the differing key was not named:\n{output}")
+
+        comparisons = _int_after(output, r"in (\d+) comparisons") or 0
+        require(comparisons > 1, "the drill-down enumerated instead of halving")
+
+        _break_target(f"UPDATE public.orders SET amount = amount - 1 WHERE order_id = {victim}")
+        clean = gantry("migration", "reconcile", str(MIGRATION_SPEC))
+        require("disagrees" not in clean, f"still disagreeing after repair:\n{clean}")
+        proved.append(f"located one row in {comparisons} comparisons, repaired, reconciled clean")
+
+
+def migration_gates(args: argparse.Namespace) -> None:
+    with step(5, "cutover refused: a gate fails, and nobody has approved") as proved:
+        # The plan called for a CDC-lag refusal. This demo migration is
+        # snapshot-only, so its lag gate is legitimately disabled; the refusal
+        # is driven by a gate that genuinely applies instead. Forcing a lag
+        # reading nobody took would demonstrate the wrong thing.
+        _break_target("ALTER TABLE public.orders ALTER COLUMN amount TYPE numeric(6,2)")
+
+        refused = gantry(
+            "migration",
+            "cutover",
+            str(MIGRATION_SPEC),
+            "--approved-by",
+            "rehearsal",
+            "--reason",
+            "trying it on",
+            expect=1,
+        )
+        require("refused" in refused, f"a failing gate did not refuse:\n{refused}")
+        require("schemaCompatible" in refused, f"the failing gate was not named:\n{refused}")
+
+        _break_target("ALTER TABLE public.orders ALTER COLUMN amount TYPE numeric(12,2)")
+        gantry("migration", "start", str(MIGRATION_SPEC), "--backend", args.backend)
+
+        unapproved = gantry("migration", "gates", str(MIGRATION_SPEC), expect=1)
+        require("requireApproval" in unapproved, f"approval was not required:\n{unapproved}")
+        require(
+            "blocked by requireApproval" in unapproved,
+            f"an unapproved cutover was not blocked:\n{unapproved}",
+        )
+        proved.append("a failing gate refused by name; without an approver, approval blocks")
+
+
+def migration_cutover(args: argparse.Namespace) -> None:
+    with step(6, "approved cutover opens the rollback window") as proved:
+        output = gantry(
+            "migration",
+            "cutover",
+            str(MIGRATION_SPEC),
+            "--approved-by",
+            "rehearsal",
+            "--reason",
+            "gates green",
+        )
+        require("cut over" in output, f"cutover did not complete:\n{output}")
+
+        position = _first_match(output, r"lsn=(\d+)")
+        require(position is not None, f"no source position recorded:\n{output}")
+
+        window = gantry("migration", "window", str(MIGRATION_SPEC))
+        require("holding" in window, f"the window did not open:\n{window}")
+        require("source authoritative" in window, f"authority unclear:\n{window}")
+        proved.append(f"cut over at lsn={position}, window holding, source authoritative")
+
+
+def migration_rollback(args: argparse.Namespace) -> None:
+    with step(7, "divergence is reported, not acted on; rollback is on command") as proved:
+        drifted = _mid_key()
+        _break_target(f"UPDATE public.orders SET amount = amount + 1 WHERE order_id = {drifted}")
+
+        window = gantry("migration", "window", str(MIGRATION_SPEC))
+        require("diverged" in window, f"divergence went unnoticed:\n{window}")
+        require("your call" in window, f"the window did not defer the decision:\n{window}")
+        require(
+            _migration_state() == "rollback_window",
+            "reporting divergence moved the workflow; it must only report",
+        )
+
+        _break_target(f"UPDATE public.orders SET amount = amount - 1 WHERE order_id = {drifted}")
+        rolled = gantry(
+            "migration",
+            "rollback",
+            str(MIGRATION_SPEC),
+            "--decided-by",
+            "rehearsal",
+            "--reason",
+            "checkout errors spiked",
+        )
+        require("rolled back" in rolled, f"rollback did not happen:\n{rolled}")
+        require("no data moved back" in rolled, f"rollback was not traffic-only:\n{rolled}")
+        proved.append("divergence reported without acting; rolled back from the cutover position")
+
+
+def migration_finalize(args: argparse.Namespace) -> None:
+    with step(8, "re-cut over, wait out the window, finalize, audit") as proved:
+        _clear_migration(MIGRATION_NAME)
+        _clear_operation(MOVEMENT_NAME)
+        gantry("migration", "start", str(MIGRATION_SPEC), "--backend", args.backend)
+        gantry(
+            "migration",
+            "cutover",
+            str(MIGRATION_SPEC),
+            "--approved-by",
+            "rehearsal",
+            "--reason",
+            "second attempt",
+        )
+
+        early = gantry("migration", "finalize", str(MIGRATION_SPEC), expect=1)
+        require("cannot finalize" in early, f"finalize did not refuse an open window:\n{early}")
+
+        # The spec's window is seconds, so waiting it out is honest rather than
+        # simulated. Its duration is policy; the mechanism is what is on trial.
+        time.sleep(6)
+
+        final = gantry("migration", "finalize", str(MIGRATION_SPEC))
+        require("completed" in final, f"finalize did not complete:\n{final}")
+
+        audit = gantry("migration", "audit", MIGRATION_NAME)
+        for decision in ("cutting_over", "rollback_window", "completed"):
+            require(decision in audit, f"the audit lost {decision}:\n{audit}")
+        # Tokens, not the joined phrase. Rich wraps to the terminal width, so
+        # "operator (rehearsal)" can arrive split across two lines — the second
+        # time rendering has broken a check in this script, after markup
+        # swallowing a bracketed subject on Day 3.
+        require("operator" in audit, f"no operator decision in the trail:\n{audit}")
+        require("rehearsal" in audit, f"the approver is not in the trail:\n{audit}")
+        decisions = audit.count("->")
+        proved.append(f"finalize refused early then completed; audit holds {decisions} decisions")
+
+
+def _mid_key() -> int:
+    """A key that exists, in the middle of the range.
+
+    Middle rather than an end so the drill-down actually has to halve: a row
+    at the boundary can be found by a search that is not a binary one.
+    """
+    value = psql(TARGET_URL, "SELECT (min(order_id) + max(order_id)) / 2 FROM public.orders")
+    return int(value.strip() or 1)
+
+
+def _target_rows() -> int:
+    return int(psql(TARGET_URL, "SELECT count(*) FROM public.orders").strip() or 0)
+
+
+def _migration_state() -> str:
+    return psql(META_URL, f"SELECT state FROM migrations WHERE name = '{MIGRATION_NAME}'").strip()
+
+
 def _int_after(text: str, pattern: str) -> int | None:
     match = re.search(pattern, text, re.IGNORECASE)
     return int(match.group(1).replace(",", "")) if match else None
@@ -303,6 +516,43 @@ def _int_after(text: str, pattern: str) -> int | None:
 def _first_match(text: str, pattern: str) -> str | None:
     match = re.search(pattern, text)
     return match.group(1) if match else None
+
+
+V1_STAGES: tuple[Callable[[argparse.Namespace], None], ...] = (
+    seed_and_register,
+    # Before the Movement, not after: the chaos suite clears every
+    # Operation, which would take the Movement Result that step 6
+    # traces a finding back to.
+    faults,
+    move,
+    corrupt_and_repair,
+    analysis,
+    provenance,
+    agent_access,
+)
+
+# The Migration suite reuses v1's seeding and then drives the workflow. It is
+# a separate sequence rather than more steps on the end, because it proves a
+# different claim: v1 proves the guarantees, this proves the workflow composed
+# over them.
+MIGRATION_STAGES: tuple[Callable[[argparse.Namespace], None], ...] = (
+    migration_prepare,
+    migration_snapshot,
+    migration_localise,
+    migration_gates,
+    migration_cutover,
+    migration_rollback,
+    migration_finalize,
+)
+
+
+def _stages(suite: str) -> tuple[Callable[[argparse.Namespace], None], ...]:
+    if suite == "v1":
+        return V1_STAGES
+    if suite == "migration":
+        # Seeding still has to happen; the workflow needs data to move.
+        return (seed_and_register, *MIGRATION_STAGES)
+    return (*V1_STAGES, *MIGRATION_STAGES)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -323,6 +573,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=1_000_000,
         help="Customers to seed. The crash test partitions these, so it needs a million.",
     )
+    parser.add_argument(
+        "--suite",
+        default="v1",
+        choices=("v1", "migration", "all"),
+        help="Which sequence to run: the v1 guarantees, the Migration workflow, or both.",
+    )
     parser.add_argument("--registry", type=Path, default=ROOT / ".gantry" / "rehearsal.json")
     parser.add_argument("--backend", default="temporal", choices=("temporal", "queue"))
     parser.add_argument("--skip-seed", action="store_true", help="Reuse the data already there.")
@@ -339,20 +595,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     args.registry.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"{BOLD}gantry v1 rehearsal{OFF}  {DIM}{args.rows:,} rows, {args.backend} backend{OFF}")
+    label = {"v1": "v1", "migration": "migration workflow", "all": "v1 + migration"}[args.suite]
+    print(
+        f"{BOLD}gantry {label} rehearsal{OFF}  {DIM}{args.rows:,} rows, {args.backend} backend{OFF}"
+    )
     try:
-        for stage in (
-            seed_and_register,
-            # Before the Movement, not after: the chaos suite clears every
-            # Operation, which would take the Movement Result that step 6
-            # traces a finding back to.
-            faults,
-            move,
-            corrupt_and_repair,
-            analysis,
-            provenance,
-            agent_access,
-        ):
+        for stage in _stages(args.suite):
             stage(args)
     except RehearsalError as failure:
         print(f"\n{RED}rehearsal failed{OFF}\n{failure}", file=sys.stderr)

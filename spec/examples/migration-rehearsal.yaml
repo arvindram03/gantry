@@ -1,0 +1,31 @@
+# The migration the rehearsal drives.
+#
+# Identical to migration-orders-to-warehouse.yaml but for the rollback window,
+# which is seconds rather than a day. The window's *duration* is policy; what
+# the rehearsal is proving is the mechanism — that it holds, that it reports
+# divergence without acting, and that finalize refuses until it has elapsed.
+# Waiting a real day to demonstrate that would prove nothing extra.
+apiVersion: gantry.dev/v1alpha1
+kind: Migration
+
+metadata:
+  name: orders-rehearsal
+
+description: The migration workflow, end to end, for the rehearsal.
+
+movements:
+  - movement: orders-snapshot
+    spec: examples/postgres-to-postgres/movement.yaml
+
+cutover:
+  gates:
+    allPartitionsVerified: true
+    maxCdcLag: 2s
+    criticalVerificationFailures: 0
+    targetHealthy: true
+    schemaCompatible: true
+    requireApproval: true
+
+rollback:
+  window: 5s
+  sourceRemainsAuthoritative: true

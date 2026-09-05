@@ -1,7 +1,7 @@
 .DEFAULT_GOAL := help
 COMPOSE := docker compose -f deploy/docker/docker-compose.yml
 
-.PHONY: help install check fmt lint type test test-int test-chaos migrate dev-up dev-down dev-logs seed rehearse demo clean
+.PHONY: help install check fmt lint type test test-int test-chaos migrate dev-up dev-down dev-logs seed rehearse rehearse-migration rehearse-all demo clean
 
 help: ## Show available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "};{printf "  \033[36m%-12s\033[0m %s\n",$$1,$$2}'
@@ -47,8 +47,14 @@ dev-logs: ## Tail stack logs
 seed: ## Seed the source database with synthetic orders (ROWS=1000000)
 	uv run python -m gantry.cli.main seed --rows $${ROWS:-1000000}
 
-rehearse: dev-up migrate ## Full end-to-end rehearsal, timed (ROWS=4000000)
-	uv run python scripts/rehearsal.py --rows $${ROWS:-4000000} --reset
+rehearse: dev-up migrate ## v1 end-to-end rehearsal, timed (ROWS=4000000)
+	uv run python scripts/rehearsal.py --suite v1 --rows $${ROWS:-4000000} --reset
+
+rehearse-migration: dev-up migrate ## Migration workflow rehearsal, timed
+	uv run python scripts/rehearsal.py --suite migration --rows $${ROWS:-200000} --reset
+
+rehearse-all: dev-up migrate ## Both rehearsals, back to back
+	uv run python scripts/rehearsal.py --suite all --rows $${ROWS:-200000} --reset
 
 demo: dev-up migrate ## The engine-success / Gantry-failure case, on real data
 	uv run python scripts/guarantee_boundary.py
