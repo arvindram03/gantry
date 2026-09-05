@@ -13,10 +13,20 @@ is broken.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
+
+from gantry.core.commit import CommitResult
+from gantry.lifecycle.plan import PlanNode
 
 
-class SimulatedCrashError(Exception):
-    """A worker process dying. Not catchable as an ordinary failure."""
+class SimulatedCrashError(BaseException):
+    """A worker process dying.
+
+    Deliberately a BaseException rather than an Exception: a process being
+    killed is not a failure the runtime gets to classify and retry, it is the
+    process ending. `except Exception` must not catch it, exactly as it must
+    not catch a real SIGKILL.
+    """
 
 
 class SimulatedFailureError(Exception):
@@ -72,19 +82,23 @@ class FakeTarget:
 
 
 class FakeWorkload:
-    """The work a plan node performs, with faults injected around it.
+    """A node executor whose effects can fail in the specific ways the runtime
+    claims to survive.
 
     The commit/checkpoint ordering lives in the worker, not here. This only
-    provides an effect that can fail in the specific ways the runtime claims to
-    survive.
+    provides an effect, and a `CommitResult` attesting it - which is what the
+    worker requires before it may record progress.
     """
 
-    def __init__(self, target: FakeTarget, faults: FaultSpec | None = None) -> None:
+    def __init__(self, operation: str, target: FakeTarget, faults: FaultSpec | None = None) -> None:
+        self.operation = operation
         self.target = target
         self.faults = faults or FaultSpec()
 
-    def run(self, operation: str, node_id: str) -> str:
-        """Perform one node's effect and return its idempotency key."""
+    async def execute(self, node: PlanNode) -> CommitResult:
+        """Perform one node's effect."""
+        node_id = node.id
+
         if node_id in self.faults.crash_before_commit:
             self.faults.crash_before_commit.discard(node_id)
             raise SimulatedCrashError(f"worker died before committing {node_id}")
@@ -94,8 +108,8 @@ class FakeWorkload:
             self.faults.transient_failures[node_id] = remaining - 1
             raise SimulatedFailureError(f"transient fault on {node_id} ({remaining} left)")
 
-        key = f"{operation}/{node_id}"
-        self.target.apply(key, node_id)
+        key = f"{self.operation}/{node_id}"
+        inserted = self.target.apply(key, node_id)
 
         if node_id in self.faults.duplicate_delivery:
             # The same effect arriving twice, as at-least-once delivery allows.
@@ -105,4 +119,8 @@ class FakeWorkload:
             self.faults.crash_after_commit.discard(node_id)
             raise SimulatedCrashError(f"worker died after committing {node_id}, before checkpoint")
 
-        return key
+        return CommitResult(
+            rows_inserted=1 if inserted else 0,
+            rows_unchanged=0 if inserted else 1,
+            committed_at=datetime.now(UTC),
+        )

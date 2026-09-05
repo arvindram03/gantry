@@ -127,7 +127,8 @@ async def test_checkpoint_is_not_recorded_when_the_worker_dies_after_commit() ->
         "doomed",
         simulator.backend,
         simulator.checkpoints,
-        simulator.workload.run,
+        simulator.workload,
+        plan,
         clock=simulator.clock,
     )
     with pytest.raises(SimulatedCrashError):

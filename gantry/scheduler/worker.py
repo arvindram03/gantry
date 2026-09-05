@@ -1,14 +1,18 @@
 """The worker loop.
 
-The ordering in `_execute` is the whole point, and it is structural rather than
-a convention a caller has to remember:
+The ordering in `_run_task` is the whole point, and it is enforced by types
+rather than by convention:
 
-    read -> process -> write -> commit -> verify durable -> advance checkpoint
+    lease -> execute -> obtain CommitResult -> advance checkpoint -> complete
+
+A checkpoint cannot be advanced without a `CommitResult`, and only an executor
+that actually committed can produce one. Nothing in the runtime can manufacture
+progress it did not make.
 
 A crash anywhere before the checkpoint leaves the task leased. The lease
 expires, another worker reclaims it, and the effect runs again - which is safe
 only because effects are idempotent. Advancing the checkpoint before the commit
-would make progress metadata run ahead of durable state, and no amount of
+would let progress metadata run ahead of durable state, and no amount of
 retrying recovers from that.
 """
 
@@ -17,14 +21,23 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from typing import Protocol
 
-from gantry.adapters.fake import SimulatedCrashError
+from gantry.core.commit import CommitResult
 from gantry.core.positions import Checkpoint, CheckpointScope, PositionKind, SourcePosition
+from gantry.lifecycle.plan import PlanNode, PlanVersion
 from gantry.scheduler.backend import Task, TaskState, WorkflowBackend
+from gantry.scheduler.failures import FailureClass, classify
 from gantry.state.checkpoints import CheckpointStore
 
 DEFAULT_LEASE = timedelta(seconds=30)
 DEFAULT_MAX_ATTEMPTS = 5
+
+
+class NodeExecutor(Protocol):
+    """Performs one plan node's work and attests that it committed."""
+
+    async def execute(self, node: PlanNode) -> CommitResult: ...
 
 
 @dataclass
@@ -35,11 +48,18 @@ class WorkerReport:
     completed: list[str] = field(default_factory=list)
     retried: list[str] = field(default_factory=list)
     quarantined: list[str] = field(default_factory=list)
+    fatal: list[str] = field(default_factory=list)
+    needs_replan: list[str] = field(default_factory=list)
+    rows_written: int = 0
     crashed_on: str | None = None
 
     @property
     def crashed(self) -> bool:
         return self.crashed_on is not None
+
+    @property
+    def stopped_permanently(self) -> bool:
+        return bool(self.fatal or self.needs_replan)
 
 
 class Worker:
@@ -50,7 +70,8 @@ class Worker:
         name: str,
         backend: WorkflowBackend,
         checkpoints: CheckpointStore,
-        execute: Callable[[str, str], str],
+        executor: NodeExecutor,
+        plan: PlanVersion,
         *,
         clock: Callable[[], datetime],
         lease: timedelta = DEFAULT_LEASE,
@@ -59,7 +80,8 @@ class Worker:
         self._name = name
         self._backend = backend
         self._checkpoints = checkpoints
-        self._execute = execute
+        self._executor = executor
+        self._plan = plan
         self._clock = clock
         self._lease = lease
         self._max_attempts = max_attempts
@@ -67,9 +89,9 @@ class Worker:
     async def run(self, *, max_tasks: int | None = None) -> WorkerReport:
         """Drain runnable tasks until none remain, or the process dies.
 
-        A `SimulatedCrashError` propagates out deliberately: a crashed worker does
-        not get to tidy up after itself, and the task stays leased until its
-        lease expires.
+        A `BaseException` that is not an `Exception` - a kill, a cancellation -
+        propagates deliberately. A crashed worker does not get to tidy up after
+        itself, and its task stays leased until the lease expires.
         """
         report = WorkerReport(worker=self._name)
         processed = 0
@@ -81,27 +103,25 @@ class Worker:
             processed += 1
 
             try:
-                await self._run_task(task)
-            except SimulatedCrashError as crash:
-                report.crashed_on = task.node_id
-                raise crash
+                result = await self._run_task(task)
             except Exception as error:
-                state = await self._backend.release(
-                    task, str(error), max_attempts=self._max_attempts
-                )
-                if state is TaskState.QUARANTINED:
-                    report.quarantined.append(task.node_id)
-                else:
-                    report.retried.append(task.node_id)
+                if not await self._handle_failure(task, error, report):
+                    break
                 continue
 
             report.completed.append(task.node_id)
+            report.rows_written += result.rows_changed
 
         return report
 
-    async def _run_task(self, task: Task) -> None:
-        # 1. Perform the effect and commit it durably.
-        key = self._execute(task.operation, task.node_id)
+    async def _run_task(self, task: Task) -> CommitResult:
+        node = self._plan.node(task.node_id)
+        if node is None:
+            raise ValueError(f"node {task.node_id!r} is not in plan version {self._plan.version}")
+
+        # 1. Do the work and commit it durably. The CommitResult is the only
+        #    evidence that this happened.
+        result = await self._executor.execute(node)
 
         # 2. Only now record progress. A crash between these two lines is the
         #    case the whole design has to survive.
@@ -110,10 +130,36 @@ class Worker:
             Checkpoint(
                 scope=CheckpointScope.PARTITION,
                 scope_id=task.node_id,
-                position=SourcePosition(kind=PositionKind.PARTITION_ID, value=key),
-                committed_at=self._clock(),
+                position=SourcePosition(
+                    kind=PositionKind.PARTITION_ID, value=node.scope or task.node_id
+                ),
+                committed_at=result.committed_at,
             ),
         )
 
         # 3. And only then release the task.
         await self._backend.complete(task)
+        return result
+
+    async def _handle_failure(self, task: Task, error: Exception, report: WorkerReport) -> bool:
+        """Record a failure. Returns False when the worker should stop."""
+        failure = classify(error)
+        reason = f"{failure.value}: {error}"
+
+        if failure is FailureClass.FATAL:
+            await self._backend.release(task, reason, max_attempts=0)
+            report.fatal.append(task.node_id)
+            return False
+
+        if failure is FailureClass.NEEDS_REPLAN:
+            # Retrying reproduces the same error; the plan has to change.
+            await self._backend.release(task, reason, max_attempts=0)
+            report.needs_replan.append(task.node_id)
+            return False
+
+        state = await self._backend.release(task, reason, max_attempts=self._max_attempts)
+        if state is TaskState.QUARANTINED:
+            report.quarantined.append(task.node_id)
+        else:
+            report.retried.append(task.node_id)
+        return True

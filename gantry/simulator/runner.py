@@ -68,7 +68,7 @@ class Simulator:
         self._tick = start
         self.backend = InMemoryWorkflowBackend()
         self.checkpoints = InMemoryCheckpointStore()
-        self.workload = FakeWorkload(self.target, self.faults)
+        self.workload = FakeWorkload(plan.operation, self.target, self.faults)
 
     def clock(self) -> datetime:
         # Time only moves forward, and never during a task, so lease expiry is
@@ -85,7 +85,8 @@ class Simulator:
                 f"worker-{attempt}",
                 self.backend,
                 self.checkpoints,
-                self.workload.run,
+                self.workload,
+                self.plan,
                 clock=self.clock,
                 lease=self._lease,
             )

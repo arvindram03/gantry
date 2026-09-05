@@ -44,6 +44,8 @@ jobs:
         run: uv run alembic upgrade head
       - run: uv run pytest -m integration
       - name: Chaos tests
+        env:
+          PYTHONPATH: tests/integration/helpers
         run: uv run pytest -m chaos
       - name: Stack logs on failure
         if: failure()

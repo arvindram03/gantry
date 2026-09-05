@@ -32,8 +32,8 @@ migrate: ## Apply metadata store migrations
 test-int: dev-up migrate ## Integration tests against the local stack
 	uv run pytest -m integration
 
-test-chaos: dev-up ## Fault-injection tests
-	uv run pytest -m chaos
+test-chaos: dev-up migrate ## Fault-injection tests, including a real kill -9
+	PYTHONPATH=tests/integration/helpers uv run pytest -m chaos
 
 dev-up: ## Start the local stack and wait for health
 	$(COMPOSE) up -d --wait

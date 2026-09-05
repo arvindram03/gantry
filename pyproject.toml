@@ -76,6 +76,11 @@ strict = true
 warn_unreachable = true
 plugins = ["pydantic.mypy"]
 
+# Subprocess helper for the crash-replay test; imported by path at runtime.
+[[tool.mypy.overrides]]
+module = ["build_plan"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
