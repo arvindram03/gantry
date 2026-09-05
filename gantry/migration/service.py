@@ -23,8 +23,34 @@ from gantry.core.operation import TERMINAL_STATES, OperationState
 from gantry.lifecycle.migration import MigrationState
 from gantry.lifecycle.states import ActorKind
 from gantry.migration.model import Migration
+from gantry.migration.prepare import PrepareReport
 from gantry.state.migrations import MigrationRecord, MigrationStore, MigrationTransition
 from gantry.state.operations import OperationStore, UnknownOperationError
+
+
+class PrepareRefusedError(Exception):
+    """The target cannot hold what the source would send it.
+
+    Raised rather than returned because a caller that ignored it would go on
+    to move data into a target the runtime has just said will not hold it. The
+    report travels with the exception so nothing has to be re-derived.
+    """
+
+    def __init__(self, migration: str, report: PrepareReport) -> None:
+        super().__init__(f"migration {migration!r} not ready: {report.describe()}")
+        self.migration = migration
+        self.report = report
+
+
+class Preparer(Protocol):
+    """Whatever knows how to check a target before anything moves.
+
+    Injected for the same reason the runner is: the workflow knows that a
+    Migration can be checked and that the answer is a report. It does not know
+    about engines, catalogs or connection strings.
+    """
+
+    async def __call__(self, migration: Migration, /) -> PrepareReport: ...
 
 
 class MovementRunner(Protocol):
@@ -34,7 +60,7 @@ class MovementRunner(Protocol):
     `MovementService` itself. The Migration asks; something else knows how.
     """
 
-    async def __call__(self, name: str) -> object: ...
+    async def __call__(self, name: str, /) -> object: ...
 
 
 @dataclass(frozen=True)
@@ -130,7 +156,13 @@ class MigrationService:
         )
         return await self._migrations.get(migration.name)
 
-    async def run(self, migration: Migration, *, runner: MovementRunner) -> MigrationStatus:
+    async def run(
+        self,
+        migration: Migration,
+        *,
+        runner: MovementRunner,
+        preparer: Preparer | None = None,
+    ) -> MigrationStatus:
         """Drive the Movements, and derive the workflow state from what they did.
 
         The runner is injected rather than constructed here, and that is the
@@ -150,6 +182,24 @@ class MigrationService:
                 actor=ActorKind.RUNTIME,
                 reason="checking targets before moving anything",
             )
+
+            # The point of Prepare: refuse here, where a mismatch costs a
+            # minute, rather than at cutover, where it costs the snapshot and
+            # the catch-up too. The workflow goes back to PLANNED rather than
+            # FAILED — an incompatible target is repairable input, not a dead
+            # end, exactly as a failed Analysis validation returns to DRAFT.
+            if preparer is not None:
+                report = await preparer(migration)
+                if not report.ready:
+                    await self._migrations.transition(
+                        migration.name,
+                        MigrationState.PLANNED,
+                        actor=ActorKind.RUNTIME,
+                        reason=f"prepare refused: {report.describe()}",
+                        evidence={"failures": [f.describe() for f in report.failures]},
+                    )
+                    raise PrepareRefusedError(migration.name, report)
+
             await self._migrations.transition(
                 migration.name,
                 MigrationState.SNAPSHOTTING,

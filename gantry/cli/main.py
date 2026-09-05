@@ -27,7 +27,7 @@ from gantry.adapters.source.seed import seed as seed_source
 from gantry.analysis.artifact import GeneratedArtifact
 from gantry.api.aggregates import Aggregate, AggregateFunction, AggregateQuery
 from gantry.api.datasets import Datasets, QueryOutcome
-from gantry.core.dataset import DatasetRef, DatasetVersion
+from gantry.core.dataset import DatasetManifest, DatasetRef, DatasetVersion
 from gantry.core.results import Result
 from gantry.core.sizes import format_byte_size
 from gantry.lifecycle.migration import IllegalMigrationTransitionError
@@ -37,7 +37,15 @@ from gantry.lifecycle.states import (
     OperationInFlightError,
     StateTransition,
 )
-from gantry.migration.service import MigrationService, MigrationStatus
+from gantry.migration.model import Migration
+from gantry.migration.prepare import PrepareReport, prepare
+from gantry.migration.service import (
+    MigrationService,
+    MigrationStatus,
+    Preparer,
+    PrepareRefusedError,
+)
+from gantry.movement.model import MovementMode
 from gantry.movement.result import MovementResult
 from gantry.movement.service import MovementService, Progress
 from gantry.policy.audit import access_log_for
@@ -1227,6 +1235,100 @@ def migration_pause(
     console.print(f"[yellow]paused[/yellow] {name}")
 
 
+def _preparer(
+    movements: MovementService,
+    source: AsyncEngine,
+    target: AsyncEngine,
+    migration: Migration,
+) -> Preparer:
+    """Build the Prepare closure the workflow calls.
+
+    Discovery of both sides happens here rather than in the workflow: what a
+    target currently looks like is an adapter question, and the Migration only
+    needs the verdict.
+    """
+
+    async def run(_migration: Migration, /) -> PrepareReport:
+        source_adapter = PostgresSourceAdapter(source)
+        target_adapter = PostgresSourceAdapter(target)
+        discovered = {m.name: m for m in await source_adapter.discover()}
+        existing = {m.name: m for m in await target_adapter.discover()}
+
+        manifests: dict[str, DatasetManifest] = {}
+        targets: dict[str, str] = {}
+        for name in migration.runnable:
+            parsed = load_movement_spec(migration.movement_specs[name]).to_movement()
+            for dataset in parsed.datasets:
+                if dataset.name in discovered:
+                    manifests[dataset.name] = discovered[dataset.name]
+                    targets[dataset.name] = dataset.target
+
+        return await prepare(
+            migration.name,
+            source=source,
+            target=target,
+            manifests=manifests,
+            targets=targets,
+            target_manifests=existing,
+            # Only a streaming migration needs a slot. Demanding logical
+            # decoding for a snapshot would refuse migrations that are fine.
+            needs_replication=any(
+                load_movement_spec(migration.movement_specs[name]).to_movement().mode
+                is not MovementMode.SNAPSHOT
+                for name in migration.runnable
+            ),
+        )
+
+    return run
+
+
+@migration_app.command("prepare")
+def migration_prepare(
+    spec: SpecArg,
+    source_url: SourceUrlOpt = None,
+    target_url: TargetUrlOpt = None,
+    meta_url: MetaUrlOpt = None,
+) -> None:
+    """Check the target without moving anything."""
+    try:
+        migration = load_migration_spec(spec).to_migration()
+    except SpecError as exc:
+        _fail(str(exc))
+        return
+
+    movements, engines = _service(source_url, target_url, meta_url)
+    source = create_engine(source_url or _source_url())
+    target = create_engine(target_url or _target_url())
+
+    async def run() -> PrepareReport:
+        try:
+            return await _preparer(movements, source, target, migration)(migration)
+        finally:
+            await source.dispose()
+            await target.dispose()
+            await _dispose(engines)
+
+    report = asyncio.run(run())
+
+    if report.ready:
+        console.print(f"[green]ready[/green] {report.describe()}")
+    else:
+        console.print(f"[red]not ready[/red] {report.migration}")
+    for failure in report.failures:
+        err_console.print(f"  [red]✗[/red] {failure.describe()}")
+        err_console.print(f"      [dim]fix: {failure.repair}[/dim]")
+    for name in report.to_create:
+        console.print(f"  [yellow]+[/yellow] will create target {name}")
+    for compatibility in report.compatibility:
+        if compatibility.extra_columns:
+            console.print(
+                f"  [dim]{compatibility.dataset}: target also has "
+                f"{', '.join(compatibility.extra_columns)}[/dim]"
+            )
+    if not report.ready:
+        raise typer.Exit(code=1)
+
+
 @migration_app.command("start")
 def migration_start(
     spec: SpecArg,
@@ -1267,15 +1369,30 @@ def migration_start(
             return await movements.run_on_temporal(parsed, compiled, targets=targets)
         return await movements.run(parsed, compiled, targets=targets)
 
+    source = create_engine(source_url or _source_url())
+    target = create_engine(target_url or _target_url())
+
     async def run() -> MigrationStatus:
         try:
-            return await service.run(migration, runner=run_movement)
+            return await service.run(
+                migration,
+                runner=run_movement,
+                preparer=_preparer(movements, source, target, migration),
+            )
         finally:
+            await source.dispose()
+            await target.dispose()
             await _dispose(engines)
             await meta.dispose()
 
     try:
         status = asyncio.run(run())
+    except PrepareRefusedError as exc:
+        err_console.print(f"[red]not ready:[/red] {exc.report.migration}")
+        for failure in exc.report.failures:
+            err_console.print(f"  [red]✗[/red] {failure.describe()}")
+            err_console.print(f"      [dim]fix: {failure.repair}[/dim]")
+        raise typer.Exit(code=1) from None
     except (OperationInFlightError, IllegalMigrationTransitionError) as exc:
         _fail(str(exc))
         return

@@ -222,8 +222,56 @@ cheaper.
 - **[B]** Index strategy: which target indexes to create before the snapshot and which to
   defer until after, since indexes slow bulk load and their absence slows verification.
 
-**Exit:** an incompatible target is refused during `PREPARING` with a structured report naming
-every offending column — before a single row moves.
+**Exit: met.** Against the real stack, with three different faults introduced into the demo
+target at once:
+
+```text
+$ gantry migration prepare spec/examples/migration-orders-to-warehouse.yaml
+not ready orders-to-warehouse
+  ✗ schema_compatible (public.customers.region -> public.customers): source allows
+    nulls, target does not; rows would be rejected                fix: alter_target
+  ✗ schema_compatible (public.orders.amount -> public.orders): source is
+    numeric(12, 2), target is numeric(6, 2); the target is narrower and would
+    truncate                                                      fix: alter_target
+  ✗ schema_compatible (public.orders.status -> public.orders): target has no such
+    column                                                        fix: alter_target
+  public.customers: target also has warehouse_loaded_at
+```
+
+`gantry migration start` refuses on the same report, and the assertion that matters is the
+row count: **3,000,000 before, 3,000,000 after.** Nothing moved. The workflow returns to
+`PLANNED` rather than `FAILED` — an incompatible target is repairable input, not a dead end,
+exactly as a failed Analysis validation returns to `DRAFT`.
+
+### Compatibility is directional, and that is the whole design
+
+A target wider than the source is fine; the reverse truncates. A target more permissive about
+nulls is fine; the reverse rejects rows the source considers valid. Every rule is written in
+the direction data actually flows — a symmetric check would refuse half the migrations that
+are safe and permit half that are not.
+
+Three things are deliberately *not* refusals. A target that does not exist yet is reported as
+something the run will create, because "about to create four tables" is a thing an operator
+may want to stop but not an error. Extra target columns are reported, not refused: a target
+may carry its own bookkeeping, and a column nobody remembers adding is worth seeing before a
+cutover rather than after. And a snapshot-only migration is not asked for logical decoding,
+which would refuse migrations that are perfectly fine.
+
+**Writability is tested, not asked about.** Querying the catalog for granted privileges gets
+this wrong in every interesting case — inherited roles, default privileges, a read replica
+that answers happily until you write. Creating and dropping a temporary table is the question
+actually being asked.
+
+### Two bugs the tests found
+
+`check_reachable` caught `SQLAlchemyError`, but a refused connection surfaces as `OSError` and
+never reaches the driver's exception hierarchy — so the one case the check exists for was the
+one it missed.
+
+And the refusals rendered as `schema_compatible : source allows nulls…` with the subject
+missing. Rich reads `[...]` as markup and had been silently swallowing the column name. A
+refusal that loses the name of what it refused is worse than no refusal; the separator is now
+parentheses, and a unit test asserts no failure description contains a square bracket.
 
 ### Day 4 — Reconcile (§7 Phase 7)
 
