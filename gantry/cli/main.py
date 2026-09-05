@@ -332,6 +332,53 @@ def verify(
 
 
 @app.command()
+def repair(
+    spec: SpecArg,
+    partition: Annotated[str, typer.Argument(help="Partition id, e.g. public.orders/00004.")],
+    source_url: SourceUrlOpt = None,
+    target_url: TargetUrlOpt = None,
+    meta_url: MetaUrlOpt = None,
+) -> None:
+    """Re-copy one partition and re-verify it.
+
+    A failed checksum means one partition is wrong, not the migration. The copy
+    is idempotent, so this restores exactly the rows that are missing or stale.
+    """
+    try:
+        movement = load_movement_spec(spec).to_movement()
+    except SpecError as exc:
+        _fail(str(exc))
+        return
+
+    service, engines = _service(source_url, target_url, meta_url)
+    targets = {dataset.name: dataset.target for dataset in movement.datasets}
+
+    async def run() -> VerificationReport:
+        try:
+            compiled = await service.plan(movement)
+            return await service.repair(movement, compiled, targets=targets, partition_id=partition)
+        finally:
+            await _dispose(engines)
+
+    try:
+        report = asyncio.run(run())
+    except ValueError as exc:
+        _fail(str(exc))
+        return
+
+    passed = sum(1 for finding in report.results if finding.passed)
+    style = "green" if report.passed else "red"
+    console.print(
+        f"[{style}]{'repaired' if report.passed else 'STILL FAILING'}[/{style}] "
+        f"{partition}  {passed}/{len(report.results)} checks passed"
+    )
+    for finding in report.blocking:
+        err_console.print(f"  [red]{finding.describe()}[/red]")
+    if not report.passed:
+        raise typer.Exit(code=1)
+
+
+@app.command()
 def status(
     name: Annotated[str, typer.Argument(help="Operation name.")],
     meta_url: MetaUrlOpt = None,

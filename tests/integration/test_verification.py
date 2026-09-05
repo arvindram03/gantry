@@ -18,6 +18,8 @@ from gantry.adapters.source.postgres import PostgresSourceAdapter
 from gantry.core.dataset import DatasetManifest
 from gantry.core.evidence import ScopeKind, VerificationStatus
 from gantry.core.verification import (
+    CheckName,
+    ChunkChecksumCheck,
     ForeignKeyIntegrityCheck,
     NullRateCheck,
     PrimaryKeyUniqueCheck,
@@ -35,6 +37,7 @@ from gantry.movement.model import (
 )
 from gantry.movement.partitioning import plan_partitions
 from gantry.state.database import create_engine, transaction
+from gantry.verification.localize import KeyRange, MismatchLocalizer
 from gantry.verification.runner import MovementVerificationRunner
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -267,3 +270,119 @@ async def test_a_broken_check_errors_rather_than_passing(
 
     assert not report.passed
     assert report.results[0].status is VerificationStatus.ERRORED
+
+
+# --- checksums and localisation (Day 12) ----------------------------------
+
+
+async def test_a_changed_value_is_caught_by_checksum_not_row_count(
+    engines: tuple[AsyncEngine, AsyncEngine],
+) -> None:
+    """A row count cannot see a row that is present on both sides and different."""
+    _, target = engines
+    manifest = await copy_source(engines)
+    async with transaction(target) as connection:
+        await connection.execute(
+            text(f"UPDATE {TARGET_TABLE} SET region = 'CORRUPTED' WHERE customer_id = 543210")
+        )
+
+    spec, dataset = movement(RowCountCheck(), ChunkChecksumCheck())
+    report = await runner(engines).verify_dataset(spec, dataset, manifest, plan_version=1)
+
+    by_check = {result.check: result for result in report.results}
+    assert by_check[CheckName.ROW_COUNT].passed, "counts still agree"
+    assert not by_check[CheckName.CHUNK_CHECKSUM].passed, "the checksum must not"
+
+
+async def test_a_checksum_failure_names_the_row(
+    engines: tuple[AsyncEngine, AsyncEngine],
+) -> None:
+    """ "This partition is wrong" is a fact; "row 543210 is wrong" is actionable."""
+    _, target = engines
+    manifest = await copy_source(engines)
+    async with transaction(target) as connection:
+        await connection.execute(
+            text(f"UPDATE {TARGET_TABLE} SET region = 'CORRUPTED' WHERE customer_id = 543210")
+        )
+
+    spec, dataset = movement(ChunkChecksumCheck())
+    report = await runner(engines).verify_dataset(spec, dataset, manifest, plan_version=1)
+    failure = report.blocking[0]
+
+    assert failure.evidence["differing_keys"] == "543210"
+    assert "1 differing" in (failure.difference or "")
+
+
+async def test_localisation_is_logarithmic(
+    engines: tuple[AsyncEngine, AsyncEngine],
+) -> None:
+    """One corrupted row in a million, found without a full-table diff."""
+    source, target = engines
+    manifest = await copy_source(engines)
+    async with transaction(target) as connection:
+        await connection.execute(
+            text(f"UPDATE {TARGET_TABLE} SET region = 'X' WHERE customer_id = 777777")
+        )
+
+    localizer = MismatchLocalizer(source_engine=source, target_engine=target)
+    located = await localizer.localize(
+        manifest, target=TARGET_TABLE, key="customer_id", bounds=KeyRange("1", "1000001")
+    )
+
+    assert located.differing_keys == ["777777"]
+    # log2(1M) is about 20; the extra few are the descent into enumeration.
+    assert located.comparisons < 40, f"took {located.comparisons} comparisons"
+
+
+async def test_a_missing_row_is_distinguished_from_a_changed_one(
+    engines: tuple[AsyncEngine, AsyncEngine],
+) -> None:
+    source, target = engines
+    manifest = await copy_source(engines)
+    async with transaction(target) as connection:
+        await connection.execute(text(f"DELETE FROM {TARGET_TABLE} WHERE customer_id = 100"))
+        await connection.execute(
+            text(f"UPDATE {TARGET_TABLE} SET region = 'X' WHERE customer_id = 200")
+        )
+
+    localizer = MismatchLocalizer(source_engine=source, target_engine=target)
+    located = await localizer.localize(
+        manifest, target=TARGET_TABLE, key="customer_id", bounds=KeyRange("1", "1000")
+    )
+
+    assert located.missing_keys == ["100"]
+    assert located.differing_keys == ["200"]
+    assert located.extra_keys == []
+
+
+async def test_an_extra_row_is_detected(engines: tuple[AsyncEngine, AsyncEngine]) -> None:
+    source, target = engines
+    manifest = await copy_source(engines)
+    async with transaction(target) as connection:
+        await connection.execute(
+            text(
+                f"INSERT INTO {TARGET_TABLE} (customer_id, email, region, created_at, source_lsn) "
+                f"VALUES (9999999, 'ghost@example.com', 'us-east', now(), 0)"
+            )
+        )
+
+    localizer = MismatchLocalizer(source_engine=source, target_engine=target)
+    located = await localizer.localize(
+        manifest, target=TARGET_TABLE, key="customer_id", bounds=KeyRange("9999998", "10000000")
+    )
+    assert located.extra_keys == ["9999999"]
+
+
+async def test_an_intact_copy_needs_one_comparison(
+    engines: tuple[AsyncEngine, AsyncEngine],
+) -> None:
+    """No drilling when nothing disagrees."""
+    source, target = engines
+    manifest = await copy_source(engines)
+
+    localizer = MismatchLocalizer(source_engine=source, target_engine=target)
+    located = await localizer.localize(
+        manifest, target=TARGET_TABLE, key="customer_id", bounds=KeyRange("1", "1000001")
+    )
+    assert located.comparisons == 1
+    assert not located.located

@@ -16,6 +16,8 @@ from gantry.core.evidence import Severity, VerificationResult, VerificationStatu
 from gantry.core.verification import CheckName, NullRateCheck
 from gantry.state.database import transaction
 from gantry.verification.base import VerificationContext, Verifier
+from gantry.verification.checksum import compute_checksum
+from gantry.verification.localize import KeyRange, Localization, MismatchLocalizer
 from gantry.verification.sql import partition_predicate, qualified, quote
 
 
@@ -267,10 +269,109 @@ class ForeignKeyIntegrityVerifier:
         )
 
 
+class ChunkChecksumVerifier:
+    """Source and target must hash identically over the scope.
+
+    Catches what a row count cannot: a row that is present on both sides and
+    different. On a mismatch it drills down rather than just reporting
+    disagreement, because "this partition is wrong" is a fact and "row 7654321
+    is wrong" is something an operator can act on.
+    """
+
+    check = CheckName.CHUNK_CHECKSUM
+
+    def __init__(self, *, localize: bool = True) -> None:
+        self._localize = localize
+
+    async def verify(self, context: VerificationContext) -> VerificationResult:
+        where, params = partition_predicate(context.manifest, context.partition)
+
+        source = await compute_checksum(
+            context.source_engine,
+            context.manifest,
+            context.manifest.physical.reference,
+            predicate=where,
+            params=params,
+        )
+        target = await compute_checksum(
+            context.target_engine,
+            context.manifest,
+            context.target,
+            predicate=where,
+            params=params,
+        )
+
+        evidence = {"predicate": where, **params}
+        if source == target:
+            return _result(
+                context,
+                self.check,
+                VerificationStatus.PASSED,
+                source=source.describe(),
+                target=target.describe(),
+                evidence=evidence,
+            )
+
+        difference = "checksums differ"
+        if self._localize:
+            located = await self._drill_down(context)
+            if located is not None:
+                evidence["comparisons"] = str(located.comparisons)
+                if located.differing_keys:
+                    evidence["differing_keys"] = ",".join(located.differing_keys[:20])
+                if located.missing_keys:
+                    evidence["missing_keys"] = ",".join(located.missing_keys[:20])
+                if located.extra_keys:
+                    evidence["extra_keys"] = ",".join(located.extra_keys[:20])
+                difference = located.describe()
+
+        return _result(
+            context,
+            self.check,
+            VerificationStatus.FAILED,
+            source=source.describe(),
+            target=target.describe(),
+            difference=difference,
+            evidence=evidence,
+        )
+
+    async def _drill_down(self, context: VerificationContext) -> Localization | None:
+        keys = context.manifest.dataset_schema.keys
+        if len(keys) != 1:
+            # Drilling halves a key range; a composite key has no midpoint.
+            return None
+        partition = context.partition
+        bounds = (
+            KeyRange(lo=partition.lo, hi=partition.hi)
+            if partition is not None
+            else KeyRange(
+                lo=context.manifest.statistics.key_min,
+                hi=_exclusive(context.manifest.statistics.key_max),
+            )
+        )
+        localizer = MismatchLocalizer(
+            source_engine=context.source_engine, target_engine=context.target_engine
+        )
+        return await localizer.localize(
+            context.manifest, target=context.target, key=keys[0], bounds=bounds
+        )
+
+
+def _exclusive(maximum: str | None) -> str | None:
+    """Turn an inclusive maximum into an exclusive upper bound."""
+    if maximum is None:
+        return None
+    try:
+        return str(int(maximum) + 1)
+    except ValueError:
+        return None
+
+
 def movement_verifiers() -> tuple[Verifier, ...]:
     return (
         RowCountVerifier(),
         PrimaryKeyUniqueVerifier(),
         NullRateVerifier(),
         ForeignKeyIntegrityVerifier(),
+        ChunkChecksumVerifier(),
     )

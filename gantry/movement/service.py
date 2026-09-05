@@ -18,6 +18,7 @@ from gantry.adapters.source.postgres import PostgresSourceAdapter
 from gantry.core.dataset import DatasetManifest, DatasetVersion
 from gantry.core.evidence import VerificationResult
 from gantry.core.operation import OperationState, OperationType
+from gantry.core.positions import Checkpoint, CheckpointScope, PositionKind, SourcePosition
 from gantry.core.provenance import DatasetPin, Lineage, Provenance
 from gantry.core.results import ResultStatus
 from gantry.lifecycle.plan import NodeKind, PlanVersion
@@ -404,6 +405,79 @@ class MovementService:
         if self._verifications is not None:
             await self._verifications.record(combined.results)
         return combined
+
+    async def repair(
+        self,
+        movement: Movement,
+        plan: PlanVersion,
+        *,
+        targets: Mapping[str, str],
+        partition_id: str,
+    ) -> VerificationReport:
+        """Re-run one partition and re-verify only that partition.
+
+        A failed checksum means one partition is wrong, not that the migration
+        is. Re-copying everything to fix one range would turn a small
+        correction into another full run - and the copy is idempotent, so
+        re-running a single partition restores exactly the rows that are
+        missing or stale and touches nothing else.
+        """
+        node = next(
+            (
+                candidate
+                for candidate in plan.nodes
+                if candidate.kind is NodeKind.SNAPSHOT_PARTITION and candidate.scope == partition_id
+            ),
+            None,
+        )
+        if node is None:
+            raise ValueError(f"plan version {plan.version} has no partition {partition_id!r}")
+
+        executor = MovementExecutor(
+            source_engine=self._source_engine,
+            target_engine=self._target_engine,
+            manifests=dict(self._manifests),
+            targets=dict(targets),
+        )
+        result = await executor.execute(node)
+        await self._checkpoints.advance(
+            movement.name,
+            Checkpoint(
+                scope=CheckpointScope.PARTITION,
+                scope_id=node.id,
+                position=SourcePosition(kind=PositionKind.PARTITION_ID, value=partition_id),
+                committed_at=result.committed_at,
+            ),
+        )
+
+        dataset_name = partition_id.rsplit("/", 1)[0]
+        dataset = movement.dataset(dataset_name)
+        manifest = self._manifests.get(dataset_name)
+        if dataset is None or manifest is None:
+            raise ValueError(f"no dataset {dataset_name!r} in this Movement")
+
+        partition = next(
+            partition
+            for partition in _partitions_for(plan, dataset_name)
+            if partition.id == partition_id
+        )
+        runner = MovementVerificationRunner(
+            source_engine=self._source_engine, target_engine=self._target_engine
+        )
+        bound = dataset.model_copy(update={"target": targets.get(dataset.name, dataset.target)})
+        # Only this partition is re-verified: the rest was verified already,
+        # and re-checking it would cost as much as the repair saved.
+        report = await runner.verify_dataset(
+            movement, bound, manifest, plan_version=plan.version, partitions=(partition,)
+        )
+        scoped = VerificationReport(
+            results=tuple(
+                finding for finding in report.results if finding.scope.identifier == partition_id
+            )
+        )
+        if self._verifications is not None:
+            await self._verifications.record(scoped.results)
+        return scoped
 
 
 _ORDER = (

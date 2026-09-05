@@ -152,7 +152,39 @@ already-complete partitions to discover they were no-ops, not copying data.
 Recorded here because it is the kind of figure that looks like a benchmark and
 is not.
 
+## Day 12 — checksums and localisation
+
+### Locating one corrupted row in 10,000,000
+
+| | |
+|---|---|
+| Comparisons | **27** |
+| log₂(10M) | 23 |
+| Wall time | 33.5 s |
+| Result | key `7654321`, exactly |
+
+The extra four comparisons over the theoretical minimum are the descent into
+enumeration once a range falls under 2,000 rows.
+
+The comparisons are not equal in cost: the first scans ten million rows on each
+side, the next five million, and so on. Total work is therefore about twice the
+table, not 27 full scans — the same shape as the comparison count, one level
+down.
+
+### Detect, locate, repair, re-verify
+
+One value changed (not deleted, so no row count can see it) in a 1,000,000-row
+target:
+
+| Step | Result |
+|---|---|
+| `gantry verify` | `chunk_checksum failed` — 1 differing in 19 comparisons, key `543210` |
+| `gantry repair … public.customers/00004` | **2.3 s** |
+| `gantry verify` | 18/18 checks passed |
+
+Repair costs seconds because it re-copies one partition, not the migration.
+That is only safe because the copy is idempotent.
+
 ## Not yet measured
 
-- Checksum computation by key range (Day 12)
 - CDC apply rate and lag (Days 13–15)
