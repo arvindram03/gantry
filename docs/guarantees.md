@@ -294,6 +294,18 @@ that will not plan is never sampled, and an unregistered input is refused
 without asking the engine at all. Failure detail carries the **engine's own
 words**, trimmed to the line that identifies the problem.
 
+## Deterministic row order
+
+The compiled query orders by its grouping keys. Not cosmetic: two things read
+rows by position — comparing the same artifact across engines, and deriving
+findings, which takes the first group as the baseline and the last as the
+current. Without an `ORDER BY`, PostgreSQL and DuckDB returned the same groups
+in different orders, which would have inverted the direction of every finding
+depending on where the Analysis ran.
+
+A deterministic artifact that returns non-deterministic row order is not
+deterministic.
+
 ## Running on more than one engine
 
 Two engines is the minimum that keeps the abstraction honest. With one, "engine
@@ -396,9 +408,84 @@ A group that has disappeared is reported as absent, not as zero. Zero is a
 measurement; the group being gone is a different fact, and collapsing the two
 turns a vanished cohort into a dramatic improvement.
 
+## What an agent may reach
+
+Agents do not start with rows. The RFC's ladder, in order, with what each rung
+can expose:
+
+| Rung | Returns | Default |
+|---|---|---|
+| `describe` | Schema, keys, physical reference | allow |
+| `profile` | Counts, null rates, distribution | allow |
+| `query` | A grouped aggregate | allow |
+| `partition` | How the data splits, including key values at the boundaries | allow |
+| `sample` | A bounded number of raw rows | **deny** |
+| `records` | Raw rows by key, unbounded | **deny** |
+
+The shipped defaults are the design document's: rows deny, aggregates allow,
+metadata allow, PII redacted, samples capped at 50 rows and requiring a stated
+reason, evidence persisted.
+
+**Enforcement is in the deterministic path, not the prompt.** Every method that
+can return Dataset content calls the gate and masks its output with the
+decision it got back. There is no system prompt asking a model to behave and no
+tool description it could reinterpret — there is a function it must call to get
+anything at all, and the decision depends on the policy and the manifest and
+nothing else. A request cannot carry an override, because there is no field for
+one.
+
+**A Dataset can tighten the global policy and never loosen it.** The effective
+decision is the stricter of the two, which is the only composition rule that
+does not need a precedence table nobody remembers.
+
+**Aggregates are structured, not SQL.** `rows: deny, aggregates: allow` is only
+enforceable if "is this an aggregate" is decidable, and over arbitrary SQL it is
+not — deciding it would mean parsing every dialect Gantry dispatches to, and
+being wrong once means an agent read raw rows through a rule that said it could
+not. So the API takes a grouping and a fixed vocabulary of measures. Every field
+is checked against the manifest before anything is built, which is also why a
+field name cannot carry SQL: an identifier that is not in the schema never
+reaches one.
+
+**Counting a sensitive column is not printing it.** `count`, `count_distinct`,
+`sum`, `avg` and `null_rate` reduce a column to a number that reveals no stored
+value, and masking them would withhold a figure that gives nothing away. `min`
+and `max` do return a stored value, one bound at a time, so they are masked like
+a projection of the column itself.
+
+**Masking applies to output columns, not source fields.** An aggregate's output
+is aliased — `min_email`, not `email` — and masking by source name against an
+aliased output matches nothing while the decision still reads REDACT. A mask
+that is not applied is worse than one that was never promised.
+
+**A small group is refused, not silently dropped.** With `minGroupSize` above 1,
+a result containing any group under the minimum is refused whole. Filtering the
+small groups out would answer a different question than the one asked, and would
+not say that it had.
+
+**The trail records refusals as carefully as grants.** A log holding only what
+was permitted reads as clean history while an agent probes every rung on every
+Dataset and is turned away each time. Each row says who asked, for what, at
+which rung, what policy answered, and on what grounds.
+
+### The group-of-one gap
+
+At the shipped `minGroupSize: 1`, an aggregate grouped by a unique key returns
+one row per record: row access wearing a `GROUP BY`. The policy language can
+close this — raise `minGroupSize` — and the default does not, because choosing
+a threshold is a decision about a specific dataset's sensitivity that the
+runtime cannot make for an operator. It is called out here rather than left to
+be discovered.
+
 ## Not yet
 
 - Adaptive concurrency and rate limits (v1.1)
 - Cutover gates and approvals (v1.1)
+- **Starting a Movement against an Operation that is already executing.** The
+  Day 19 rehearsal hit this: a run interrupted mid-execution leaves leases and
+  quarantined partitions, and starting again on a fresh plan version ran the
+  partitions the new plan named while the old state was still in place, then
+  reported a verification failure. It should refuse and say what to clear
+  instead of half-running (v1.1)
 - Causal claims: Gantry reports correlation with its strength basis stated, and
   does not assert cause

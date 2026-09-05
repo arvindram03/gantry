@@ -21,7 +21,7 @@ from gantry.core.operation import OperationState, OperationType
 from gantry.core.positions import Checkpoint, CheckpointScope, PositionKind, SourcePosition
 from gantry.core.provenance import DatasetPin, Lineage, Provenance
 from gantry.core.results import ResultStatus
-from gantry.lifecycle.plan import NodeKind, PlanVersion
+from gantry.lifecycle.plan import NodeKind, PlanVersion, next_version
 from gantry.lifecycle.states import ActorKind
 from gantry.movement.executor import MovementExecutor
 from gantry.movement.model import Movement
@@ -108,6 +108,17 @@ class MovementService:
             registered.append(version)
 
         plan = compile_movement(movement, created_at=self._clock(), manifests=manifests)
+
+        # Partition bounds come from the data, so recompiling after the source
+        # changes produces different content under the same guarantees. That is
+        # ordinary, and it is a new version: a stored plan is immutable because
+        # workers reconstruct plans from the store rather than recompiling.
+        previous = await self._plans.latest(movement.name)
+        plan_version = next_version(
+            previous, plan.guarantee_fingerprint, proposed_content=plan.content_hash
+        )
+        if plan_version != plan.version:
+            plan = plan.model_copy(update={"version": plan_version})
 
         await self._operations.ensure(
             movement.name, OperationType.MOVEMENT, plan_version=plan.version

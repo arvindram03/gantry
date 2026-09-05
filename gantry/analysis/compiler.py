@@ -88,6 +88,7 @@ def compile_analysis(
             f"SELECT{projection}",
             f"FROM {joined}",
             _group_by(analysis, manifests),
+            _order_by(analysis, manifests),
         )
     ).strip()
 
@@ -350,6 +351,26 @@ def _group_by(analysis: Analysis, manifests: dict[str, DatasetManifest]) -> str:
         return ""
     owners = _column_owners(analysis, manifests)
     return "GROUP BY " + ", ".join(_qualify(owners, column) for column in columns)
+
+
+def _order_by(analysis: Analysis, manifests: dict[str, DatasetManifest]) -> str:
+    """Order the output by the grouping keys.
+
+    Not cosmetic. Two things downstream read rows by position: comparing the
+    same artifact across engines, and deriving findings, which takes the first
+    group as the baseline and the last as the current. Without an ORDER BY the
+    engines are free to return groups in any order and did - PostgreSQL and
+    DuckDB disagreed on which group came first, which would have inverted the
+    direction of every finding depending on where the Analysis ran.
+
+    A deterministic artifact that returns non-deterministic row order is not
+    deterministic.
+    """
+    columns = _grouping_columns(analysis)
+    if not columns:
+        return ""
+    owners = _column_owners(analysis, manifests)
+    return "ORDER BY " + ", ".join(_qualify(owners, column) for column in columns)
 
 
 def _parameters(analysis: Analysis) -> dict[str, str]:

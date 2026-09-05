@@ -260,3 +260,59 @@ def test_changing_ordering_requires_a_replan() -> None:
     mutated = domain.model_copy(update={"datasets": (changed, *domain.datasets[1:])})
     with pytest.raises(ReplanRequiredError):
         next_version(plan, mutated.guarantee_fingerprint())
+
+
+class TestVersioningAfterTheDataChanges:
+    """The gap the Day 19 rehearsal found.
+
+    Recompiling after the source changed produces different partition bounds
+    under identical guarantees. Before this, `next_version` reused the version
+    and the store refused to overwrite it, so a replan against changed data
+    failed outright with a plan-mismatch error.
+    """
+
+    FINGERPRINT = "sha256:" + "a" * 64
+    CHANGED = "sha256:" + "b" * 64
+
+    def _plan(self, *, version: int, nodes: tuple[str, ...]) -> PlanVersion:
+        return PlanVersion(
+            operation="orders-snapshot",
+            operation_type=OperationType.MOVEMENT,
+            version=version,
+            nodes=tuple(_node(name) for name in nodes),
+            guarantee_fingerprint=self.FINGERPRINT,
+            created_at=AT,
+        )
+
+    def test_identical_content_reuses_the_version(self) -> None:
+        """Recompiling an unchanged Operation has to be idempotent."""
+        stored = self._plan(version=3, nodes=("a", "b"))
+        recompiled = self._plan(version=3, nodes=("a", "b"))
+        assert recompiled.content_hash == stored.content_hash
+        assert next_version(stored, self.FINGERPRINT, proposed_content=recompiled.content_hash) == 3
+
+    def test_moved_partition_bounds_allocate_the_next_version(self) -> None:
+        """Bounds are content, not a guarantee. A stored plan is immutable
+        because workers reconstruct plans from it rather than recompiling, so
+        rewriting version 3 would change what a running worker is executing."""
+        stored = self._plan(version=3, nodes=("a", "b"))
+        recompiled = self._plan(version=3, nodes=("a", "b", "c"))
+        assert recompiled.content_hash != stored.content_hash
+        assert next_version(stored, self.FINGERPRINT, proposed_content=recompiled.content_hash) == 4
+
+    def test_changed_guarantees_still_demand_an_explicit_replan(self) -> None:
+        stored = self._plan(version=3, nodes=("a",))
+        with pytest.raises(ReplanRequiredError):
+            next_version(stored, self.CHANGED, proposed_content=stored.content_hash)
+
+    def test_an_explicit_replan_bumps_past_changed_guarantees(self) -> None:
+        stored = self._plan(version=3, nodes=("a",))
+        assert next_version(stored, self.CHANGED, replan=True) == 4
+
+    def test_omitting_the_content_hash_compares_guarantees_alone(self) -> None:
+        """Callers that only know the fingerprint keep the older behaviour."""
+        stored = self._plan(version=3, nodes=("a",))
+        assert next_version(stored, self.FINGERPRINT) == 3
+
+    def test_a_first_plan_is_version_one(self) -> None:
+        assert next_version(None, self.FINGERPRINT, proposed_content="sha256:" + "1" * 64) == 1

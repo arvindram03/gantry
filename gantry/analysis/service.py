@@ -68,14 +68,23 @@ class AnalysisService:
         self._checkpoints = tuple(checkpoints)
         self._policy = policy
 
-    async def run(self, analysis: Analysis) -> AnalysisRun:
-        """Compile, validate, execute, verify, and build the Result."""
-        started = datetime.now(UTC)
-        artifact = compile_analysis(analysis, self._manifests)
+    async def prepare(self, analysis: Analysis) -> tuple[GeneratedArtifact, ValidationReport]:
+        """Compile and validate, without executing.
 
+        Split out so a caller can see the SQL, the estimate and the refusals
+        before committing to a run. `run` goes through the same path, so what
+        was inspected is what executes.
+        """
+        artifact = compile_analysis(analysis, self._manifests)
         validation = await validate(
             analysis, artifact, self._adapter, self._manifests, policy=self._policy
         )
+        return artifact, validation
+
+    async def run(self, analysis: Analysis) -> AnalysisRun:
+        """Compile, validate, execute, verify, and build the Result."""
+        started = datetime.now(UTC)
+        artifact, validation = await self.prepare(analysis)
         run = AnalysisRun(analysis=analysis.name, artifact=artifact, validation=validation)
         if not validation.accepted:
             # Refused before execution: nothing ran, so there is nothing to

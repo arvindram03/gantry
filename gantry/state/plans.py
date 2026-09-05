@@ -41,6 +41,8 @@ class PlanStore(Protocol):
 
     async def get(self, operation: str, version: int) -> PlanVersion | None: ...
 
+    async def latest(self, operation: str) -> PlanVersion | None: ...
+
     async def pins(self, operation: str, version: int) -> Sequence[DatasetPin]: ...
 
 
@@ -73,6 +75,19 @@ class PostgresPlanStore:
 
     async def get(self, operation: str, version: int) -> PlanVersion | None:
         row = await self._row(operation, version)
+        return None if row is None else PlanVersion.model_validate(row._mapping["plan"])
+
+    async def latest(self, operation: str) -> PlanVersion | None:
+        """The highest stored version, or None if this Operation never planned."""
+        async with transaction(self._engine) as connection:
+            row = (
+                await connection.execute(
+                    select(plan_versions)
+                    .where(plan_versions.c.operation == operation)
+                    .order_by(plan_versions.c.version.desc())
+                    .limit(1)
+                )
+            ).one_or_none()
         return None if row is None else PlanVersion.model_validate(row._mapping["plan"])
 
     async def pins(self, operation: str, version: int) -> Sequence[DatasetPin]:

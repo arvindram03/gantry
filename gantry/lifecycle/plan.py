@@ -190,19 +190,35 @@ def next_version(
     previous: PlanVersion | None,
     proposed_fingerprint: ContentHash,
     *,
+    proposed_content: ContentHash | None = None,
     replan: bool = False,
 ) -> int:
     """Decide the version number for a newly compiled plan.
 
-    Recompiling an unchanged Operation reuses its version. A change to immutable
-    guarantees is refused unless the caller explicitly asked to replan.
+    Three cases, and the third is the one that matters in practice:
+
+    - Nothing changed: reuse the version. Recompiling is free and idempotent.
+    - Immutable guarantees changed: refuse unless the caller asked to replan.
+      Source and target identity, ordering, key and verification requirements
+      cannot change inside a version (design document section 10).
+    - Only content changed - partition bounds moved because the data moved:
+      allocate the next version. This is ordinary. Bounds are content, not a
+      guarantee, and a plan that has been stored is immutable: workers
+      reconstruct plans from the store rather than recompiling, so rewriting
+      version 1 with new bounds would change what a running worker believes
+      it is executing.
+
+    Passing no `proposed_content` keeps the old behaviour of comparing
+    guarantees alone.
     """
     if previous is None:
         return 1
-    if previous.guarantee_fingerprint == proposed_fingerprint:
-        return previous.version
-    if not replan:
-        raise ReplanRequiredError(
-            previous.operation, previous.guarantee_fingerprint, proposed_fingerprint
-        )
-    return previous.version + 1
+    if previous.guarantee_fingerprint != proposed_fingerprint:
+        if not replan:
+            raise ReplanRequiredError(
+                previous.operation, previous.guarantee_fingerprint, proposed_fingerprint
+            )
+        return previous.version + 1
+    if proposed_content is not None and previous.content_hash != proposed_content:
+        return previous.version + 1
+    return previous.version

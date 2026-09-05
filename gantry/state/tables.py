@@ -220,3 +220,48 @@ analysis_artifacts = Table(
     Column("generated_at", TIMESTAMP, nullable=False),
     Index("ix_analysis_artifacts_analysis", "analysis", "generated_at"),
 )
+
+
+access_log = Table(
+    "access_log",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    # No foreign key to dataset_versions: an attempt against a Dataset that
+    # does not exist is exactly the attempt most worth recording, and a
+    # constraint here would drop it.
+    Column("dataset", String(253), nullable=False),
+    Column("rung", String(32), nullable=False),
+    Column("decision", String(16), nullable=False),
+    Column("principal", String(253), nullable=False),
+    # Why policy answered as it did, in the order the rules were applied. A
+    # denial without grounds teaches nothing to whoever reads the trail later.
+    Column("grounds", ARRAY(String), nullable=False, server_default="{}"),
+    Column("redacted_fields", ARRAY(String), nullable=False, server_default="{}"),
+    Column("reason", Text, nullable=True),
+    Column("row_limit", Integer, nullable=True),
+    Column("observed_at", TIMESTAMP, nullable=False),
+    Index("ix_access_log_dataset", "dataset", "observed_at"),
+    # Denials are what a review actually looks for; give them their own index
+    # rather than making that scan the whole trail.
+    Index("ix_access_log_denied", "decision", "observed_at"),
+)
+
+
+def operation_dependents() -> tuple[Table, ...]:
+    """Every table with a foreign key to `operations`, derived from the schema.
+
+    This was a hand-written list once, and it drifted twice - each time a new
+    table arrived, and each time it surfaced as a foreign key violation in
+    something unrelated. Deriving it means a new table joins the list by
+    existing. Ordered so children are removed before their parent.
+    """
+    return tuple(
+        table
+        for table in metadata.sorted_tables
+        if table is not operations
+        and any(
+            key.column.table is operations
+            for constraint in table.foreign_key_constraints
+            for key in constraint.elements
+        )
+    )

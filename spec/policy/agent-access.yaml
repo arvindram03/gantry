@@ -1,0 +1,32 @@
+# The RFC's agent access policy, as shipped.
+#
+# Not under spec/examples/ because this is not a `kind:` document. A policy is
+# operational configuration - it changes when an operator's appetite changes,
+# not when a Dataset does - and `gantry validate` is for resources.
+#
+# These are the defaults the runtime already applies; the file exists so the
+# posture is visible and reviewable rather than implicit in the code. Tighten
+# it by editing here — nothing an agent says can loosen it.
+agentAccess:
+  default:
+    rows: deny
+    aggregates: allow
+    metadata: allow
+
+  pii:
+    mode: redact
+
+  samples:
+    maxRows: 50
+    requireReason: true
+
+  queries:
+    maxBytesScanned: 100GB
+    timeout: 5m
+    # Raise this to close the group-of-one gap: at 1, an aggregate grouped by
+    # a unique key returns one row per record, which is row access wearing a
+    # GROUP BY. See docs/guarantees.md.
+    minGroupSize: 1
+
+  evidence:
+    persist: true

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated
@@ -23,6 +23,8 @@ from gantry.adapters.engine.postgres import PostgresEngineAdapter
 from gantry.adapters.source.postgres import PostgresSourceAdapter
 from gantry.adapters.source.seed import seed as seed_source
 from gantry.analysis.artifact import GeneratedArtifact
+from gantry.api.aggregates import Aggregate, AggregateFunction, AggregateQuery
+from gantry.api.datasets import Datasets, QueryOutcome
 from gantry.core.dataset import DatasetRef, DatasetVersion
 from gantry.core.results import Result
 from gantry.core.sizes import format_byte_size
@@ -30,6 +32,11 @@ from gantry.lifecycle.plan import PlanVersion
 from gantry.lifecycle.states import IllegalTransitionError, StateTransition
 from gantry.movement.result import MovementResult
 from gantry.movement.service import MovementService, Progress
+from gantry.policy.audit import access_log_for
+from gantry.policy.gate import AccessDeniedError, AccessGate, AccessRequest
+from gantry.policy.ladder import AccessRung
+from gantry.policy.loader import PolicyError, load_access_rules
+from gantry.policy.rules import AccessRules
 from gantry.registry.base import DatasetRegistry
 from gantry.registry.discovery import DiscoveryReport, discover_into_registry
 from gantry.registry.errors import RegistryError
@@ -75,9 +82,13 @@ results_app = typer.Typer(
     name="results", help="Read Results, findings and provenance.", no_args_is_help=True
 )
 schema_app = typer.Typer(name="schema", help="Emit JSON Schema for specs.", no_args_is_help=True)
+policy_app = typer.Typer(
+    name="policy", help="Inspect the agent access policy.", no_args_is_help=True
+)
 app.add_typer(dataset_app)
 app.add_typer(results_app)
 app.add_typer(schema_app)
+app.add_typer(policy_app)
 
 console = Console()
 err_console = Console(stderr=True)
@@ -479,16 +490,27 @@ SourceUrlOpt = Annotated[
 @app.command()
 def seed(
     rows: Annotated[int, typer.Option(help="Orders to generate.")] = 1_000_000,
+    customers: Annotated[
+        int | None,
+        typer.Option(help="Customers to generate. Default: one per hundred orders."),
+    ] = None,
     source_url: SourceUrlOpt = None,
 ) -> None:
-    """Seed the source database with synthetic orders."""
+    """Seed the source database with synthetic orders.
+
+    Customers default to a hundredth of the orders, which is a plausible shape
+    but ties the two together. They can be set separately because some work
+    needs many customers and few orders - the crash-replay test partitions
+    customers, and seeding a hundred million orders to reach a million of them
+    is a long way round.
+    """
     engine = create_engine(source_url or _source_url())
 
     # One event loop for the whole command: a second asyncio.run() would try to
     # dispose connections created in a loop that no longer exists.
     async def run() -> int:
         try:
-            return await seed_source(engine, orders=rows)
+            return await seed_source(engine, orders=rows, customers=customers)
         finally:
             await engine.dispose()
 
@@ -843,6 +865,200 @@ def results_refresh(
         console.print(f"  {marker} {drift.describe()}")
     if report.drifts and report.holds:
         console.print("  [dim]the finding still holds on current data[/dim]")
+
+
+PolicyOpt = Annotated[
+    Path | None,
+    typer.Option("--policy", help="Agent access policy file (default: the shipped defaults)."),
+]
+
+
+def _rules(path: Path | None) -> AccessRules:
+    if path is None:
+        return AccessRules()
+    try:
+        return load_access_rules(path)
+    except PolicyError as error:
+        _fail(str(error))
+        raise
+
+
+@policy_app.command("show")
+def policy_show(policy: PolicyOpt = None) -> None:
+    """Print the agent access policy in force."""
+    rules = _rules(policy)
+    source = str(policy) if policy else "built-in defaults"
+    console.print(f"[bold]agent access[/bold]  [dim]{source}[/dim]")
+    console.print(
+        f"  default      rows {rules.default.rows.value}, "
+        f"aggregates {rules.default.aggregates.value}, metadata {rules.default.metadata.value}"
+    )
+    console.print(f"  pii          {rules.pii.mode.value}")
+    reason = "reason required" if rules.samples.require_reason else "no reason required"
+    console.print(f"  samples      at most {rules.samples.max_rows} rows, {reason}")
+
+    budget = rules.queries.max_bytes_scanned
+    console.print(
+        f"  queries      "
+        f"{'no byte budget' if budget is None else format_byte_size(budget) + ' scanned'}"
+        f", timeout {rules.queries.timeout or 'none'}"
+        f", minimum group {rules.queries.min_group_size}"
+    )
+    console.print(f"  evidence     {'persisted' if rules.evidence.persist else 'not persisted'}")
+
+
+@dataset_app.command("access")
+def dataset_access(
+    name: Annotated[str, typer.Argument(help="Dataset name, or name@version.")],
+    policy: PolicyOpt = None,
+    reason: Annotated[str | None, typer.Option(help="Reason to supply for row access.")] = None,
+    registry: RegistryOpt = None,
+) -> None:
+    """Show, rung by rung, what an agent may do with this Dataset.
+
+    The ladder made legible. Reading it beats discovering the policy one
+    denial at a time, and it is the same evaluation the API performs - not a
+    description of it.
+    """
+    try:
+        manifest = asyncio.run(_registry(registry).get(_parse_ref(name))).manifest
+    except RegistryError as error:
+        _fail(str(error))
+        return
+
+    gate = AccessGate(_rules(policy))
+    console.print(
+        f"[bold]{manifest.name}[/bold]  dataset policy: {manifest.access.agent_policy.value}"
+    )
+    if manifest.sensitive_fields:
+        console.print(f"  [dim]sensitive: {', '.join(manifest.sensitive_fields)}[/dim]")
+
+    for rung in AccessRung:
+        decision = gate.evaluate(
+            AccessRequest(
+                rung=rung,
+                dataset=manifest,
+                reason=reason,
+                rows_requested=gate.rules.samples.max_rows if rung is AccessRung.SAMPLE else None,
+            )
+        )
+        colour = {"allow": "green", "redact": "yellow", "deny": "red"}[decision.decision.value]
+        line = f"  {rung.describe():<9} [{colour}]{decision.decision.value}[/{colour}]"
+        if decision.redacted_fields:
+            line += f"  [dim]masking {', '.join(decision.redacted_fields)}[/dim]"
+        if decision.row_limit is not None:
+            line += f"  [dim]at most {decision.row_limit} rows[/dim]"
+        console.print(line)
+        for ground in decision.grounds:
+            console.print(f"      [dim]{ground}[/dim]")
+
+
+@dataset_app.command("query")
+def dataset_query(
+    name: Annotated[str, typer.Argument(help="Dataset name.")],
+    group_by: Annotated[
+        list[str] | None, typer.Option("--group-by", help="Grouping field.")
+    ] = None,
+    aggregate: Annotated[
+        list[str] | None,
+        typer.Option("--agg", help="Aggregate as function:field (e.g. avg:latency_ms, count)."),
+    ] = None,
+    limit: Annotated[int | None, typer.Option(help="Maximum groups returned.")] = None,
+    policy: PolicyOpt = None,
+    registry: RegistryOpt = None,
+    source_url: SourceUrlOpt = None,
+    meta_url: MetaUrlOpt = None,
+) -> None:
+    """Run a grouped aggregate through the agent access path."""
+    try:
+        query = AggregateQuery(
+            group_by=tuple(group_by or ()),
+            aggregates=tuple(_parse_aggregate(spec) for spec in (aggregate or ["count"])),
+            limit=limit,
+        )
+    except ValueError as error:
+        _fail(str(error))
+        return
+    _agent_call(name, policy, registry, source_url, meta_url, lambda api: api.query(name, query))
+
+
+@dataset_app.command("sample")
+def dataset_sample(
+    name: Annotated[str, typer.Argument(help="Dataset name.")],
+    limit: Annotated[int, typer.Option(help="Rows requested.")] = 25,
+    reason: Annotated[str | None, typer.Option(help="Why the rows are needed.")] = None,
+    policy: PolicyOpt = None,
+    registry: RegistryOpt = None,
+    source_url: SourceUrlOpt = None,
+    meta_url: MetaUrlOpt = None,
+) -> None:
+    """Ask for raw rows through the agent access path. Denied by default."""
+    _agent_call(
+        name,
+        policy,
+        registry,
+        source_url,
+        meta_url,
+        lambda api: api.sample(name, limit=limit, reason=reason),
+    )
+
+
+def _parse_aggregate(spec: str) -> Aggregate:
+    function, _, field = spec.partition(":")
+    try:
+        chosen = AggregateFunction(function.strip())
+    except ValueError:
+        known = ", ".join(sorted(f.value for f in AggregateFunction))
+        raise ValueError(f"unknown aggregate {function.strip()!r}; known: {known}") from None
+    return Aggregate(function=chosen, field=field.strip() or None)
+
+
+def _agent_call(
+    name: str,
+    policy: Path | None,
+    registry: Path | None,
+    source_url: str | None,
+    meta_url: str | None,
+    call: Callable[[Datasets], Awaitable[QueryOutcome]],
+) -> None:
+    """Run one gated call and render what policy allowed."""
+    rules = _rules(policy)
+    meta = create_engine(meta_url or database_url())
+    source = create_engine(source_url or _source_url())
+    api = Datasets(
+        registry=_registry(registry),
+        engine=source,
+        rules=rules,
+        audit=access_log_for(meta, persist=rules.evidence.persist, principal="cli"),
+    )
+
+    async def run() -> QueryOutcome:
+        try:
+            return await call(api)
+        finally:
+            await source.dispose()
+            await meta.dispose()
+
+    try:
+        outcome = asyncio.run(run())
+    except AccessDeniedError as denied:
+        err_console.print(f"[red]denied:[/red] {denied.decision.describe()}")
+        raise typer.Exit(code=3) from None
+    except (RegistryError, ValueError) as error:
+        _fail(str(error))
+        return
+
+    decision = outcome.decision
+    console.print(f"[bold]{name}[/bold]  {decision.describe()}")
+    if not outcome.rows:
+        console.print("  [dim]no rows[/dim]")
+        return
+    table = Table(box=None, pad_edge=False)
+    for column in outcome.rows[0]:
+        table.add_column(column)
+    for row in outcome.rows:
+        table.add_row(*(str(value) for value in row.values()))
+    console.print(table)
 
 
 if __name__ == "__main__":

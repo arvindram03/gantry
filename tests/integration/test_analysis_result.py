@@ -281,8 +281,12 @@ async def test_a_finding_traces_back_to_the_movement_checkpoint(
     assert {d.name for d in chain.datasets} == {"public.request_logs", "public.deploy_events"}
     assert UPSTREAM in chain.upstream_operations
 
+    # Containment, not equality. Any Movement that produced one of these
+    # Datasets contributes its checkpoints, and on a shared stack there is
+    # usually more than one — a real demo Movement over the same tables is not
+    # contamination, it is another honest answer to "where did this data get to".
     reached = {c.position.value for c in chain.checkpoints}
-    assert reached == {c.position.value for c in movement.provenance.checkpoints}
+    assert reached >= {c.position.value for c in movement.provenance.checkpoints}
 
 
 async def test_refresh_re_runs_the_same_computation_on_current_data(

@@ -41,6 +41,31 @@ def test_results_commands_are_wired() -> None:
         assert command in result.stdout
 
 
+def test_the_access_ladder_is_reachable_from_the_cli() -> None:
+    for group, commands in (
+        ("policy", ("show",)),
+        ("dataset", ("access", "query", "sample")),
+    ):
+        result = runner.invoke(app, [group, "--help"])
+        assert result.exit_code == 0
+        for command in commands:
+            assert command in result.stdout, f"{group} {command}"
+
+
+def test_policy_show_prints_the_shipped_defaults() -> None:
+    """The defaults are the RFC's; printing them is how an operator checks."""
+    result = runner.invoke(app, ["policy", "show"])
+    assert result.exit_code == 0
+    assert "rows deny" in result.stdout
+    assert "aggregates allow" in result.stdout
+
+
+def test_an_unreadable_policy_file_fails_rather_than_falling_back() -> None:
+    result = runner.invoke(app, ["policy", "show", "--policy", "/nonexistent/policy.yaml"])
+    assert result.exit_code == 1
+    assert "rows deny" not in result.stdout
+
+
 def test_validate_accepts_an_example(tmp_path: Path) -> None:
     result = runner.invoke(app, ["validate", str(ORDERS)])
     assert result.exit_code == 0

@@ -329,6 +329,34 @@ Two things fixed here rather than papered over: the Result store rehydrated ever
 
 **Exit:** two consecutive clean end-to-end runs from a fresh `make dev-up`. Recorded as an asciinema cast.
 
+**Outcome (met, with two deviations stated below).** `make rehearse` drives the whole sequence through the *public* surfaces — the CLI and the typed API — rather than through the runtime's internals, because a rehearsal built out of internals proves what the test suite already proves. Two consecutive clean runs:
+
+| step | seconds | proved |
+|---|---|---|
+| seed and register | 8.8 | 200,000 orders and 1,000,000 customers; 7 datasets registered from discovery |
+| faults | 32.9 | 16 chaos tests, including a real `kill -9` |
+| movement | 9.9 | plan, run, verify |
+| corruption and repair | 9.2 | one row corrupted, located in `public.orders/00000`, repaired without a full re-copy |
+| analysis | 0.6 | well-formed join published findings; expanding join rejected after the engine reported SUCCESS |
+| provenance | 0.5 | artifact, Dataset versions and 11 checkpoints from `orders-snapshot.movement`, no gaps |
+| agent access | 1.4 | sample denied by policy default; aggregate over the same table returned |
+| **total** | **63.3** | |
+
+**Deviations.** No asciinema cast — the recording adds nothing a text transcript does not, and the script's own timing table is the artifact worth keeping. And the rehearsal ran at 200,000 orders rather than 100,000,000: the 100M figures stand from the M1 measurement on Day 10 (101M rows in 462.7s) and are not re-derived here. Every guarantee in the list is scale-independent; the throughput numbers are the ones that are not, and those are Day 10's.
+
+**The access ladder.** `describe → profile → query → partition → sample → records`, with the RFC's defaults shipped: rows deny, aggregates allow, metadata allow, PII redacted, samples capped and requiring a reason, evidence persisted. Enforcement is a function every content-returning path must call, not a prompt — and a request has no field that could carry an override. A Dataset can tighten the global policy and never loosen it.
+
+The API takes a **structured aggregate rather than SQL**, because `rows: deny, aggregates: allow` is only enforceable if "is this an aggregate" is decidable, and over arbitrary SQL it is not. That also makes field checking the whole injection defence: an identifier not in the manifest never reaches SQL.
+
+**What the rehearsal found, which is what it was for:**
+
+1. **Replanning after the data changed failed outright.** Partition bounds come from the data, so recompiling produced different content under identical guarantees — and `next_version` reused the version while the plan store correctly refused to overwrite it. Bounds are content, not a guarantee: a content change now allocates the next version, and an immutable-guarantee change still demands an explicit replan.
+2. **Masking matched source field names against aliased output columns**, so a `REDACT` decision on `min(email)` masked nothing while still reporting itself as redacted. A mask that is not applied is worse than one never promised.
+3. **The demo registered Datasets in an in-memory registry**, so a stored Result pinned versions that died with the process. Provenance reported the gaps rather than hiding them — the behaviour built on Day 18 catching a bug written on Day 19.
+4. **The chaos suite depended on ambient source scale**, failing in a way that looked like a crash-replay bug when it was a short table. `gantry seed` now takes `--customers` separately from `--rows`.
+5. **The compiled Analysis SQL had no `ORDER BY`.** PostgreSQL and DuckDB returned the same groups in different orders — and `derive_findings` takes the first group as the baseline and the last as the current, so the *direction* of every finding depended on which engine ran it. The compiler now orders by the grouping keys.
+6. **Starting a Movement against an Operation already executing half-runs instead of refusing.** Left as a known gap for v1.1 and written down in `docs/guarantees.md` rather than quietly worked around.
+
 ### Day 20 — Mon+4 · Docs and release
 
 - `docs/architecture.md` (the four resources and the shared lifecycle), `docs/guarantees.md` (what v1 guarantees and — equally important — what it does not), `docs/adapters.md`, `docs/benchmarks.md`.

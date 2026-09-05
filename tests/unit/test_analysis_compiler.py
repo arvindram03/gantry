@@ -282,3 +282,30 @@ def test_an_artifact_can_be_previewed() -> None:
     # Three lines of body, plus the line saying how much was elided.
     assert len(preview.splitlines()) == 4
     assert "more lines" in preview
+
+
+def test_the_compiled_sql_orders_by_the_grouping_keys() -> None:
+    """Found by running the same artifact on two engines.
+
+    PostgreSQL and DuckDB returned the groups in different orders, and two
+    things downstream read rows by position: cross-engine comparison, and
+    finding derivation, which takes the first group as the baseline and the
+    last as the current. Without an ORDER BY, where an Analysis ran decided
+    which direction its findings pointed.
+    """
+    body = compile_it().body
+
+    # rindex, not index: percentile_cont carries its own ORDER BY inside the
+    # projection, and matching that one would pass without an outer ordering.
+    group_by = body[body.rindex("GROUP BY") :]
+    grouping, _, ordering = group_by.partition("ORDER BY")
+    assert ordering, "the compiled query does not order its groups"
+    assert ordering.split() == grouping.replace("GROUP BY", "").split(), (
+        "the ordering must be exactly the grouping keys, or row position "
+        "still depends on the engine"
+    )
+
+
+def test_ordering_does_not_change_the_artifact_identity_rules() -> None:
+    """Compiling twice still yields one hash: ordering is derived, not chosen."""
+    assert compile_it().content_hash == compile_it().content_hash
