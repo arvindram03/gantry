@@ -25,6 +25,8 @@ from gantry.state.database import create_engine, transaction
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from .conftest import clear_all_operations
+
 pytestmark = [pytest.mark.integration, pytest.mark.chaos]
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -62,10 +64,8 @@ async def target() -> AsyncIterator[AsyncEngine]:
 async def meta() -> AsyncIterator[AsyncEngine]:
     engine = create_engine(META_URL)
     try:
+        await clear_all_operations(engine)
         async with transaction(engine) as connection:
-            await connection.execute(text("DELETE FROM checkpoints"))
-            await connection.execute(text("DELETE FROM tasks"))
-            await connection.execute(text("DELETE FROM operations"))
             await connection.execute(
                 text(
                     "INSERT INTO operations (name, operation_type, state, created_at, updated_at)"
