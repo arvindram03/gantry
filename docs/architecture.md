@@ -17,12 +17,15 @@ still a design that drifted: a single Python process is the throughput ceiling
 for a large partition, and a crash there is a crash *in* the data path rather
 than beside it.
 
-**v1.2 corrects it.** The principle is that Gantry never moves data: it plans
-the work, generates the instruction, hands it to something that executes, and
-verifies the outcome. Postgres→Postgres becomes a federated `INSERT … SELECT`
-the target server runs itself; cross-engine work goes to Beam. The relay stays
-as the fallback for environments without `postgres_fdw`, and is the one backend
-where Gantry is in the path. See
+**v1.2 corrects it, and removes the relay.** The principle is that Gantry never
+moves data: it plans the work, **generates a job**, submits it to an executor,
+observes it finish, verifies the outcome, and checkpoints what verified. A job is
+whatever actually moves bytes — a transaction script, a Beam pipeline, a Flink
+job, an ETL container.
+
+The line is precise: **control flows through Gantry; data does not.** Issuing a
+statement and waiting for it is submission. Holding the rows in a queue is being
+the mover, and that is what goes. See
 [execution-plan-external-execution.md](execution-plan-external-execution.md).
 
 ## Four resources
