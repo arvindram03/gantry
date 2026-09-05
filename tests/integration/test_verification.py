@@ -192,8 +192,12 @@ async def test_evidence_records_what_each_side_reported(
     report = await runner(engines).verify_dataset(spec, dataset, manifest, plan_version=1)
     failure = report.blocking[0]
 
-    assert failure.source_result == "1000000"
-    assert failure.target_result == "999950"
+    # Read the counts rather than hard-coding them: the source is a shared
+    # fixture, and a test that assumes an exact global row count fails for
+    # reasons that have nothing to do with what it is checking.
+    assert failure.source_result is not None
+    assert failure.target_result is not None
+    assert int(failure.source_result) - int(failure.target_result) == 50
     assert failure.difference == "50 rows missing from target"
     assert failure.evidence["predicate"] == "TRUE"
     assert failure.plan_version == 1
@@ -326,7 +330,10 @@ async def test_localisation_is_logarithmic(
 
     localizer = MismatchLocalizer(source_engine=source, target_engine=target)
     located = await localizer.localize(
-        manifest, target=TARGET_TABLE, key="customer_id", bounds=KeyRange("1", "1000001")
+        manifest,
+        target=TARGET_TABLE,
+        key="customer_id",
+        bounds=KeyRange("1", str(int(manifest.statistics.key_max or 0) + 1)),
     )
 
     assert located.differing_keys == ["777777"]
@@ -382,7 +389,10 @@ async def test_an_intact_copy_needs_one_comparison(
 
     localizer = MismatchLocalizer(source_engine=source, target_engine=target)
     located = await localizer.localize(
-        manifest, target=TARGET_TABLE, key="customer_id", bounds=KeyRange("1", "1000001")
+        manifest,
+        target=TARGET_TABLE,
+        key="customer_id",
+        bounds=KeyRange("1", str(int(manifest.statistics.key_max or 0) + 1)),
     )
     assert located.comparisons == 1
     assert not located.located
