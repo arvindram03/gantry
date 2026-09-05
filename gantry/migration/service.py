@@ -24,6 +24,7 @@ from gantry.lifecycle.migration import MigrationState
 from gantry.lifecycle.states import ActorKind
 from gantry.migration.model import Migration
 from gantry.migration.prepare import PrepareReport
+from gantry.migration.reconcile import ReconciliationReport
 from gantry.state.migrations import MigrationRecord, MigrationStore, MigrationTransition
 from gantry.state.operations import OperationStore, UnknownOperationError
 
@@ -40,6 +41,17 @@ class PrepareRefusedError(Exception):
         super().__init__(f"migration {migration!r} not ready: {report.describe()}")
         self.migration = migration
         self.report = report
+
+
+class Reconciler(Protocol):
+    """Whatever knows how to reconcile this Migration's Datasets.
+
+    Injected like the runner and the preparer, and for the same reason: the
+    workflow knows a Migration can be reconciled and that the answer is a list
+    of reports. Which engines, which tables and which key is not its business.
+    """
+
+    async def __call__(self, migration: Migration, /) -> list[ReconciliationReport]: ...
 
 
 class Preparer(Protocol):
@@ -95,6 +107,10 @@ class MigrationStatus:
 
     record: MigrationRecord
     movements: tuple[MovementStatus, ...]
+    # Present only on the call that ran it. Reconciliation costs real queries
+    # against both databases, so `status` does not re-run it to answer a
+    # question about workflow state.
+    reconciliation: tuple[ReconciliationReport, ...] = ()
 
     @property
     def state(self) -> MigrationState:
@@ -162,6 +178,7 @@ class MigrationService:
         *,
         runner: MovementRunner,
         preparer: Preparer | None = None,
+        reconciler: Reconciler | None = None,
     ) -> MigrationStatus:
         """Drive the Movements, and derive the workflow state from what they did.
 
@@ -237,9 +254,43 @@ class MigrationService:
             actor=ActorKind.RUNTIME,
             reason="reconciling source against target",
         )
+
+        if reconciler is not None:
+            reports = await reconciler(migration)
+            disagreed = [report for report in reports if not report.agreed]
+            evidence = {"datasets": [report.describe() for report in reports]}
+
+            if disagreed:
+                # Back to CATCHING_UP, not FAILED. Under live writes a
+                # disagreement is more often a stream that has not finished
+                # applying than data that is wrong, and the runtime cannot
+                # tell those apart from one reading. Retrying is the cheap
+                # answer; failing the migration is not reversible.
+                await self._migrations.transition(
+                    migration.name,
+                    MigrationState.CATCHING_UP,
+                    actor=ActorKind.RUNTIME,
+                    reason=(
+                        f"reconciliation found {len(disagreed)} dataset(s) disagreeing; "
+                        f"applying more changes before verifying again"
+                    ),
+                    evidence=evidence,
+                )
+            else:
+                await self._migrations.transition(
+                    migration.name,
+                    MigrationState.READY_FOR_CUTOVER,
+                    actor=ActorKind.RUNTIME,
+                    reason=f"reconciliation agreed on {len(reports)} dataset(s)",
+                    evidence=evidence,
+                )
+            return await self.status(migration.name, reconciliation=tuple(reports))
+
         return await self.status(migration.name)
 
-    async def status(self, name: str) -> MigrationStatus:
+    async def status(
+        self, name: str, *, reconciliation: tuple[ReconciliationReport, ...] = ()
+    ) -> MigrationStatus:
         """The workflow state, and every Movement beneath it.
 
         Movement state is read from the Operations rather than mirrored into
@@ -261,7 +312,9 @@ class MigrationService:
                     plan_version=operation.current_plan_version,
                 )
             )
-        return MigrationStatus(record=record, movements=tuple(statuses))
+        return MigrationStatus(
+            record=record, movements=tuple(statuses), reconciliation=reconciliation
+        )
 
     async def pause(self, name: str, *, reason: str, actor_id: str | None = None) -> None:
         await self._migrations.transition(

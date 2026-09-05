@@ -14,7 +14,7 @@ has failed.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -95,7 +95,7 @@ class MigrationTransition:
     actor: ActorKind
     actor_id: str | None
     reason: str
-    evidence: dict[str, object] | None
+    evidence: Mapping[str, object] | None
     occurred_at: datetime
 
     def describe(self) -> str:
@@ -171,7 +171,9 @@ class MigrationStore:
         actor: ActorKind,
         reason: str,
         actor_id: str | None = None,
-        evidence: dict[str, object] | None = None,
+        # Mapping, not dict: this is only ever read, and an invariant dict
+        # would reject a caller's dict[str, list[str]] for no reason.
+        evidence: Mapping[str, object] | None = None,
     ) -> MigrationTransition:
         """Advance the workflow, recording who moved it and why."""
         current = await self.get(name)
@@ -210,7 +212,7 @@ class MigrationStore:
                     actor=actor.value,
                     actor_id=actor_id,
                     reason=reason,
-                    evidence=evidence,
+                    evidence=dict(evidence) if evidence is not None else None,
                     occurred_at=occurred_at,
                 )
             )

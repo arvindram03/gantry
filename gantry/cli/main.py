@@ -39,11 +39,13 @@ from gantry.lifecycle.states import (
 )
 from gantry.migration.model import Migration
 from gantry.migration.prepare import PrepareReport, prepare
+from gantry.migration.reconcile import ReconciliationReport, reconcile
 from gantry.migration.service import (
     MigrationService,
     MigrationStatus,
     Preparer,
     PrepareRefusedError,
+    Reconciler,
 )
 from gantry.movement.model import MovementMode
 from gantry.movement.result import MovementResult
@@ -1329,6 +1331,72 @@ def migration_prepare(
         raise typer.Exit(code=1)
 
 
+def _reconciler(source: AsyncEngine, target: AsyncEngine, migration: Migration) -> Reconciler:
+    """Build the reconciliation closure the workflow calls."""
+
+    async def run(_migration: Migration, /) -> list[ReconciliationReport]:
+        discovered = {m.name: m for m in await PostgresSourceAdapter(source).discover()}
+        reports: list[ReconciliationReport] = []
+        for name in migration.runnable:
+            parsed = load_movement_spec(migration.movement_specs[name]).to_movement()
+            for dataset in parsed.datasets:
+                manifest = discovered.get(dataset.name)
+                if manifest is None:
+                    continue
+                reports.append(
+                    await reconcile(
+                        manifest,
+                        source_engine=source,
+                        target_engine=target,
+                        target=dataset.target,
+                    )
+                )
+        return reports
+
+    return run
+
+
+def _render_reconciliation(reports: Sequence[ReconciliationReport]) -> None:
+    for report in reports:
+        colour = "green" if report.agreed else "red"
+        console.print(f"  [{colour}]{report.describe()}[/{colour}]")
+        for layer in report.layers:
+            console.print(f"    [dim]{layer.describe()}[/dim]")
+        if report.localization is not None and report.localization.located:
+            keys = report.localization.differing_keys[:5]
+            if keys:
+                err_console.print(f"    [red]differing keys:[/red] {', '.join(keys)}")
+
+
+@migration_app.command("reconcile")
+def migration_reconcile(
+    spec: SpecArg,
+    source_url: SourceUrlOpt = None,
+    target_url: TargetUrlOpt = None,
+) -> None:
+    """Compare source against target, cheapest layer first."""
+    try:
+        migration = load_migration_spec(spec).to_migration()
+    except SpecError as exc:
+        _fail(str(exc))
+        return
+
+    source = create_engine(source_url or _source_url())
+    target = create_engine(target_url or _target_url())
+
+    async def run() -> list[ReconciliationReport]:
+        try:
+            return await _reconciler(source, target, migration)(migration)
+        finally:
+            await source.dispose()
+            await target.dispose()
+
+    reports = asyncio.run(run())
+    _render_reconciliation(reports)
+    if any(not report.agreed for report in reports):
+        raise typer.Exit(code=1)
+
+
 @migration_app.command("start")
 def migration_start(
     spec: SpecArg,
@@ -1378,6 +1446,7 @@ def migration_start(
                 migration,
                 runner=run_movement,
                 preparer=_preparer(movements, source, target, migration),
+                reconciler=_reconciler(source, target, migration),
             )
         finally:
             await source.dispose()
@@ -1401,6 +1470,7 @@ def migration_start(
     for movement in status.movements:
         marker = "[green]✓[/green]" if movement.complete else " "
         console.print(f"  {marker} {movement.describe()}")
+    _render_reconciliation(status.reconciliation)
 
 
 if __name__ == "__main__":

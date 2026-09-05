@@ -21,6 +21,7 @@ from gantry.core.operation import OperationState, OperationType
 from gantry.lifecycle.migration import MigrationState
 from gantry.lifecycle.states import ActorKind
 from gantry.migration.model import Migration
+from gantry.migration.reconcile import ReconciliationReport
 from gantry.migration.service import MigrationService
 from gantry.state.database import create_engine, transaction
 from gantry.state.migrations import MigrationStore
@@ -193,3 +194,92 @@ async def test_a_movement_that_ends_badly_stops_the_workflow(meta: AsyncEngine) 
     status = await service(meta).run(migration(), runner=runner)
     assert status.any_movement_failed
     assert status.state is MigrationState.FAILED
+
+
+async def test_reconciliation_agreeing_opens_the_door_to_cutover(
+    meta: AsyncEngine,
+) -> None:
+    """VERIFYING is not a resting place. Agreement moves the workflow to
+    READY_FOR_CUTOVER, which is the only state the gates can be evaluated from.
+    """
+    from gantry.migration.reconcile import LayerOutcome, LayerResult, ReconciliationLayer
+
+    operations = OperationStore(meta)
+
+    async def runner(name: str, /) -> object:
+        await operations.ensure(name, OperationType.MOVEMENT, plan_version=1)
+        for state in (
+            OperationState.PLANNED,
+            OperationState.GENERATED,
+            OperationState.VALIDATED,
+            OperationState.EXECUTING,
+            OperationState.VERIFYING,
+            OperationState.COMPLETED,
+        ):
+            await operations.transition(
+                name, state, actor=ActorKind.RUNTIME, reason="test", plan_version=1
+            )
+        return None
+
+    async def agreeing(_: Migration, /) -> list[ReconciliationReport]:
+        report = ReconciliationReport(dataset="public.orders", target="public.orders")
+        report.layers.append(
+            LayerResult(
+                layer=ReconciliationLayer.COUNT,
+                outcome=LayerOutcome.AGREED,
+                detail="10 rows on both sides",
+            )
+        )
+        return [report]
+
+    status = await service(meta).run(migration(), runner=runner, reconciler=agreeing)
+
+    assert status.state is MigrationState.READY_FOR_CUTOVER
+    assert status.reconciliation and status.reconciliation[0].agreed
+
+
+async def test_reconciliation_disagreeing_returns_to_catching_up(
+    meta: AsyncEngine,
+) -> None:
+    """Not FAILED. Under live writes a disagreement is more often a stream
+    that has not finished applying than data that is wrong, and the runtime
+    cannot tell those apart from one reading. Retrying is cheap; failing the
+    migration is not reversible."""
+    from gantry.migration.reconcile import LayerOutcome, LayerResult, ReconciliationLayer
+
+    operations = OperationStore(meta)
+
+    async def runner(name: str, /) -> object:
+        await operations.ensure(name, OperationType.MOVEMENT, plan_version=1)
+        for state in (
+            OperationState.PLANNED,
+            OperationState.GENERATED,
+            OperationState.VALIDATED,
+            OperationState.EXECUTING,
+            OperationState.VERIFYING,
+            OperationState.COMPLETED,
+        ):
+            await operations.transition(
+                name, state, actor=ActorKind.RUNTIME, reason="test", plan_version=1
+            )
+        return None
+
+    async def disagreeing(_: Migration, /) -> list[ReconciliationReport]:
+        report = ReconciliationReport(dataset="public.orders", target="public.orders")
+        report.layers.append(
+            LayerResult(
+                layer=ReconciliationLayer.COUNT,
+                outcome=LayerOutcome.DISAGREED,
+                detail="source 10, target 9 (+1)",
+            )
+        )
+        return [report]
+
+    status = await service(meta).run(migration(), runner=runner, reconciler=disagreeing)
+
+    assert status.state is MigrationState.CATCHING_UP
+    assert not status.reconciliation[0].agreed
+
+    last = (await MigrationStore(meta).history(NAME))[-1]
+    assert "disagreeing" in last.reason
+    assert last.evidence is not None, "what disagreed must survive into the trail"

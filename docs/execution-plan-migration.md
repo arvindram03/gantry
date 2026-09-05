@@ -287,8 +287,75 @@ cheapest first, and drilling only where it must.
 - **[B]** Reconcile **while catch-up continues** — the count that matters is the one taken at
   a consistent position, not one taken with the stream paused.
 
-**Exit:** reconciliation on a migrated Dataset with live writes reports agreement at a stated
-position, and a deliberately corrupted chunk is localised without a full row-level scan.
+**Exit: met.** Against the real stack, on the 3,000,000-row demo target:
+
+```text
+$ gantry migration reconcile spec/examples/migration-orders-to-warehouse.yaml
+  public.customers agrees below 1000000 in 4 queries
+    count:    agreed — 1,000,000 rows on both sides            (2 queries, 0.15s)
+    checksum: agreed — 576066573638…  over 1,000,000 rows      (2 queries, 0.79s)
+  public.orders agrees below 3000000 in 4 queries
+    count:    agreed — 3,000,000 rows on both sides            (2 queries, 0.39s)
+    checksum: agreed — 173008798253… over 3,000,000 rows       (2 queries, 2.59s)
+```
+
+With one row corrupted at `order_id = 1777777`:
+
+```text
+  public.orders disagrees below 3000000 in 50 queries
+    count:    agreed — 3,000,000 rows on both sides
+    checksum: disagreed — source 173008798253…, target 173008843032…
+    row_diff: disagreed — 1 differing in 23 comparisons
+    differing keys: 1777777
+```
+
+**23 comparisons over three million rows.** log₂(3,000,000) ≈ 21.5.
+
+### What each layer can and cannot conclude
+
+The ordering is not a style choice. A count is an index scan; a checksum reads every row on
+both sides; a row diff reads and compares them. On a migration that matters the difference is
+hours.
+
+- Counts agreeing proves nothing about content. Counts *dis*agreeing proves the sides differ,
+  so the checksum is **skipped** — confirming it would read everything to learn nothing.
+- Checksums agreeing is strong evidence. Disagreeing says nothing about *where*, which is what
+  the drill-down is for.
+- An empty target is not a disagreement. Saying "disagrees" would be true and useless: the
+  phase has not run.
+
+### Reconciling while the stream is still moving
+
+Every comparison is bounded by the **highest key present in the target when reconciliation
+began**. Rows written after that point are excluded from both sides, which makes the
+comparison stable without pausing the stream — and stops a streaming migration from reporting
+replication lag as missing data. The watermark is read from the *target*, the side that lags;
+bounding by the source's maximum would include rows the target has not been given yet.
+
+That is exact for append-shaped data and honest about the rest: updates to keys below the
+watermark can still race, and the report says `source still moving` rather than pretending
+otherwise.
+
+### Two bugs, both of which reported success while being wrong
+
+**The watermark was compared as text.** `id::text <= '1000000'` is a string comparison, and
+`'2' > '1000000'` lexically — so a million-row table was bounded to seven rows and
+reconciliation cheerfully agreed over them. A comparison that silently narrows to the wrong
+subset is worse than one that errors. The bound is now re-typed from the schema, the same way
+partition predicates are.
+
+**The drill-down was enumerating, not halving.** It was handed an open lower bound, and it
+cannot compute a midpoint without both ends — so it fell back to reading all three million
+rows: *one* comparison, twenty-one seconds, correct answer. The verdict looked fine and the
+`O(log n)` property from Day 12 was simply gone. Both bounds are passed now, and a test
+asserts the comparison count stays within `3·⌈log₂ n⌉` rather than merely that the answer is
+right.
+
+### The measurement
+
+**No change to `gantry/movement/` or `gantry/verification/` this day.** Reconciliation is the
+v1 framework — the same checksum expression, the same localiser — arranged as a phase. That is
+what "verification reused, not duplicated" was supposed to mean, and it held.
 
 ---
 
