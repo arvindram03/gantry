@@ -54,9 +54,14 @@ measures something harder and more honest — **which guarantees survive**:
 | A killed worker loses nothing and duplicates nothing | holds | ? |
 | Writes are idempotent under duplicated delivery | holds | ? |
 | Stale writes rejected by source position | holds | ? |
-| Checkpoint granularity | per partition | ? |
+| Checkpoint granularity | per partition | **per partition group** — the job is the only durability boundary Dataflow exposes |
 | Repair re-copies one partition, not the table | holds | ? |
 | Verification is order-independent and localises in `O(log n)` | holds | ? |
+
+One row is already answered, from the runner's semantics rather than from an
+experiment: **Dataflow exposes no checkpoint below the job**, so the Beam
+backend's unit is a partition group. That is a real difference in what a crash
+costs and it belongs in the same sentence as the feature.
 
 **A guarantee that cannot be kept must be written down as lost, not quietly
 redefined.** If Beam-backed Movements checkpoint per dataset rather than per
@@ -100,30 +105,89 @@ abstraction. The second is the harder question.
 
 ## 2. Day 0 — the shape question
 
-**Do not write an adapter until this is answered.** Three architectures are
-possible and they differ in what a crash costs. Spike all three far enough to
-measure; pick with numbers.
+**Partly answered already, and the answer narrows the design before any code is
+written.** Assume Dataflow as the runner.
 
-**(A) One job per partition.** Gantry submits a pipeline per partition, awaits
-it, checkpoints. This is **buying the commit boundary back** by making the job
-the unit: "commit" becomes "the job reported success", the ordering is unchanged,
-and every guarantee holds as written. The cost is job submission: seconds on the
-Direct runner, a minute or more on Dataflow, paid per partition.
+### What Beam gives us, and what it does not
 
-**(B) One job for the dataset, Gantry polls.** Cheap to submit, and checkpoint
-granularity collapses to the whole dataset. A crash at 95% re-runs everything.
-Simple, fast, and a real weakening.
+**There are no Beam checkpoints to rely on for a bulk copy.** Dataflow snapshots
+are a *streaming* feature — Streaming Engine state, drain and resume. A batch
+pipeline has no user-visible checkpoint to resume from. What it has instead is
+internal bundle and work-item retry, which is invisible to the submitter and is
+precisely why idempotent writes stop being a nicety and become the thing holding
+correctness together.
 
-**(C) One job that reports back.** The pipeline's write step commits data and a
-checkpoint marker together, or emits per-bundle completion Gantry consumes.
-Keeps fine-grained checkpoints, needs a transactional sink, and puts Gantry's
-code inside someone else's pipeline.
+**Polling job status is the mechanism, and it is enough — at one granularity.**
+Be exact about what a terminal state says about the sink:
 
-**Exit:** a table of measured submission overhead per runner, and a decision
-recorded with its reasoning. **My expectation, to be tested rather than
-assumed:** (A) for correctness now, (C) documented as where this goes, (B)
-rejected — a guarantee that evaporates at scale is worse than one that was never
-claimed.
+| Job state | What the target contains |
+|---|---|
+| `DONE` | everything the pipeline wrote is committed — a real durability signal |
+| `FAILED` / `CANCELLED` | **partially written.** `JdbcIO` commits per bundle; there is no global transaction to roll back |
+
+So `DONE` is a genuine commit signal **at job granularity, and nothing finer is
+available**. A failed job leaves the target partially populated, which is safe
+only because Gantry already requires idempotent upserts: re-running is correct,
+merely expensive.
+
+### The consequence: checkpoint granularity is a tuning knob
+
+This is the finding, and it replaces the three-way choice above.
+
+The checkpoint unit is the job, because that is the only durability boundary
+Dataflow exposes. **What is left to choose is how much work goes in a job** —
+and that is a straight trade:
+
+| Partitions per job | Submission cost | Cost of a crash |
+|---|---|---|
+| 1 | one cluster start per partition | one partition re-run |
+| all | one cluster start | the whole dataset re-run |
+| *n* | ⌈partitions/*n*⌉ starts | at most *n* partitions re-run |
+
+Naive one-job-per-partition is **correct and economically unusable**: Dataflow
+batch provisions workers per job, so submission-to-first-row is minutes, and
+there are per-project quotas on both concurrent jobs and job creation rate.
+Sixty-one partitions is sixty-one cluster starts.
+
+So the design is **one job per partition group**, with the group size declared
+in the spec and defaulting to something that makes a crash cost minutes rather
+than hours. The guarantee statement becomes precise rather than weakened:
+
+> On the Beam backend, the checkpoint unit is a partition group, not a
+> partition. A crash re-runs at most one group. Group size is declared.
+
+### What would be needed for finer granularity, and why it is not day one
+
+Sub-job durability signal requires the pipeline to write the checkpoint itself,
+in the same transaction as the data. `JdbcIO` cannot do that — its batches do
+not align with partitions and it exposes no hook — so it needs a **custom sink**
+that writes rows and a partition marker in one transaction. That is real work,
+it puts Gantry code inside someone else's pipeline, and it is only correct if
+the marker lands in the same database as the data.
+
+Two things that look like a shortcut and are not:
+
+- **Beam metrics.** Counters are explicitly best-effort and may be reported from
+  retried bundles. A metric is not a durability signal.
+- **`@FinishBundle` hooks.** Bundle boundaries are non-deterministic and a bundle
+  can be retried after the hook ran. Writing a checkpoint there claims durability
+  the runner has not promised.
+
+### Day 0 still has to measure
+
+The shape is decided; the numbers are not.
+
+- **[A]** Dataflow batch submission-to-first-row, and job teardown, for a trivial
+  pipeline. This sets the floor on group size.
+- **[A]** Current per-project quotas on concurrent jobs and creation rate. If the
+  ceiling is low, group size is forced up regardless of what a crash costs.
+- **[A]** Whether the Python SDK's JDBC path needs a Java expansion service in
+  practice, and what that means for the dev stack.
+- **[B]** The same three on the Direct runner, which is what tests will use.
+
+**Exit:** a default group size chosen from measured numbers, and the guarantee
+sentence above written into `docs/guarantees.md` before the adapter exists —
+so the thing being built is the thing that was promised.
 
 ---
 
@@ -151,8 +215,15 @@ Postgres path's.
 
 ### Day 2 — Checkpoints across a boundary
 
-- **[A]** Whatever Day 0 chose, implemented and *proven* rather than asserted:
-  a checkpoint exists if and only if the data it describes is durable.
+- **[A]** Partition groups: the plan already names partitions, so a group is a
+  contiguous run of them and the job covers exactly that range. A checkpoint is
+  written for **every partition in the group, and only once the job reports
+  `DONE`** — never on `RUNNING`, and never per partition, because Dataflow has
+  told us nothing about individual partitions.
+- **[A]** Proven rather than asserted: a checkpoint exists if and only if the
+  data it describes is durable. The test that matters is the inverse — a job
+  that fails after writing 90% of its group leaves **no** checkpoints, and the
+  re-run is safe because the writes are idempotent.
 - **[A]** The submission itself must be idempotent. A worker that crashes
   between submitting a job and recording that it submitted must not start a
   second one — deterministic job naming from the plan node id, and a submitted
@@ -162,7 +233,8 @@ Postgres path's.
 
 **Exit:** kill a worker between submit and checkpoint; restarting adopts the
 running job rather than launching a second. **This is the new failure mode Beam
-introduces and the Postgres path does not have.**
+introduces and the Postgres path does not have** — there, a crash mid-copy kills
+the copy, and here the work carries on without anyone watching it.
 
 ---
 
@@ -266,6 +338,7 @@ answers rather than intentions.
 | 2 | The non-Postgres target (Day 5) | Costs the reach claim entirely — say so in the docs rather than implying it |
 | 3 | Beam-side checksums | Fall back to "verification unsupported on this target", named explicitly |
 | 4 | Job adoption after crash (Day 2) | Only if replaced by a refusal: a duplicate job is worse than a stopped migration |
+| 5 | Configurable group size → one group per dataset | Simplest possible backend; the crash cost becomes the whole dataset, and the docs must say so |
 
 **Never cut:** the guarantee table. Shipping a second execution backend without
 a per-backend statement of what holds would make every guarantee in the project
@@ -281,7 +354,8 @@ ambiguous, including the ones that are fine.
 | Cross-language transforms drag in a Java expansion service | High | **High** | Prove the JDBC path on Day 0. If it needs a Java sidecar, that is a stack change and belongs in the same decision as the architecture |
 | Beam's Python SDK weight and startup cost | Medium | High | Optional extra (`gantry[beam]`), never a core dependency (§17) |
 | Checkpoint granularity collapses silently | **Critical** | Medium | The guarantee table is the artifact that prevents this; fill it in as you go rather than at the end |
-| Job submission overhead makes partitioned movement absurd | High | Medium | Day 0 measures it. If per-partition submission costs a minute, architecture (A) is unusable at real partition counts and (C) becomes required rather than aspirational |
+| Group size chosen without measuring | High | Medium | Day 0 measures submission cost and quota ceilings first. A default picked by taste trades a crash cost nobody computed against a bill nobody predicted |
+| Someone reads `DONE` as "the rows are right" | Medium | Medium | `DONE` means committed, not correct. Verification is a separate stage and stays exactly where it is |
 | The Direct runner passes and Flink does not | Medium | Medium | Say which runner each guarantee was proven on. "Holds" without a runner name is not a claim |
 | Two data paths diverge over time | Medium | High | The worker must not know which backend ran; anything that leaks into it is the seam being wrong |
 
@@ -294,6 +368,7 @@ ambiguous, including the ones that are fine.
 - [ ] The chaos suite runs against Beam, and every guarantee is either proven or written down as lost
 - [ ] Data lands in one non-Postgres target, verified or explicitly unverifiable
 - [ ] **`docs/guarantees.md` states what holds per backend**, and a reader can choose from it
+- [ ] The checkpoint-unit sentence is written *before* the adapter, and the adapter matches it
 - [ ] Two consecutive clean rehearsal runs
 - [ ] Nothing in `gantry/movement/worker` or the scheduler knows which backend ran
 
