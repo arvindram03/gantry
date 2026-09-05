@@ -55,6 +55,7 @@ measures something harder and more honest — **which guarantees survive**:
 | Writes are idempotent under duplicated delivery | holds | ? |
 | Stale writes rejected by source position | holds | ? |
 | Checkpoint granularity | per partition | **per partition group** — the job is the only durability boundary Dataflow exposes |
+| What a checkpoint asserts | committed | **committed and verified** — `DONE` alone is not accepted |
 | Repair re-copies one partition, not the table | holds | ? |
 | Verification is order-independent and localises in `O(log n)` | holds | ? |
 
@@ -156,6 +157,66 @@ than hours. The guarantee statement becomes precise rather than weakened:
 > On the Beam backend, the checkpoint unit is a partition group, not a
 > partition. A crash re-runs at most one group. Group size is declared.
 
+### Verification is the acceptance test, not the checkpoint
+
+A better answer than checkpointing on `DONE`, and it follows from something
+Gantry already believes: **an engine reporting success is not a correct result.**
+`DONE` is Dataflow saying it finished. That is exactly the class of claim this
+project exists not to take at face value.
+
+So the loop per group is:
+
+```text
+submit job for partition group
+  → poll to DONE
+  → verify that group's partitions
+  → checkpoint the partitions that verified
+```
+
+**A checkpoint on the Beam path therefore means "committed *and* verified",**
+which is strictly stronger than the Postgres path's "committed". That is an odd
+and pleasing result: the backend with the weaker durability signal ends up with
+the stronger checkpoint, because it has to earn one.
+
+**It costs nothing extra.** `verify_dataset` already runs every declared check at
+dataset scope *and* at every partition scope, at the end of a Movement. Verifying
+a group when its job finishes is the same total scan volume moved earlier — and
+earlier is better, because a doomed movement stops at group 2 of 40 rather than
+after all 40 have been paid for.
+
+Dataset-scope checks — total row count, referential integrity across the whole
+thing — still run once at the end, because they cannot be answered a group at a
+time.
+
+**Repair does not need the checkpoints either.** Repair re-copies one partition,
+and what it needs is the partition's *bounds*, which live in the plan. A
+single-partition Beam job repairs exactly as the Postgres path does.
+
+Two limits, both real:
+
+**The target has to be verifiable.** If Gantry cannot compute a checksum on a
+sink — the Day 5 risk — then there is no acceptance test and `DONE` is all there
+is. Verification becomes load-bearing for *progress*, not only for correctness,
+and a target that cannot be verified gets a weaker guarantee that must be
+written down as such.
+
+**The source has to be stable while a group verifies.** A snapshot Movement pins
+a position, so this holds. Under live writes it is the watermark-bounded
+comparison from the Migration work, with the same stated caveat: exact for
+append-shaped data, racy for updates below the watermark.
+
+### Two failure modes, and only one of them costs work
+
+Worth separating, because they are easy to conflate and have different answers:
+
+| What died | What happened to the work | Response |
+|---|---|---|
+| the Gantry worker | the Dataflow job is still running | **adopt it** — nothing is lost |
+| the Dataflow job | the group is partially written | **re-run the group** — idempotent, bounded by group size |
+
+The first is the new failure mode Beam introduces and is Day 2's job. The second
+is the one group size is tuned against.
+
 ### What would be needed for finer granularity, and why it is not day one
 
 Sub-job durability signal requires the pipeline to write the checkpoint itself,
@@ -220,10 +281,13 @@ Postgres path's.
   written for **every partition in the group, and only once the job reports
   `DONE`** — never on `RUNNING`, and never per partition, because Dataflow has
   told us nothing about individual partitions.
+- **[A]** Verify the group's partitions before checkpointing any of them, so a
+  checkpoint asserts "committed and verified" rather than "the runner said so".
+  This is work that `verify_dataset` does at the end anyway, moved earlier.
 - **[A]** Proven rather than asserted: a checkpoint exists if and only if the
-  data it describes is durable. The test that matters is the inverse — a job
-  that fails after writing 90% of its group leaves **no** checkpoints, and the
-  re-run is safe because the writes are idempotent.
+  data it describes is durable *and* agrees with the source. The test that
+  matters is the inverse — a job that reports `DONE` having written 90% of its
+  group leaves **no** checkpoints, because verification refuses it.
 - **[A]** The submission itself must be idempotent. A worker that crashes
   between submitting a job and recording that it submitted must not start a
   second one — deterministic job naming from the plan node id, and a submitted
@@ -355,7 +419,8 @@ ambiguous, including the ones that are fine.
 | Beam's Python SDK weight and startup cost | Medium | High | Optional extra (`gantry[beam]`), never a core dependency (§17) |
 | Checkpoint granularity collapses silently | **Critical** | Medium | The guarantee table is the artifact that prevents this; fill it in as you go rather than at the end |
 | Group size chosen without measuring | High | Medium | Day 0 measures submission cost and quota ceilings first. A default picked by taste trades a crash cost nobody computed against a bill nobody predicted |
-| Someone reads `DONE` as "the rows are right" | Medium | Medium | `DONE` means committed, not correct. Verification is a separate stage and stays exactly where it is |
+| Someone reads `DONE` as "the rows are right" | Medium | Medium | `DONE` means committed, not correct. Nothing is checkpointed on `DONE` alone — the group is verified first |
+| A target Gantry cannot verify silently gets a weaker guarantee | High | Medium | Verification is the acceptance test, so an unverifiable sink has none. Name it in the guarantee table rather than letting `DONE` stand in for correctness |
 | The Direct runner passes and Flink does not | Medium | Medium | Say which runner each guarantee was proven on. "Holds" without a runner name is not a claim |
 | Two data paths diverge over time | Medium | High | The worker must not know which backend ran; anything that leaks into it is the seam being wrong |
 
@@ -369,6 +434,7 @@ ambiguous, including the ones that are fine.
 - [ ] Data lands in one non-Postgres target, verified or explicitly unverifiable
 - [ ] **`docs/guarantees.md` states what holds per backend**, and a reader can choose from it
 - [ ] The checkpoint-unit sentence is written *before* the adapter, and the adapter matches it
+- [ ] Nothing is checkpointed on `DONE` alone; every checkpoint has a verification behind it
 - [ ] Two consecutive clean rehearsal runs
 - [ ] Nothing in `gantry/movement/worker` or the scheduler knows which backend ran
 
