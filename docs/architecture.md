@@ -1,9 +1,22 @@
 # Architecture
 
 Gantry sits above the transport and processing infrastructure you already run.
-It does not own the bytes on the wire. It owns the execution contract around
-them — what was planned, what ran, what was checkpointed, what was verified,
-and what may be believed as a result.
+It never stores, interprets or transforms your data. It owns the execution
+contract around it — what was planned, what ran, what was checkpointed, what
+was verified, and what may be believed as a result.
+
+**A distinction worth making early, because looser phrasing invites the wrong
+question.** Bytes do sometimes pass through Gantry: the Postgres backend relays
+one `COPY` stream into another through a bounded queue, so a partition's bytes
+traverse the worker process. What never happens is that they become rows —
+Python moves buffers, engines move rows (§17).
+
+And that relay is not what the guarantees rest on. Rewrite the Postgres path to
+use `postgres_fdw`, so no byte ever enters the process, and every guarantee
+holds unchanged. What is load-bearing is that **Gantry chooses the transaction
+boundary and observes the commit**: `copy_partition` opens the transaction and
+returns only after it commits, and the worker checkpoints on the next line.
+Topology is incidental; commit-boundary ownership is not.
 
 ## Four resources
 
