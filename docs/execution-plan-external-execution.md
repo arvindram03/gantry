@@ -296,9 +296,43 @@ Named for what they are, not for the Operation that happens to use them first.
   runner ran. Anything that leaks is the seam in the wrong place.
 - **[B]** `execution:` on an Operation spec, defaulting to `sql`.
 
-**Exit:** a Movement compiles to a retained job artifact and the worker submits
-and polls it through the interface — with nothing in the worker, the job model
-or the protocol that names a container.
+**Exit: met for the abstractions and the runner.** `Job`, `Packaging`,
+`ContainerPackaging`, `Runner`, `JobState`, `JobHandle`, `JobStatus` and a
+`DockerRunner`, with the boundary enforced by a test. The Movement *generator*
+lands on Day 2, where it belongs with the script it generates.
+
+**The boundary test is an AST check, not a grep**, and narrowing it to something
+trustworthy took three attempts. A grep for container words flagged
+`DatasetRegistry` (a different registry), `digest` in the artifact hasher (a
+sha256 local), and every docstring line that mentions containers as prose. What
+survives checks *declared identifiers* — fields, parameters, assignment targets
+— against exactly three names with no other meaning here: `image`, `container`,
+`dockerfile`. A guard that cries wolf gets deleted, and one that has never been
+seen to fire has not been verified, so a second test synthesises the leak and
+confirms the detector catches it.
+
+**Idempotent submission is proven against a real daemon**, because the question
+is what Docker does with a name it has already seen — which no mock can answer.
+The container name is derived from the job's content hash, so resubmitting
+adopts, and a job whose packaging changed hashes differently and is therefore
+genuinely a different run.
+
+**One thing the tests caught in themselves.** The first version of the secret
+test asserted `test "$PROBE_SECRET" = hunter2`, which put the secret value in
+the job body — precisely the leak the test exists to prevent. It now checks the
+variable arrived without naming what it holds, and asserts the value is absent
+from the serialised artifact while its *name* is present, since the name is
+identity-bearing.
+
+**A note on how the day's suite run went**, because the wrong lesson is easy to
+take from it. Five verification tests failed on the first full run and passed on
+every run afterwards. The cause was manual probing from Day 0 — tables truncated
+and dropped by hand minutes earlier — which the first run inherited and then
+re-seeded. Establishing that took three runs: the file alone, the suite without
+it, and the suite with it. **Day 0 measurements against the shared stack need
+the same cleanup discipline as tests**, and the reflex to call an unexplained
+failure "pre-existing flakiness" is exactly the reflex that lets a real
+regression through.
 
 ### Day 2 — The SQL script job, and the relay's deletion
 
