@@ -27,10 +27,17 @@ The line is precise: **control flows through Gantry; data does not.** Issuing a
 statement and waiting for it is submission. Holding the rows in a queue is being
 the mover, and that is what goes.
 
-**The default job is a SQL transaction script**, which is also the strongest
-kind: the commit boundary stays Gantry's and checkpoints stay partition-granular.
-Beam is for what SQL cannot reach — another engine, or scale beyond one server.
-See [execution-plan-external-execution.md](execution-plan-external-execution.md).
+**The default job is a SQL script running in a container** that connects to the
+source and target itself. It is the strongest job kind — the commit boundary is
+written into the script Gantry generated, and checkpoints stay partition-granular
+because container startup is seconds. Beam is for what SQL cannot reach: another
+engine, or scale beyond one server.
+
+Adapters do not go away. Gantry still connects to databases to discover, profile,
+verify and read positions — all bounded queries, and a checksum over ten million
+rows returns one number. The rule is not that Gantry opens no connections; it is
+that **Gantry never carries a payload proportional to the data**. See
+[execution-plan-external-execution.md](execution-plan-external-execution.md).
 
 ## Four resources
 
