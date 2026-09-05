@@ -319,10 +319,86 @@ inequality on values that agree.
 the first `EXPLAIN` line; DuckDB renders a tree with no such figure. The DuckDB
 adapter reports no estimate rather than parsing a number out of prose.
 
+## What an Analysis Result asserts
+
+An engine reporting SUCCESS says the query ran. It says nothing about whether
+the numbers mean what the Analysis claimed they would. Four checks stand
+between the two, and each catches a way a successful query can still be wrong:
+
+| Check | The failure it catches |
+|---|---|
+| `rowExpansion` | A join multiplied its input, so every aggregate over it counts some rows more than once |
+| `joinCoverage` | A join stayed small by matching almost nothing, describing a different population than the one asked about |
+| `temporalAlignment` | A temporal join stayed inside its bound while joining events barely related in time |
+| `nullRate` | A grouping or comparison field is null often enough that the groups are not the ones named |
+
+Row expansion is measured against the **left input's own row count under the
+same normalisation**, not the raw table: comparing a filtered join to an
+unfiltered base would report expansion for a window predicate. The reference
+scenario measures `1.0000x` with its temporal qualifier and `2.0000x` without
+it — the same SQL, the same successful execution, on opposite sides of the
+boundary.
+
+**A failed check withholds the findings; it does not caveat them.** A
+conclusion drawn from a computation the runtime has rejected is not a weak
+finding, and publishing it with a warning attached invites it to be quoted
+without one. The Result is still written, with `verification_failed` status and
+the evidence for the refusal, because *why* nothing was concluded is itself
+worth keeping.
+
+**A strength number must say where it came from.** Every finding carries a
+`strength_basis` — `deterministic`, `statistical`, or `model_judgement` — and
+it is required, not defaulted. A number that sometimes means "measured" and
+sometimes means "a model felt fairly sure" is worse than no number, because
+nothing downstream can tell which it is. A finding claiming either measured
+basis must carry the measurements the strength was derived from; only a
+`model_judgement` may stand alone, and it is labelled wherever it is rendered.
+
+## Tracing a finding to its data
+
+One call walks the whole chain:
+
+```
+finding -> Result -> generated artifact -> Dataset versions
+        -> the Movement that produced them -> its checkpoints
+```
+
+Each link answers a different question. The artifact says what computation ran,
+by content hash rather than by name. The Dataset versions say what it read —
+the exact versions pinned at plan time, not whatever is current now. The
+Movement checkpoints say how far the data had got when it was read, which is
+what turns "these numbers" into "these numbers, from data complete up to here".
+
+**Gaps are named, not omitted.** An artifact that was not retained, a Dataset
+pin whose content hash no longer matches the registered version, a reference
+carrying no hash at all — each is reported as an unresolved link. A chain that
+silently drops what it could not resolve looks exactly like a chain that
+resolved completely, which is the one failure this is meant to prevent. A pin
+whose version still exists but whose content has changed is treated as
+dangling: answering with the current version would answer the question with
+data the Result never saw.
+
+## Asking whether a finding still holds
+
+`gantry results refresh` re-executes **the artifact the Result came from**,
+addressed by content hash, and reports how each finding's measurements have
+moved. It does not recompile: a recompilation is a different computation unless
+proven otherwise, and comparing against it would answer a question nobody
+asked. A Result whose artifact was not retained is refused rather than
+approximated.
+
+Refresh does not write a new Result. A Result needs findings derived under the
+spec's own rules and a verification pass behind them, and neither survives in
+the stored artifact — emitting one from a re-execution alone would produce
+something that looks verified and is not.
+
+A group that has disappeared is reported as absent, not as zero. Zero is a
+measurement; the group being gone is a different fact, and collapsing the two
+turns a vanished cohort into a dramatic improvement.
+
 ## Not yet
 
 - Adaptive concurrency and rate limits (v1.1)
 - Cutover gates and approvals (v1.1)
-- Analysis verification: row expansion, join coverage, temporal alignment
-- Cutover gates and approvals (v1.1)
-- Analysis verification: row expansion, join coverage, temporal alignment (Day 18)
+- Causal claims: Gantry reports correlation with its strength basis stated, and
+  does not assert cause

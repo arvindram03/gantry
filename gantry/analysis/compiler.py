@@ -102,6 +102,39 @@ def compile_analysis(
     )
 
 
+def compile_relation(analysis: Analysis, manifests: dict[str, DatasetManifest]) -> tuple[str, str]:
+    """The normalised inputs and the joined relation, without aggregation.
+
+    Verification measures the join, not the aggregate. A join that multiplies
+    its left side is invisible once the rows have been grouped away, so the
+    checks that catch it have to see the same relation the aggregate was
+    computed over - built by the same code, not a reimplementation that might
+    disagree.
+    """
+    _check_inputs(analysis, manifests)
+    ctes = _normalisation_ctes(analysis, manifests)
+    prefix = "WITH " + ",\n".join(ctes) if ctes else ""
+    return prefix, _join_expression(analysis, manifests)
+
+
+def left_input(analysis: Analysis) -> str:
+    """The input a join expands from."""
+    return analysis.inputs[0]
+
+
+def qualified_column(analysis: Analysis, manifests: dict[str, DatasetManifest], column: str) -> str:
+    """A column reference valid inside the joined relation."""
+    return _qualify(_column_owners(analysis, manifests), column)
+
+
+def relation_alias(dataset: str) -> str:
+    return _alias(dataset)
+
+
+def normalised_name(dataset: str) -> str:
+    return _cte_name(dataset)
+
+
 def _check_inputs(analysis: Analysis, manifests: dict[str, DatasetManifest]) -> None:
     missing = [name for name in analysis.inputs if name not in manifests]
     if missing:

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 from gantry import __version__
+from gantry.cli import main
 from gantry.cli.main import app
 from typer.testing import CliRunner
 
@@ -27,10 +28,17 @@ def test_bare_invocation_shows_help() -> None:
     assert "Reliability and execution layer" in result.stdout
 
 
-def test_unimplemented_command_exits_two() -> None:
-    """Planned-but-unbuilt commands must fail loudly, never silently succeed."""
-    result = runner.invoke(app, ["results", "get", "anything"])
-    assert result.exit_code == 2
+def test_no_command_is_still_a_placeholder() -> None:
+    """This asserted that `results get` exited 2 as unbuilt. It is built, and
+    it was the last one: nothing in the CLI now exits 2 to mean "planned"."""
+    assert not hasattr(main, "_pending")
+
+
+def test_results_commands_are_wired() -> None:
+    result = runner.invoke(app, ["results", "--help"])
+    assert result.exit_code == 0
+    for command in ("get", "explain", "provenance", "refresh"):
+        assert command in result.stdout
 
 
 def test_validate_accepts_an_example(tmp_path: Path) -> None:

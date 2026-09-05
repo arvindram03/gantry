@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Protocol
 
 from gantry.analysis.artifact import GeneratedArtifact
@@ -89,3 +90,29 @@ def bounded(body: str, limit: int) -> str:
 
 def explain_text(rows: Sequence[Sequence[object]]) -> str:
     return "\n".join(str(row[0]) for row in rows if row)
+
+
+def as_int(value: object, default: int = 0) -> int:
+    """Coerce an engine's number to an int.
+
+    Engines disagree about Python types for the same aggregate - PostgreSQL
+    returns Decimal where DuckDB returns float, and the reverse - so anything
+    reading a result has to normalise or it compares unequal on values that
+    agree. Doing it here means each caller does not invent its own rule.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int | float | Decimal):
+        return int(value)
+    return int(str(value))
+
+
+def as_float(value: object, default: float = 0.0) -> float:
+    """Coerce an engine's number to a float. See `as_int`."""
+    if value is None:
+        return default
+    if isinstance(value, int | float | Decimal):
+        return float(value)
+    return float(str(value))

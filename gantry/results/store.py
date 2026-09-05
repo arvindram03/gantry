@@ -5,10 +5,11 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Protocol
 
-from sqlalchemy import Row, select
+from sqlalchemy import Row, or_, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from gantry.analysis.result import AnalysisResult
 from gantry.core.results import Result, ResultKind, ResultStatus
 from gantry.movement.result import MovementResult
 from gantry.state.database import transaction
@@ -21,6 +22,8 @@ class ResultStore(Protocol):
     async def get(self, name: str) -> Result | None: ...
 
     async def for_operation(self, operation: str) -> Sequence[Result]: ...
+
+    async def for_operation_outputs(self, datasets: Sequence[str]) -> Sequence[Result]: ...
 
 
 class PostgresResultStore:
@@ -78,6 +81,29 @@ class PostgresResultStore:
             ).all()
         return tuple(_rehydrate(row) for row in rows)
 
+    async def for_operation_outputs(self, datasets: Sequence[str]) -> Sequence[Result]:
+        """Results whose lineage names one of these Datasets as an input.
+
+        A Movement that read a Dataset also wrote one, so its checkpoints
+        describe how far that data had got - which is the link between an
+        Analysis finding and the state of the data underneath it.
+        """
+        if not datasets:
+            return ()
+        # Matched in the database rather than by reading every Result and
+        # filtering in Python: this table only grows, and provenance is asked
+        # for one Result at a time.
+        pins = results.c.provenance["lineage"]["inputs"]
+        async with transaction(self._engine) as connection:
+            rows = (
+                await connection.execute(
+                    select(results)
+                    .where(or_(*(pins.contains([{"name": name}]) for name in set(datasets))))
+                    .order_by(results.c.created_at)
+                )
+            ).all()
+        return tuple(_rehydrate(row) for row in rows)
+
 
 def _rehydrate(row: Row[tuple[object, ...]]) -> Result:
     mapping = row._mapping
@@ -85,8 +111,14 @@ def _rehydrate(row: Row[tuple[object, ...]]) -> Result:
     payload["provenance"] = mapping["provenance"]
     payload["status"] = mapping["status"]
 
-    if ResultKind(mapping["kind"]) is ResultKind.MOVEMENT:
+    # Dispatch on kind: each Result specialisation carries fields the base
+    # model forbids, so rehydrating everything as the base silently fails on
+    # exactly the Results that have the most to say.
+    kind = ResultKind(mapping["kind"])
+    if kind is ResultKind.MOVEMENT:
         return MovementResult.model_validate(payload)
+    if kind in (ResultKind.FINDING, ResultKind.EVIDENCE):
+        return AnalysisResult.model_validate(payload)
     return Result.model_validate(payload)
 
 

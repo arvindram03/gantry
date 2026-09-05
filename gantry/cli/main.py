@@ -19,9 +19,12 @@ from rich.table import Table
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from gantry import __version__
+from gantry.adapters.engine.postgres import PostgresEngineAdapter
 from gantry.adapters.source.postgres import PostgresSourceAdapter
 from gantry.adapters.source.seed import seed as seed_source
+from gantry.analysis.artifact import GeneratedArtifact
 from gantry.core.dataset import DatasetRef, DatasetVersion
+from gantry.core.results import Result
 from gantry.core.sizes import format_byte_size
 from gantry.lifecycle.plan import PlanVersion
 from gantry.lifecycle.states import IllegalTransitionError, StateTransition
@@ -31,6 +34,13 @@ from gantry.registry.base import DatasetRegistry
 from gantry.registry.discovery import DiscoveryReport, discover_into_registry
 from gantry.registry.errors import RegistryError
 from gantry.registry.jsonfile import DEFAULT_REGISTRY_PATH, JsonFileDatasetRegistry
+from gantry.results.provenance import ProvenanceChain, resolve
+from gantry.results.refresh import (
+    DEFAULT_TOLERANCE,
+    MissingArtifactError,
+    RefreshReport,
+    refresh,
+)
 from gantry.results.store import PostgresResultStore
 from gantry.scheduler.postgres import PostgresWorkflowBackend
 from gantry.spec.apiversion import CANONICAL_API_VERSION, is_deprecated_api_version
@@ -43,6 +53,7 @@ from gantry.spec.loader import (
     spec_json_schema,
 )
 from gantry.spec.movement import MovementSpec
+from gantry.state.artifacts import PostgresArtifactStore
 from gantry.state.checkpoints import PostgresCheckpointStore
 from gantry.state.database import DATABASE_URL_ENV, create_engine, database_url
 from gantry.state.operations import OperationStore, UnknownOperationError
@@ -104,13 +115,6 @@ RegistryOpt = Annotated[
     Path | None,
     typer.Option("--registry", help=f"Registry file (env {REGISTRY_ENV_VAR})."),
 ]
-
-
-def _pending(feature: str, day: str) -> None:
-    """Exit with a clear signal that a planned command has not been built yet."""
-    msg = f"{feature}: not implemented yet (planned {day})."
-    typer.secho(msg, fg=typer.colors.YELLOW, err=True)
-    raise typer.Exit(code=2)
 
 
 def _fail(message: str) -> None:
@@ -660,16 +664,185 @@ def schema_show(
     console.print(f"[green]wrote[/green] {out}")
 
 
+def _result_stores(
+    meta_url: str | None,
+) -> tuple[PostgresResultStore, PostgresDatasetRegistry, PostgresArtifactStore, AsyncEngine]:
+    meta = create_engine(meta_url or database_url())
+    return (
+        PostgresResultStore(meta),
+        PostgresDatasetRegistry(meta),
+        PostgresArtifactStore(meta),
+        meta,
+    )
+
+
 @results_app.command("get")
-def results_get(name: Annotated[str, typer.Argument(help="Result name.")]) -> None:
-    """Fetch a Result."""
-    _pending("results get", "Day 18")
+def results_get(
+    name: Annotated[str, typer.Argument(help="Result name.")],
+    meta_url: MetaUrlOpt = None,
+) -> None:
+    """Fetch a Result and its findings."""
+    store, _, _, meta = _result_stores(meta_url)
+
+    async def run() -> Result | None:
+        try:
+            return await store.get(name)
+        finally:
+            await meta.dispose()
+
+    result = asyncio.run(run())
+    if result is None:
+        _fail(f"no result named {name!r}")
+        return
+
+    style = "green" if result.is_trustworthy else "red"
+    console.print(f"[bold]{result.name}[/bold]  [{style}]{result.status.value}[/{style}]")
+    console.print(f"  kind         {result.kind.value}")
+    console.print(f"  created      {result.created_at.isoformat(timespec='seconds')}")
+
+    if result.verification:
+        passed = sum(1 for finding in result.verification if finding.passed)
+        console.print(f"  verification {passed}/{len(result.verification)} checks passed")
+        for finding in result.blocking_failures:
+            err_console.print(f"    [red]{finding.describe()}[/red]")
+
+    findings = getattr(result, "findings", ())
+    if findings:
+        console.print(f"  findings     {len(findings)}")
+        for finding in findings:
+            console.print(f"    [cyan]{finding.id}[/cyan] {finding.describe()}")
+            for measurement in finding.measurements:
+                console.print(f"      [dim]{measurement.describe()}[/dim]")
+    elif result.blocking_failures:
+        # Deliberate, and worth saying: a conclusion drawn from a computation
+        # the runtime rejected is not a finding.
+        console.print("  [dim]findings withheld: verification failed[/dim]")
+
+
+@results_app.command("explain")
+def results_explain(
+    name: Annotated[str, typer.Argument(help="Result name.")],
+    meta_url: MetaUrlOpt = None,
+) -> None:
+    """Show the computation a Result came from."""
+    _, _, artifacts, meta = _result_stores(meta_url)
+    store = PostgresResultStore(meta)
+
+    async def run() -> tuple[Result | None, list[GeneratedArtifact]]:
+        try:
+            result = await store.get(name)
+            if result is None:
+                return None, []
+            found = []
+            for reference in result.provenance.artifacts:
+                if reference.content_hash:
+                    stored = await artifacts.get(reference.content_hash)
+                    if stored is not None:
+                        found.append(stored)
+            return result, found
+        finally:
+            await meta.dispose()
+
+    result, found = asyncio.run(run())
+    if result is None:
+        _fail(f"no result named {name!r}")
+        return
+
+    console.print(f"[bold]{result.name}[/bold]")
+    if not found:
+        console.print("  [dim]no stored artifact for this result[/dim]")
+        return
+    for artifact in found:
+        console.print(f"  [dim]{artifact.content_hash}  {artifact.engine}[/dim]")
+        console.print(artifact.body)
 
 
 @results_app.command("provenance")
-def results_provenance(name: Annotated[str, typer.Argument(help="Result name.")]) -> None:
+def results_provenance(
+    name: Annotated[str, typer.Argument(help="Result name.")],
+    meta_url: MetaUrlOpt = None,
+) -> None:
     """Trace a Result back through artifacts, manifests and checkpoints."""
-    _pending("results provenance", "Day 18")
+    store, registry, artifacts, meta = _result_stores(meta_url)
+
+    async def run() -> ProvenanceChain | None:
+        try:
+            return await resolve(name, results=store, registry=registry, artifacts=artifacts)
+        finally:
+            await meta.dispose()
+
+    chain = asyncio.run(run())
+    if chain is None:
+        _fail(f"no result named {name!r}")
+        return
+
+    console.print(f"[bold]{chain.result.name}[/bold]  {chain.describe()}")
+    for artifact in chain.artifacts:
+        console.print(f"  computation  [dim]{artifact.content_hash}[/dim] on {artifact.engine}")
+    for version in chain.datasets:
+        console.print(
+            f"  read         {version.name}@{version.version}  [dim]{version.content_hash}[/dim]"
+        )
+    for operation in chain.upstream_operations:
+        console.print(f"  produced by  {operation}")
+    if chain.checkpoints:
+        console.print(f"  checkpoints  {len(chain.checkpoints)}")
+        for checkpoint in chain.checkpoints[:5]:
+            console.print(
+                f"    [dim]{checkpoint.scope.value}/{checkpoint.scope_id} "
+                f"at {checkpoint.position.kind.value}={checkpoint.position.value}[/dim]"
+            )
+        if len(chain.checkpoints) > 5:
+            console.print(f"    [dim]… {len(chain.checkpoints) - 5} more[/dim]")
+    for gap in chain.unresolved:
+        err_console.print(f"  [yellow]unresolved:[/yellow] {gap}")
+
+
+@results_app.command("refresh")
+def results_refresh(
+    name: Annotated[str, typer.Argument(help="Result name.")],
+    source_url: SourceUrlOpt = None,
+    meta_url: MetaUrlOpt = None,
+    tolerance: Annotated[
+        float, typer.Option(help="Relative move below which a measurement counts as unchanged.")
+    ] = DEFAULT_TOLERANCE,
+) -> None:
+    """Re-run a Result's computation and report how its measurements moved."""
+    store, _, artifacts, meta = _result_stores(meta_url)
+    source = create_engine(source_url or _source_url())
+
+    async def run() -> RefreshReport | None:
+        try:
+            return await refresh(
+                name,
+                results=store,
+                artifacts=artifacts,
+                adapter=PostgresEngineAdapter(source),
+                tolerance=tolerance,
+            )
+        finally:
+            await source.dispose()
+            await meta.dispose()
+
+    try:
+        report = asyncio.run(run())
+    except (MissingArtifactError, TypeError) as error:
+        _fail(str(error))
+        return
+
+    if report is None:
+        _fail(f"no result named {name!r}")
+        return
+
+    style = "green" if report.holds else "yellow"
+    console.print(f"[bold]{report.result.name}[/bold]  [{style}]{report.describe()}[/{style}]")
+    console.print(f"  artifact     [dim]{report.artifact.content_hash}[/dim]")
+    moved = set(report.moved)
+    for drift in report.drifts:
+        marker = "[yellow]~[/yellow]" if drift in moved else "[dim]=[/dim]"
+        console.print(f"  {marker} {drift.describe()}")
+    if report.drifts and report.holds:
+        console.print("  [dim]the finding still holds on current data[/dim]")
 
 
 if __name__ == "__main__":

@@ -298,6 +298,19 @@ The cost is real and I am not going to hide it. Four weeks does not buy four abs
 
 **Exit:** the scenario produces an `AnalysisResult` whose finding traces, in one command, back to the Movement checkpoint its input data came from. A verification-violating Analysis is rejected despite engine success.
 
+**Outcome (met).** Both halves demonstrated on the reference scenario, on the same SQL:
+
+| | engine | Gantry | findings |
+|---|---|---|---|
+| with the temporal qualifier | `SUCCESS`, 2 rows | `PASSED` — `rowExpansion 1.0000x` | 4 published |
+| without it | `SUCCESS`, 2 rows | `FAILED` — `rowExpansion 2.0000x`, "the join expanded 40,000 rows to 80,000" | withheld |
+
+Findings are **withheld** on a failed check rather than published with a caveat; the Result is still written, carrying `verification_failed` and the evidence for the refusal. Every finding carries a required `strength_basis`, and a `deterministic` or `statistical` one must carry the measurements its strength came from — only `model_judgement` may stand alone, and it is labelled wherever rendered.
+
+`gantry results provenance` resolves the whole chain in one call — finding → Result → artifact (by hash) → pinned Dataset versions → the Movement that produced them → its three LSN checkpoints — and **names the links it could not resolve** rather than omitting them; a pin whose content hash no longer matches is treated as dangling, not silently upgraded to the current version. `gantry results refresh` re-executes the stored artifact and reports measurement drift, refusing outright when the artifact was not retained.
+
+Two things fixed here rather than papered over: the Result store rehydrated every non-Movement kind as the base `Result`, which rejects an `AnalysisResult`'s fields outright — so exactly the Results with the most to say were unreadable; and the CLI's `_pending` placeholder was retired, since `results get` was the last command standing in for an unbuilt one.
+
 ### Day 19 — Mon+3 · Agent access policy + full demo rehearsal
 
 - **[A]** Progressive access ladder (RFC): `describe → profile → aggregate/query → partition → sample → exact records`, each gated. Default policy: rows deny, aggregates allow, metadata allow; PII redaction; `samples.maxRows`; `queries.maxBytesScanned` and timeout. **An LLM cannot override these** — enforcement is in the deterministic path, not the prompt.
