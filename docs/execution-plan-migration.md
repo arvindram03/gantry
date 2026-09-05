@@ -461,8 +461,79 @@ rollback window may mean the migration was wrong, or it may mean the application
 writing to the target correctly and the source is stale *by design*. The runtime cannot tell
 those apart, and guessing would be worse than reporting.
 
-**Exit:** a migration cuts over, holds the rollback window, and rolls back on command with the
-source authoritative throughout. The audit report reconstructs every decision and who made it.
+**Exit: met.** The whole cycle against the real stack:
+
+```text
+$ gantry migration cutover … --approved-by arvind --reason "release window"
+cut over orders-to-warehouse at 37450805752 by arvind at 2026-09-05T20:24:59+00:00
+  drain: ok — no change stream to drain
+  final_reconcile: ok — 2 dataset(s) agree
+  record_position: ok — lsn=37450805752
+  rollback window open for 1 day, 0:00:00; source remains authoritative
+
+$ gantry migration window …
+holding  orders-to-warehouse: holding, 24.0h left, source authoritative
+
+$ gantry migration finalize …          # while the window is still useful
+error: cannot finalize 'orders-to-warehouse': 23:59:43 left before the window closes
+```
+
+Corrupt one row in the target and the window notices — and does nothing about it:
+
+```text
+diverged  orders-to-warehouse: diverged on public.orders — source is still
+          authoritative; rolling back is your call
+  divergence is reported, not acted on: it may mean the migration was wrong, or
+  that the target is now correct and the source is stale by design
+
+$ gantry migration status orders-to-warehouse
+orders-to-warehouse  state=rollback_window          # unmoved
+```
+
+```text
+$ gantry migration rollback … --decided-by arvind --reason "checkout errors spiked"
+rolled back orders-to-warehouse from 37450805752 by arvind
+  the source was authoritative throughout; no data moved back
+```
+
+### The ordering that looks wrong and is not
+
+The cutover steps run **after** the transition into `CUTTING_OVER`, not before. That reads
+backwards until you ask what happens if the drain fails: the moment an operator approves,
+traffic is being moved by whatever moves it, and the only safe direction from a half-finished
+cutover is back — which is reachable from `CUTTING_OVER` and from nowhere earlier. Doing the
+work first and transitioning after would leave the workflow in a state with no way out.
+
+So a cutover that cannot drain lands in `ROLLING_BACK`, not `FAILED`.
+
+### What refuses to be clever
+
+`finalize` refuses while the window is still running *and* while the sides disagree — closing
+the window on a divergence would discard the only way back. Reconciling nothing is not
+agreement: an empty list of reports must not read as a clean bill of health, because a cutover
+on a target nobody checked is a guess.
+
+And the window never rolls back on its own. That is the one place the plan warned about, and
+the reasoning holds: divergence may mean the migration was wrong, or it may mean the
+application is now writing to the target correctly and the source is stale by design. Nothing
+in the runtime can tell those apart from the outside.
+
+### Two gaps the audit trail exposed
+
+The first was mine twice over: I documented that a rollback returns the source to *the point
+the cutover recorded*, and then never wired it — `from_position: None` in the trail. Worse, the
+first fix hardcoded `PositionKind.LSN` on the way back, which is exactly the assumption
+`SourcePosition` exists to prevent. The kind travels with the value now.
+
+The second: `migration audit` printed the gate report as a raw list of dicts — technically
+complete, practically unreadable. It renders as `allPartitionsVerified=passed,
+maxCdcLag=disabled, …` now. An audit nobody reads is not an audit.
+
+### The measurement
+
+**No change to `gantry/movement/` or `gantry/verification/`.** Cutover, the rollback window and
+finalize are entirely workflow — the deepest part of Migration reached without touching the
+primitive underneath it.
 
 ---
 

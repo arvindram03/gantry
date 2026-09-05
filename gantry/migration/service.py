@@ -16,12 +16,20 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 from gantry.core.operation import TERMINAL_STATES, OperationState
+from gantry.core.positions import PositionKind, SourcePosition
 from gantry.lifecycle.migration import MigrationState
 from gantry.lifecycle.states import ActorKind
+from gantry.migration.cutover import (
+    CutoverRecord,
+    RollbackRecord,
+    RollbackWindow,
+    WindowState,
+    build_record,
+)
 from gantry.migration.gates import GateFacts, GateReport, evaluate
 from gantry.migration.model import Migration
 from gantry.migration.prepare import PrepareReport
@@ -42,6 +50,34 @@ class PrepareRefusedError(Exception):
         super().__init__(f"migration {migration!r} not ready: {report.describe()}")
         self.migration = migration
         self.report = report
+
+
+class CutoverIncompleteError(Exception):
+    """The cutover was approved but could not finish.
+
+    The workflow is left in ROLLING_BACK, not FAILED: traffic may already be
+    moving, and the only safe direction from a half-finished cutover is back.
+    """
+
+    def __init__(self, migration: str, record: CutoverRecord) -> None:
+        failed = [step.describe() for step in record.steps if not step.completed]
+        super().__init__(f"cutover of {migration!r} did not complete: {'; '.join(failed)}")
+        self.migration = migration
+        self.record = record
+
+
+class WindowOpenError(Exception):
+    """Finalize was called while the rollback window was still useful."""
+
+    def __init__(self, migration: str, window: RollbackWindow, now: datetime) -> None:
+        state = window.state(now)
+        if state is WindowState.DIVERGED:
+            detail = "the sides have diverged; decide before closing the window"
+        else:
+            detail = f"{window.remaining(now)} left before the window closes"
+        super().__init__(f"cannot finalize {migration!r}: {detail}")
+        self.migration = migration
+        self.window = window
 
 
 class CutoverRefusedError(Exception):
@@ -415,6 +451,169 @@ class MigrationService:
             evidence=report.as_evidence(),
         )
         return report
+
+    async def complete_cutover(
+        self,
+        migration: Migration,
+        *,
+        approved_by: str,
+        reason: str,
+        gates: GateReport,
+        lag: timedelta | None = None,
+        reconciliation: Sequence[ReconciliationReport] = (),
+        position: SourcePosition | None = None,
+    ) -> CutoverRecord:
+        """Finish a cutover already in `CUTTING_OVER`, opening the window.
+
+        The steps run *after* the transition rather than before it, and that
+        ordering is the honest one: the moment an operator approves, traffic is
+        being moved by whatever moves it. If draining then fails, the workflow
+        must be able to roll back — which it can only do from `CUTTING_OVER`.
+        Doing the work first and transitioning after would leave a half-cut-over
+        migration in a state with no way out.
+        """
+        record = build_record(
+            migration.name,
+            approved_by=approved_by,
+            reason=reason,
+            gates=gates,
+            lag=lag,
+            lag_threshold=migration.cutover.max_cdc_lag,
+            reconciliation=reconciliation,
+            position=position,
+        )
+
+        if not record.completed:
+            failed = [step for step in record.steps if not step.completed]
+            await self._migrations.transition(
+                migration.name,
+                MigrationState.ROLLING_BACK,
+                actor=ActorKind.OPERATOR,
+                actor_id=approved_by,
+                reason=f"cutover could not complete: {failed[0].detail}",
+                evidence=record.as_evidence(),
+            )
+            raise CutoverIncompleteError(migration.name, record)
+
+        await self._migrations.transition(
+            migration.name,
+            MigrationState.ROLLBACK_WINDOW,
+            actor=ActorKind.RUNTIME,
+            reason=(
+                f"cut over at {record.position.value if record.position else 'unknown'}; "
+                f"source authoritative for {migration.rollback.window}"
+            ),
+            evidence=record.as_evidence(),
+        )
+        return record
+
+    async def window(
+        self,
+        migration: Migration,
+        *,
+        reconciliation: Sequence[ReconciliationReport] = (),
+        now: datetime | None = None,
+    ) -> RollbackWindow:
+        """Where the rollback window stands. Reports; never acts.
+
+        Divergence here may mean the migration was wrong, or it may mean the
+        application is writing to the target correctly and the source is stale
+        by design. Nothing in the runtime can tell those apart, so rolling back
+        stays a decision someone makes.
+        """
+        record = await self._migrations.get(migration.name)
+        opened = await self._opened_at(migration.name) or record.updated_at
+        return RollbackWindow(
+            migration=migration.name,
+            opened_at=opened,
+            duration=migration.rollback.window,
+            source_authoritative=migration.rollback.source_remains_authoritative,
+            reconciliation=tuple(reconciliation),
+        )
+
+    async def roll_back(
+        self,
+        migration: Migration,
+        *,
+        decided_by: str,
+        reason: str,
+        position: SourcePosition | None = None,
+    ) -> RollbackRecord:
+        """Return authority to the source, on someone's say-so."""
+        # Read the cutover position from the trail when the caller does not
+        # supply one. Rolling back means treating the source as authoritative
+        # *from a known point*, and the cutover already recorded which — asking
+        # the operator to repeat it would invite them to get it wrong.
+        record = RollbackRecord(
+            migration=migration.name,
+            decided_by=decided_by,
+            reason=reason,
+            at=self._clock(),
+            cutover_position=position or await self._cutover_position(migration.name),
+        )
+        await self._migrations.transition(
+            migration.name,
+            MigrationState.ROLLING_BACK,
+            actor=ActorKind.OPERATOR,
+            actor_id=decided_by,
+            reason=reason,
+            evidence=record.as_evidence(),
+        )
+        await self._migrations.transition(
+            migration.name,
+            MigrationState.ROLLED_BACK,
+            actor=ActorKind.RUNTIME,
+            reason="authority returned to the source",
+            evidence=record.as_evidence(),
+        )
+        return record
+
+    async def finalize(
+        self,
+        migration: Migration,
+        *,
+        reconciliation: Sequence[ReconciliationReport] = (),
+        now: datetime | None = None,
+    ) -> MigrationStatus:
+        """Close the window and mark the source decommissionable."""
+        window = await self.window(migration, reconciliation=reconciliation, now=now)
+        moment = now or self._clock()
+        state = window.state(moment)
+
+        if state is not WindowState.ELAPSED:
+            raise WindowOpenError(migration.name, window, moment)
+
+        await self._migrations.transition(
+            migration.name,
+            MigrationState.COMPLETED,
+            actor=ActorKind.RUNTIME,
+            reason="rollback window closed; source may be decommissioned",
+            evidence={"window_closed_at": window.closes_at.isoformat()},
+        )
+        return await self.status(migration.name)
+
+    async def _cutover_position(self, name: str) -> SourcePosition | None:
+        """The position the cutover recorded, recovered from its evidence."""
+        for entry in reversed(await self._migrations.history(name)):
+            if entry.to_state is not MigrationState.ROLLBACK_WINDOW or not entry.evidence:
+                continue
+            value = entry.evidence.get("position")
+            kind = entry.evidence.get("position_kind")
+            if value and kind:
+                return SourcePosition(kind=PositionKind(str(kind)), value=str(value))
+        return None
+
+    async def _opened_at(self, name: str) -> datetime | None:
+        """When the rollback window opened, from the trail rather than a field.
+
+        The transition into ROLLBACK_WINDOW already records the instant. Storing
+        it a second time on the migration row would give two answers to one
+        question, and eventually they would disagree.
+        """
+        for entry in reversed(await self._migrations.history(name)):
+            if entry.to_state is MigrationState.ROLLBACK_WINDOW:
+                return entry.occurred_at
+        return None
 
     async def pause(self, name: str, *, reason: str, actor_id: str | None = None) -> None:
         await self._migrations.transition(

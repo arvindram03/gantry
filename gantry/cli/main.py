@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import os
 from collections.abc import Awaitable, Callable, Sequence
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated
@@ -34,9 +35,16 @@ from gantry.core.sizes import format_byte_size
 from gantry.lifecycle.migration import IllegalMigrationTransitionError
 from gantry.lifecycle.plan import PlanVersion
 from gantry.lifecycle.states import (
+    ActorKind,
     IllegalTransitionError,
     OperationInFlightError,
     StateTransition,
+)
+from gantry.migration.cutover import (
+    CutoverRecord,
+    RollbackRecord,
+    RollbackWindow,
+    WindowState,
 )
 from gantry.migration.gates import GateFacts, GateOutcome, GateReport, evaluate
 from gantry.migration.model import Migration
@@ -48,12 +56,14 @@ from gantry.migration.prepare import (
 )
 from gantry.migration.reconcile import ReconciliationReport, reconcile
 from gantry.migration.service import (
+    CutoverIncompleteError,
     CutoverRefusedError,
     MigrationService,
     MigrationStatus,
     Preparer,
     PrepareRefusedError,
     Reconciler,
+    WindowOpenError,
 )
 from gantry.movement.model import MovementMode
 from gantry.movement.result import MovementResult
@@ -1635,21 +1645,42 @@ def migration_cutover(
     meta = create_engine(meta_url or database_url())
     service = MigrationService(migrations=MigrationStore(meta), operations=OperationStore(meta))
 
-    async def run() -> GateReport:
+    async def run() -> tuple[GateReport, CutoverRecord]:
         try:
             facts = await _gather_facts(
                 migration, movements=movements, source=source, target=target, meta=meta
             )
-            return await service.cutover(
+            report = await service.cutover(
                 migration, approved_by=approved_by, reason=reason, facts=facts
             )
+            # After the transition, not before. The moment an operator
+            # approves, traffic is being moved by whatever moves it; if the
+            # drain then fails, the only safe direction is back, and
+            # ROLLING_BACK is reachable from CUTTING_OVER and nowhere earlier.
+            reports = await _reconciler(source, target, migration)(migration)
+            record = await service.complete_cutover(
+                migration,
+                approved_by=approved_by,
+                reason=reason,
+                gates=report,
+                lag=None if not facts.streaming else facts.cdc_lag,
+                reconciliation=reports,
+                position=await PostgresSourceAdapter(source).current_position(),
+            )
+            return report, record
         finally:
             for engine in (source, target, meta):
                 await engine.dispose()
             await _dispose(engines)
 
     try:
-        report = asyncio.run(run())
+        report, record = asyncio.run(run())
+    except CutoverIncompleteError as exc:
+        err_console.print(f"[red]incomplete[/red] {exc}")
+        for step in exc.record.steps:
+            err_console.print(f"  {step.describe()}")
+        err_console.print("  [dim]left in rolling_back; traffic may already have moved[/dim]")
+        raise typer.Exit(code=1) from None
     except CutoverRefusedError as exc:
         err_console.print(f"[red]refused[/red] {exc.report.describe()}")
         _render_gates(exc.report)
@@ -1658,8 +1689,202 @@ def migration_cutover(
         _fail(str(exc))
         return
 
-    console.print(f"[green]cutting over[/green] {migration.name}  approved by {approved_by}")
+    console.print(f"[green]cut over[/green] {record.describe()}")
     _render_gates(report)
+    for step in record.steps:
+        console.print(f"  [dim]{step.describe()}[/dim]")
+    console.print(
+        f"  [dim]rollback window open for {migration.rollback.window}; "
+        f"source remains authoritative[/dim]"
+    )
+
+
+@migration_app.command("window")
+def migration_window(
+    spec: SpecArg,
+    source_url: SourceUrlOpt = None,
+    target_url: TargetUrlOpt = None,
+    meta_url: MetaUrlOpt = None,
+) -> None:
+    """Where the rollback window stands. Reports; never acts."""
+    try:
+        migration = load_migration_spec(spec).to_migration()
+    except SpecError as exc:
+        _fail(str(exc))
+        return
+
+    source = create_engine(source_url or _source_url())
+    target = create_engine(target_url or _target_url())
+    meta = create_engine(meta_url or database_url())
+    service = MigrationService(migrations=MigrationStore(meta), operations=OperationStore(meta))
+
+    async def run() -> tuple[RollbackWindow, list[ReconciliationReport]]:
+        try:
+            reports = await _reconciler(source, target, migration)(migration)
+            return await service.window(migration, reconciliation=reports), reports
+        finally:
+            for engine in (source, target, meta):
+                await engine.dispose()
+
+    try:
+        window, reports = asyncio.run(run())
+    except UnknownMigrationError as exc:
+        _fail(str(exc))
+        return
+
+    now = datetime.now(UTC)
+    state = window.state(now)
+    colour = {"holding": "green", "diverged": "red", "elapsed": "yellow"}[state.value]
+    console.print(f"[{colour}]{state.value}[/{colour}]  {window.describe(now)}")
+    console.print(f"  opened   {window.opened_at.isoformat(timespec='seconds')}")
+    console.print(f"  closes   {window.closes_at.isoformat(timespec='seconds')}")
+    _render_reconciliation(reports)
+    if state is WindowState.DIVERGED:
+        err_console.print(
+            "  [dim]divergence is reported, not acted on: it may mean the migration was "
+            "wrong, or that the target is now correct and the source is stale by design[/dim]"
+        )
+
+
+@migration_app.command("rollback")
+def migration_rollback(
+    spec: SpecArg,
+    decided_by: Annotated[str, typer.Option("--decided-by", help="Who is deciding.")],
+    reason: Annotated[str, typer.Option(help="Why.")],
+    meta_url: MetaUrlOpt = None,
+) -> None:
+    """Return authority to the source. Traffic rollback, not a reverse migration."""
+    try:
+        migration = load_migration_spec(spec).to_migration()
+    except SpecError as exc:
+        _fail(str(exc))
+        return
+
+    meta = create_engine(meta_url or database_url())
+    service = MigrationService(migrations=MigrationStore(meta), operations=OperationStore(meta))
+
+    async def run() -> RollbackRecord:
+        try:
+            return await service.roll_back(migration, decided_by=decided_by, reason=reason)
+        finally:
+            await meta.dispose()
+
+    try:
+        record = asyncio.run(run())
+    except (IllegalMigrationTransitionError, UnknownMigrationError) as exc:
+        _fail(str(exc))
+        return
+
+    console.print(f"[yellow]rolled back[/yellow] {record.describe()}")
+    console.print("  [dim]the source was authoritative throughout; no data moved back[/dim]")
+
+
+@migration_app.command("finalize")
+def migration_finalize(
+    spec: SpecArg,
+    source_url: SourceUrlOpt = None,
+    target_url: TargetUrlOpt = None,
+    meta_url: MetaUrlOpt = None,
+) -> None:
+    """Close the rollback window and mark the source decommissionable."""
+    try:
+        migration = load_migration_spec(spec).to_migration()
+    except SpecError as exc:
+        _fail(str(exc))
+        return
+
+    source = create_engine(source_url or _source_url())
+    target = create_engine(target_url or _target_url())
+    meta = create_engine(meta_url or database_url())
+    service = MigrationService(migrations=MigrationStore(meta), operations=OperationStore(meta))
+
+    async def run() -> MigrationStatus:
+        try:
+            reports = await _reconciler(source, target, migration)(migration)
+            return await service.finalize(migration, reconciliation=reports)
+        finally:
+            for engine in (source, target, meta):
+                await engine.dispose()
+
+    try:
+        status = asyncio.run(run())
+    except WindowOpenError as exc:
+        _fail(str(exc))
+        return
+    except (IllegalMigrationTransitionError, UnknownMigrationError) as exc:
+        _fail(str(exc))
+        return
+
+    console.print(f"[green]{status.state.value}[/green] {status.record.name}")
+    console.print("  [dim]the source may now be decommissioned[/dim]")
+
+
+@migration_app.command("audit")
+def migration_audit(
+    name: Annotated[str, typer.Argument(help="Migration name.")],
+    meta_url: MetaUrlOpt = None,
+) -> None:
+    """Every decision this migration made, and who made it."""
+    meta = create_engine(meta_url or database_url())
+
+    async def run() -> Sequence[MigrationTransition]:
+        try:
+            return await MigrationStore(meta).history(name)
+        finally:
+            await meta.dispose()
+
+    history = asyncio.run(run())
+    if not history:
+        _fail(f"no migration named {name!r}")
+        return
+
+    console.print(f"[bold]{name}[/bold]  {len(history)} transitions")
+    for entry in history:
+        who = entry.actor.value + (f" ({entry.actor_id})" if entry.actor_id else "")
+        colour = "yellow" if entry.actor is ActorKind.OPERATOR else "dim"
+        console.print(
+            f"  {entry.occurred_at.isoformat(timespec='seconds')}  "
+            f"{entry.from_state.value} -> {entry.to_state.value}  "
+            f"[{colour}]{who}[/{colour}]"
+        )
+        console.print(f"      [dim]{entry.reason}[/dim]")
+        if entry.evidence:
+            for key in sorted(entry.evidence):
+                console.print(f"      [dim]{key}: {_brief_evidence(entry.evidence[key])}[/dim]")
+
+
+def _brief_evidence(value: object) -> str:
+    """One line per key. An audit that needs scrolling is one nobody reads.
+
+    Nested structures are summarised rather than dumped: a gate report printed
+    as a raw list of dicts is technically complete and practically unreadable,
+    and `migration audit` exists to be read.
+    """
+    if isinstance(value, list):
+        if value and all(isinstance(item, dict) for item in value):
+            return _summarise_gates(value)
+        return f"{len(value)} item(s)" if len(value) > 3 else ", ".join(str(v) for v in value)
+    if isinstance(value, dict):
+        nested = value.get("gates")
+        if isinstance(nested, list):
+            return _summarise_gates(nested)
+        return ", ".join(f"{k}={v}" for k, v in list(value.items())[:3])
+    return str(value)
+
+
+def _summarise_gates(entries: list[object]) -> str:
+    """`allPartitionsVerified=passed, maxCdcLag=disabled, …` — the shape a
+    reader actually wants from a gate report."""
+    parts: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return f"{len(entries)} item(s)"
+        name = entry.get("gate")
+        outcome = entry.get("outcome")
+        if name is None or outcome is None:
+            return f"{len(entries)} item(s)"
+        parts.append(f"{name}={outcome}")
+    return ", ".join(parts)
 
 
 if __name__ == "__main__":

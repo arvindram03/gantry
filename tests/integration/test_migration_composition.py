@@ -15,16 +15,26 @@ from __future__ import annotations
 
 import os
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from gantry.core.operation import OperationState, OperationType
-from gantry.lifecycle.migration import MigrationState
+from gantry.core.positions import PositionKind, SourcePosition
+from gantry.lifecycle.migration import (
+    IllegalMigrationTransitionError,
+    MigrationState,
+)
 from gantry.lifecycle.states import ActorKind
 from gantry.migration.gates import GateFacts, GateName
 from gantry.migration.model import Migration
 from gantry.migration.prepare import PrepareReport
 from gantry.migration.reconcile import ReconciliationReport
-from gantry.migration.service import CutoverRefusedError, MigrationService
+from gantry.migration.service import (
+    CutoverIncompleteError,
+    CutoverRefusedError,
+    MigrationService,
+    WindowOpenError,
+)
 from gantry.state.database import create_engine, transaction
 from gantry.state.migrations import ApprovalRequiredError, MigrationStore
 from gantry.state.operations import OperationStore
@@ -413,3 +423,167 @@ async def test_asking_why_you_cannot_cut_over_does_not_move_the_workflow(
 
     assert len(await MigrationStore(meta).history(NAME)) == before
     assert (await migration_service.status(NAME)).state is MigrationState.READY_FOR_CUTOVER
+
+
+async def cut_over(meta: AsyncEngine) -> None:
+    """Walk a Migration through an approved cutover into the window."""
+    await ready_for_cutover(meta)
+    migration_service = service(meta)
+    report = await migration_service.cutover(
+        migration(), approved_by="arvind", reason="release window", facts=green_facts()
+    )
+    await migration_service.complete_cutover(
+        migration(),
+        approved_by="arvind",
+        reason="release window",
+        gates=report,
+        lag=None,
+        reconciliation=[_agreed()],
+        position=SourcePosition(kind=PositionKind.LSN, value="37450805752"),
+    )
+
+
+def _agreed(dataset: str = "public.orders", *, agreed: bool = True) -> ReconciliationReport:
+    from gantry.migration.reconcile import LayerOutcome, LayerResult, ReconciliationLayer
+
+    report = ReconciliationReport(dataset=dataset, target=dataset)
+    report.layers.append(
+        LayerResult(
+            layer=ReconciliationLayer.COUNT,
+            outcome=LayerOutcome.AGREED if agreed else LayerOutcome.DISAGREED,
+            detail="test",
+        )
+    )
+    return report
+
+
+async def test_a_completed_cutover_opens_the_rollback_window(meta: AsyncEngine) -> None:
+    await cut_over(meta)
+
+    status = await service(meta).status(NAME)
+    assert status.state is MigrationState.ROLLBACK_WINDOW
+
+    last = (await MigrationStore(meta).history(NAME))[-1]
+    assert last.evidence is not None
+    assert last.evidence["position"] == "37450805752"
+    assert last.evidence["position_kind"] == "lsn"
+
+
+async def test_a_cutover_that_cannot_drain_lands_in_rolling_back(meta: AsyncEngine) -> None:
+    """Not FAILED. Traffic may already be moving, and the only safe direction
+    from a half-finished cutover is back — which is reachable from
+    CUTTING_OVER and from nowhere earlier."""
+    await ready_for_cutover(meta)
+    migration_service = service(meta)
+    report = await migration_service.cutover(
+        migration(), approved_by="arvind", reason="release window", facts=green_facts()
+    )
+
+    with pytest.raises(CutoverIncompleteError):
+        await migration_service.complete_cutover(
+            migration(),
+            approved_by="arvind",
+            reason="release window",
+            gates=report,
+            lag=timedelta(seconds=30),
+            reconciliation=[_agreed()],
+            position=SourcePosition(kind=PositionKind.LSN, value="1"),
+        )
+
+    assert (await migration_service.status(NAME)).state is MigrationState.ROLLING_BACK
+
+
+async def test_the_window_reports_divergence_without_acting_on_it(
+    meta: AsyncEngine,
+) -> None:
+    """The temptation this resists. Divergence may mean the migration was
+    wrong, or that the target is now correct and the source is stale by
+    design. Nothing here can tell those apart, so it reports and waits."""
+    await cut_over(meta)
+    migration_service = service(meta)
+
+    window = await migration_service.window(migration(), reconciliation=[_agreed(agreed=False)])
+    assert window.diverged
+
+    assert (await migration_service.status(NAME)).state is MigrationState.ROLLBACK_WINDOW
+    assert "rolling back is your call" in window.describe(datetime.now(UTC))
+
+
+async def test_rollback_recovers_the_cutover_position_from_the_trail(
+    meta: AsyncEngine,
+) -> None:
+    """Rolling back means treating the source as authoritative from a known
+    point. Asking the operator to retype it would invite getting it wrong."""
+    await cut_over(meta)
+
+    record = await service(meta).roll_back(
+        migration(), decided_by="arvind", reason="checkout errors spiked"
+    )
+
+    assert record.cutover_position is not None
+    assert record.cutover_position.value == "37450805752"
+    assert record.as_evidence()["method"] == "traffic"
+    assert (await service(meta).status(NAME)).state is MigrationState.ROLLED_BACK
+
+
+async def test_finalize_refuses_while_the_window_is_still_useful(
+    meta: AsyncEngine,
+) -> None:
+    await cut_over(meta)
+
+    with pytest.raises(WindowOpenError, match="left before the window closes"):
+        await service(meta).finalize(migration(), reconciliation=[_agreed()])
+
+    assert (await service(meta).status(NAME)).state is MigrationState.ROLLBACK_WINDOW
+
+
+async def test_finalize_refuses_while_the_sides_disagree(meta: AsyncEngine) -> None:
+    """Closing the window on a divergence would discard the only way back."""
+    await cut_over(meta)
+
+    with pytest.raises(WindowOpenError, match="diverged"):
+        await service(meta).finalize(
+            migration(),
+            reconciliation=[_agreed(agreed=False)],
+            now=datetime.now(UTC) + timedelta(days=2),
+        )
+
+
+async def test_finalize_closes_an_elapsed_window(meta: AsyncEngine) -> None:
+    await cut_over(meta)
+
+    status = await service(meta).finalize(
+        migration(), reconciliation=[_agreed()], now=datetime.now(UTC) + timedelta(days=2)
+    )
+
+    assert status.state is MigrationState.COMPLETED
+
+
+async def test_a_completed_migration_cannot_be_rolled_back(meta: AsyncEngine) -> None:
+    """The source has been released; there is nothing to roll back to."""
+    await cut_over(meta)
+    await service(meta).finalize(
+        migration(), reconciliation=[_agreed()], now=datetime.now(UTC) + timedelta(days=2)
+    )
+
+    with pytest.raises(IllegalMigrationTransitionError):
+        await service(meta).roll_back(migration(), decided_by="arvind", reason="too late")
+
+
+async def test_the_audit_trail_reconstructs_every_decision_and_who_made_it(
+    meta: AsyncEngine,
+) -> None:
+    """The exit criterion for the phase."""
+    await cut_over(meta)
+    await service(meta).roll_back(migration(), decided_by="arvind", reason="checkout errors spiked")
+
+    history = await MigrationStore(meta).history(NAME)
+    operator_decisions = [entry for entry in history if entry.actor is ActorKind.OPERATOR]
+
+    assert [entry.to_state for entry in operator_decisions] == [
+        MigrationState.CUTTING_OVER,
+        MigrationState.ROLLING_BACK,
+    ]
+    assert all(entry.actor_id == "arvind" for entry in operator_decisions)
+    assert all(entry.reason for entry in operator_decisions)
+    assert all(entry.evidence for entry in operator_decisions)
