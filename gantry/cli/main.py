@@ -8,27 +8,44 @@ from __future__ import annotations
 
 import asyncio
 import os
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Annotated
 
 import typer
 from rich.console import Console
 from rich.table import Table
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from gantry import __version__
 from gantry.adapters.source.postgres import PostgresSourceAdapter
 from gantry.adapters.source.seed import seed as seed_source
 from gantry.core.dataset import DatasetRef, DatasetVersion
 from gantry.core.sizes import format_byte_size
+from gantry.lifecycle.plan import PlanVersion
+from gantry.lifecycle.states import IllegalTransitionError, StateTransition
+from gantry.movement.result import MovementResult
+from gantry.movement.service import MovementService, Progress
 from gantry.registry.base import DatasetRegistry
 from gantry.registry.discovery import DiscoveryReport, discover_into_registry
 from gantry.registry.errors import RegistryError
 from gantry.registry.jsonfile import DEFAULT_REGISTRY_PATH, JsonFileDatasetRegistry
+from gantry.results.store import PostgresResultStore
+from gantry.scheduler.postgres import PostgresWorkflowBackend
 from gantry.spec.apiversion import CANONICAL_API_VERSION, is_deprecated_api_version
 from gantry.spec.errors import SpecError
-from gantry.spec.loader import SUPPORTED_KINDS, load_dataset_spec, load_spec, spec_json_schema
+from gantry.spec.loader import (
+    SUPPORTED_KINDS,
+    load_dataset_spec,
+    load_movement_spec,
+    load_spec,
+    spec_json_schema,
+)
 from gantry.spec.movement import MovementSpec
-from gantry.state.database import create_engine
+from gantry.state.checkpoints import PostgresCheckpointStore
+from gantry.state.database import DATABASE_URL_ENV, create_engine, database_url
+from gantry.state.operations import OperationStore, UnknownOperationError
+from gantry.state.registry import PostgresDatasetRegistry
 
 app = typer.Typer(
     name="gantry",
@@ -53,10 +70,16 @@ err_console = Console(stderr=True)
 REGISTRY_ENV_VAR = "GANTRY_REGISTRY"
 SOURCE_URL_ENV = "GANTRY_SOURCE_URL"
 DEFAULT_SOURCE_URL = "postgresql+asyncpg://gantry:gantry@localhost:15432/gantry"
+TARGET_URL_ENV = "GANTRY_TARGET_URL"
+DEFAULT_TARGET_URL = "postgresql+asyncpg://gantry:gantry@localhost:15433/gantry"
 
 
 def _source_url() -> str:
     return os.environ.get(SOURCE_URL_ENV, DEFAULT_SOURCE_URL)
+
+
+def _target_url() -> str:
+    return os.environ.get(TARGET_URL_ENV, DEFAULT_TARGET_URL)
 
 
 SpecArg = Annotated[Path, typer.Argument(help="Path to a spec file.")]
@@ -126,22 +149,196 @@ def validate(spec: SpecArg) -> None:
     console.print(f"[green]ok[/green] {spec}: {parsed.kind} {parsed.metadata.name}")
 
 
-@app.command()
-def plan(spec: SpecArg) -> None:
-    """Compile a spec into an immutable PlanVersion."""
-    _pending("plan", "Day 4")
+TargetUrlOpt = Annotated[
+    str | None,
+    typer.Option("--target-url", help=f"Target database (env {TARGET_URL_ENV})."),
+]
+MetaUrlOpt = Annotated[
+    str | None,
+    typer.Option("--meta-url", help=f"Metadata store (env {DATABASE_URL_ENV})."),
+]
+
+
+def _service(
+    source_url: str | None, target_url: str | None, meta_url: str | None
+) -> tuple[MovementService, tuple[AsyncEngine, ...]]:
+    """Wire a service and hand back the engines to dispose."""
+    source = create_engine(source_url or _source_url())
+    target = create_engine(target_url or _target_url())
+    meta = create_engine(meta_url or database_url())
+
+    service = MovementService(
+        source_engine=source,
+        target_engine=target,
+        operations=OperationStore(meta),
+        backend_factory=lambda name: PostgresWorkflowBackend(meta, name),
+        checkpoints=PostgresCheckpointStore(meta),
+        registry=PostgresDatasetRegistry(meta),
+        results=PostgresResultStore(meta),
+    )
+    return service, (source, target, meta)
+
+
+async def _dispose(engines: tuple[AsyncEngine, ...]) -> None:
+    for engine in engines:
+        await engine.dispose()
 
 
 @app.command()
-def start(name: Annotated[str, typer.Argument(help="Operation name.")]) -> None:
-    """Start an Operation."""
-    _pending("start", "Day 10")
+def plan(
+    spec: SpecArg,
+    source_url: SourceUrlOpt = None,
+    target_url: TargetUrlOpt = None,
+    meta_url: MetaUrlOpt = None,
+) -> None:
+    """Discover the source and compile a spec into an immutable PlanVersion."""
+    try:
+        movement = load_movement_spec(spec).to_movement()
+    except SpecError as exc:
+        _fail(str(exc))
+        return
+
+    service, engines = _service(source_url, target_url, meta_url)
+
+    async def run() -> PlanVersion:
+        try:
+            return await service.plan(movement)
+        finally:
+            await _dispose(engines)
+
+    compiled = asyncio.run(run())
+    partitions = sum(1 for node in compiled.nodes if node.kind.value == "snapshot_partition")
+    console.print(
+        f"[green]planned[/green] {compiled.operation} v{compiled.version}  "
+        f"[dim]{len(compiled.nodes)} nodes, {partitions} partitions[/dim]"
+    )
+    console.print(f"  [dim]{compiled.content_hash}[/dim]")
 
 
 @app.command()
-def status(name: Annotated[str, typer.Argument(help="Operation name.")]) -> None:
-    """Show Operation progress and state."""
-    _pending("status", "Day 10")
+def start(
+    spec: SpecArg,
+    source_url: SourceUrlOpt = None,
+    target_url: TargetUrlOpt = None,
+    meta_url: MetaUrlOpt = None,
+) -> None:
+    """Run a Movement to completion, emitting a Result."""
+    try:
+        movement = load_movement_spec(spec).to_movement()
+    except SpecError as exc:
+        _fail(str(exc))
+        return
+
+    service, engines = _service(source_url, target_url, meta_url)
+    targets = {dataset.name: dataset.target for dataset in movement.datasets}
+
+    async def run() -> MovementResult:
+        try:
+            compiled = await service.plan(movement)
+            return await service.run(movement, compiled, targets=targets)
+        finally:
+            await _dispose(engines)
+
+    result = asyncio.run(run())
+    rate = result.rows_per_second
+    console.print(
+        f"[green]{result.status.value}[/green] {result.name}  "
+        f"{result.rows_moved:,} rows in {result.duration.total_seconds():.1f}s"
+        + (f" ({rate:,.0f} rows/sec)" if rate else "")
+    )
+    console.print(
+        f"  partitions {result.partitions_complete}/{result.partitions_total}"
+        f"   checkpoints {len(result.provenance.checkpoints)}"
+        f"   inputs pinned {len(result.provenance.lineage.inputs)}"
+    )
+
+
+@app.command()
+def status(
+    name: Annotated[str, typer.Argument(help="Operation name.")],
+    meta_url: MetaUrlOpt = None,
+) -> None:
+    """Show Operation state and progress."""
+    service, engines = _service(None, None, meta_url)
+
+    async def run() -> tuple[Progress, Sequence[StateTransition]]:
+        try:
+            return (
+                await service.progress(name),
+                await OperationStore(create_engine(meta_url or database_url())).history(name),
+            )
+        finally:
+            await _dispose(engines)
+
+    try:
+        progress, history = asyncio.run(run())
+    except UnknownOperationError as exc:
+        _fail(str(exc))
+        return
+
+    console.print(f"[bold]{name}[/bold]  state=[cyan]{progress.state.value}[/cyan]")
+    console.print(f"  plan version   {progress.plan_version or '-'}")
+    console.print(
+        f"  partitions     {progress.tasks_done}/{progress.tasks_total} "
+        f"({progress.percent_complete:.1f}%)"
+    )
+    console.print(f"  in flight      {progress.tasks_leased}")
+    console.print(f"  quarantined    {progress.tasks_quarantined}")
+    console.print(f"  checkpoints    {progress.checkpoints}")
+    if history:
+        console.print("  [dim]recent transitions[/dim]")
+        for step in list(history)[-5:]:
+            console.print(
+                f"    [dim]{step.occurred_at.isoformat(timespec='seconds')}[/dim] "
+                f"{step.from_state.value} -> {step.to_state.value}  [dim]{step.reason}[/dim]"
+            )
+
+
+def _control(name: str, meta_url: str | None, action: str, reason: str) -> None:
+    service, engines = _service(None, None, meta_url)
+
+    async def run() -> None:
+        try:
+            await getattr(service, action)(name, reason=reason)
+        finally:
+            await _dispose(engines)
+
+    try:
+        asyncio.run(run())
+    except (UnknownOperationError, IllegalTransitionError) as exc:
+        _fail(str(exc))
+        return
+    console.print(f"[green]{action}d[/green] {name}")
+
+
+@app.command()
+def pause(
+    name: Annotated[str, typer.Argument(help="Operation name.")],
+    reason: Annotated[str, typer.Option(help="Why, for the audit log.")] = "operator paused",
+    meta_url: MetaUrlOpt = None,
+) -> None:
+    """Stop handing out work. In-flight partitions run to their checkpoint."""
+    _control(name, meta_url, "pause", reason)
+
+
+@app.command()
+def resume(
+    name: Annotated[str, typer.Argument(help="Operation name.")],
+    reason: Annotated[str, typer.Option(help="Why, for the audit log.")] = "operator resumed",
+    meta_url: MetaUrlOpt = None,
+) -> None:
+    """Resume a paused Operation."""
+    _control(name, meta_url, "resume", reason)
+
+
+@app.command()
+def abort(
+    name: Annotated[str, typer.Argument(help="Operation name.")],
+    reason: Annotated[str, typer.Option(help="Why, for the audit log.")] = "operator aborted",
+    meta_url: MetaUrlOpt = None,
+) -> None:
+    """Stop an Operation permanently."""
+    _control(name, meta_url, "abort", reason)
 
 
 SourceUrlOpt = Annotated[

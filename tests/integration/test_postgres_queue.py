@@ -20,7 +20,7 @@ from gantry.scheduler.backend import TaskState
 from gantry.scheduler.postgres import PostgresWorkflowBackend
 from gantry.spec import load_movement_spec
 from gantry.state.database import create_engine, transaction
-from gantry.state.tables import operations, tasks
+from gantry.state.tables import checkpoints, operations, state_transitions, tasks
 from sqlalchemy import delete, insert
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -41,13 +41,16 @@ async def engine() -> AsyncIterator[AsyncEngine]:
     created = create_engine()
     try:
         async with transaction(created) as connection:
+            # Everything referencing operations has to go first.
+            await connection.execute(delete(checkpoints))
+            await connection.execute(delete(state_transitions))
             await connection.execute(delete(tasks))
             await connection.execute(delete(operations))
             await connection.execute(
                 insert(operations).values(
                     name=plan().operation,
                     operation_type="movement",
-                    state="draft",
+                    state="executing",
                     created_at=AT,
                     updated_at=AT,
                 )

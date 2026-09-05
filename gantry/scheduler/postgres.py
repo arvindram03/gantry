@@ -35,6 +35,12 @@ _LEASE_SQL = text(
              FROM tasks AS c
             WHERE c.operation = :operation
               AND c.state = 'pending'
+              AND EXISTS (
+                    SELECT 1
+                      FROM operations AS o
+                     WHERE o.name = c.operation
+                       AND o.state NOT IN ('paused', 'failed', 'completed')
+                  )
               AND NOT EXISTS (
                     SELECT 1
                       FROM tasks AS dep
