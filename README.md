@@ -561,7 +561,7 @@ feature list, not after.
 | [rfcs/0000-gantry.md](docs/rfcs/0000-gantry.md) | the design document and its revisions |
 | [execution-plan-v1.md](docs/execution-plan-v1.md) | how v1 was built, day by day, with what each day found |
 | [execution-plan-migration.md](docs/execution-plan-migration.md) | how v1.1 was built: Migration as a workflow over Movements |
-| [execution-plan-beam.md](docs/execution-plan-beam.md) | what v1.2 would do: Movement over a data path Gantry does not run |
+| [execution-plan-external-execution.md](docs/execution-plan-external-execution.md) | what v1.2 would do: Gantry stops moving data — federated and Beam executors |
 
 ## Status
 

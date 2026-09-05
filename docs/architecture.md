@@ -11,12 +11,19 @@ one `COPY` stream into another through a bounded queue, so a partition's bytes
 traverse the worker process. What never happens is that they become rows —
 Python moves buffers, engines move rows (§17).
 
-And that relay is not what the guarantees rest on. Rewrite the Postgres path to
-use `postgres_fdw`, so no byte ever enters the process, and every guarantee
-holds unchanged. What is load-bearing is that **Gantry chooses the transaction
-boundary and observes the commit**: `copy_partition` opens the transaction and
-returns only after it commits, and the worker checkpoints on the next line.
-Topology is incidental; commit-boundary ownership is not.
+That relay is not what the guarantees rest on — what is load-bearing is that
+**Gantry chooses the transaction boundary and observes the commit**. But it is
+still a design that drifted: a single Python process is the throughput ceiling
+for a large partition, and a crash there is a crash *in* the data path rather
+than beside it.
+
+**v1.2 corrects it.** The principle is that Gantry never moves data: it plans
+the work, generates the instruction, hands it to something that executes, and
+verifies the outcome. Postgres→Postgres becomes a federated `INSERT … SELECT`
+the target server runs itself; cross-engine work goes to Beam. The relay stays
+as the fallback for environments without `postgres_fdw`, and is the one backend
+where Gantry is in the path. See
+[execution-plan-external-execution.md](execution-plan-external-execution.md).
 
 ## Four resources
 
