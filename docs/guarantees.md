@@ -506,9 +506,77 @@ Before this, an interrupted run left leases and quarantined partitions behind,
 and a fresh plan version ran the partitions it named alongside them — then
 reported a verification failure, which reads as a data bug and is not one.
 
+## Migration: what the workflow guarantees
+
+A Migration is a workflow composed from Movements, and it guarantees things
+about *decisions* rather than about data — the data guarantees are Movement's,
+listed above, and Migration inherits them unchanged.
+
+**Cutover is one-way through the gates.** `READY_FOR_CUTOVER` is reachable only
+from `VERIFYING` and `CUTTING_OVER` only from `READY_FOR_CUTOVER`. There is no
+edge that skips gate evaluation, because an edge that exists will eventually be
+taken.
+
+**Unmeasured is not passed.** A gate nobody supplied a reading for blocks.
+Otherwise forgetting to wire a probe is indistinguishable from wiring one that
+always says yes. The single stated exception is a snapshot-only migration,
+whose `maxCdcLag` gate is *disabled* with "no change stream" as its measured
+value — faking a zero would read as a measurement nobody took.
+
+**Gates are re-evaluated at the moment of cutover**, never trusted from an
+earlier call. A column altered during six hours of snapshot is exactly what
+this catches, and a report from before the snapshot cannot see it.
+
+**Neither an agent nor the runtime can move traffic.** `CUTTING_OVER` and
+`ROLLING_BACK` are operator-only, enforced in the transition function rather
+than in policy that could be relaxed. An operator transition without an
+identity is refused: a cutover approved by "operator" and nobody in particular
+is a checkbox.
+
+**Every gate is recorded, including the ones that passed and the ones the spec
+disabled.** A post-mortem asks what was believed at the moment of the decision,
+and a record of only the failures cannot answer it.
+
+**A half-finished cutover goes back, not to FAILED.** The cutover steps run
+after the transition into `CUTTING_OVER` because the only safe direction from a
+half-finished cutover is `ROLLING_BACK`, which is unreachable from anywhere
+earlier.
+
+**A rollback returns to the position the cutover recorded**, recovered from the
+trail rather than retyped. The position kind travels with the value: a position
+is comparable only within its kind, and reading one back as an LSN because it
+usually is would be the assumption `SourcePosition` exists to prevent.
+
+**Reconciliation under live writes is bounded, not paused.** Every comparison
+runs below the highest key the target held when it began, so replication lag is
+not reported as missing data. Exact for append-shaped data; updates to keys
+below the watermark can still race, and the report says `source still moving`
+rather than implying a frozen instant.
+
+### What Migration does not do
+
+As easy to find as the features, because these are the ones that surprise
+people:
+
+- **It does not move your traffic.** Gantry decides whether you may cut over
+  and records why. Redirecting an application is your deploy system's job;
+  owning it would make Gantry a proxy.
+- **It does not roll back on its own.** Divergence during the window may mean
+  the migration was wrong, or that the application is now writing to the target
+  correctly and the source is stale by design. Nothing in the runtime can tell
+  those apart, and guessing would be worse than reporting.
+- **It does not transform schemas.** Compatible schemas only; incompatible ones
+  are refused during `PREPARING` with every offending column named.
+- **There is no reverse CDC.** Rollback is traffic rollback (§7 Phase 9), not a
+  reverse bulk migration.
+- **It does not decommission the source.** `COMPLETED` marks it
+  decommissionable; doing so is yours.
+
 ## Not yet
 
-- Adaptive concurrency and rate limits (v1.1)
-- Cutover gates and approvals (v1.1)
+- Adaptive concurrency and rate limits
+- A second source adapter. v1.1 migrates PostgreSQL to PostgreSQL, which is not
+  the migration most people need
+- Multi-source and multi-region topologies
 - Causal claims: Gantry reports correlation with its strength basis stated, and
   does not assert cause

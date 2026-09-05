@@ -9,6 +9,6 @@ Analysis are both Operations over Datasets, and both traverse one lifecycle:
 See docs/execution-plan-v1.md for the v1 build order.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = ["__version__"]

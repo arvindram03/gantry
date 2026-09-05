@@ -82,6 +82,71 @@ A number that sometimes means "measured" and sometimes means "a model felt
 fairly sure" is worse than no number, because nothing downstream can tell which
 it is.
 
+## What v1.1 proved about §5.2
+
+The spec claims, in §5.2 and again at §1279, that **migration is a workflow
+composed from Movements, not a fundamental abstraction**. v1 shipped without
+testing that claim; v1.1 built the workflow specifically to find out.
+
+**The claim holds.** Seven days of building Migration — spec and state machine,
+composition, prepare, reconcile, gates, cutover, rollback, finalize — required
+**35 lines of change to `gantry/movement/`, in one function**, and nothing at
+all in `gantry/verification/`.
+
+Those 35 lines are worth describing, because they are the interesting part.
+Composing a workflow over Movement exposed a v1 bug: **a Movement never reached
+`COMPLETED`.** It stopped at `VERIFYING` and stayed there forever with every
+check passed. `gantry status` had been showing it and nobody chased it, because
+nothing in v1 ever asked the question — a workflow gate asking "are the
+Movements done?" could never have got a yes. The fix is the state machine's own
+documented rule finally implemented: `COMPLETED` is reachable only through
+verification.
+
+So the diff is not Migration reaching into Movement to bend it. It is Migration
+asking a question v1 never asked and finding the answer missing. **That is what
+a correctly factored abstraction looks like under a new consumer**, and had the
+diff been large, the honest conclusion would have been that Movement was
+factored around migration all along.
+
+Two things made this measurable rather than a matter of opinion: the number was
+taken on day 2 rather than day 7, and it was written into the plan as the exit
+criterion before any code existed.
+
+## Deviations in v1.1
+
+### Gantry does not switch traffic
+
+The spec's §7 Phase 8 describes cutover as an operation the system performs.
+v1.1 decides whether you *may* cut over, records that decision with its
+evidence, and holds the rollback window open — but redirecting an application
+is the deploy system's job. Owning a connection string would make Gantry a
+proxy, which is the same category error as owning the bytes on the wire, and it
+would make the whole workflow untestable against anything but a toy.
+
+### Rollback is never automatic
+
+§7 Phase 9 keeps the source authoritative and prefers traffic rollback over
+reverse bulk migration, which v1.1 follows. What it adds is a refusal: the
+window reports divergence and **will not act on it**. Divergence may mean the
+migration was wrong, or it may mean the application is now writing to the
+target correctly and the source is stale by design. Nothing in the runtime can
+distinguish those from the outside.
+
+### No schema transformation, no reverse CDC, no decommissioning
+
+§7 Phase 10 lists source decommissioning among the finalize steps. v1.1 marks
+the source decommissionable and stops. Reverse CDC ("optional… where
+supported") is not implemented. Schema transformation was never in the spec and
+is explicitly out: a migration tool that also rewrites your data model is two
+products.
+
+### Two gates the spec does not name
+
+`targetHealthy` and `schemaCompatible` are additions. Both read facts the
+runtime measures anyway — a write probe and Prepare's compatibility check
+re-run at cutover time — and both exist because the §7 Phase 8 gate list is
+introduced with "example gates" rather than as a closed set.
+
 ## Open questions
 
 The spec's section 23 open questions are tracked as issues. Two were answered
@@ -97,12 +162,22 @@ during v1:
 
 ## Known gaps
 
-Carried forward rather than closed in v1, and stated in
+Carried forward rather than closed, and stated in
 [../guarantees.md](../guarantees.md):
 
-- Adaptive concurrency and rate limits
-- Cutover gates and approvals
-- Starting a Movement against an Operation already executing half-runs instead
-  of refusing — found by the Day 19 rehearsal
+- Adaptive concurrency and rate limits (§10)
+- **A second source adapter.** v1 and v1.1 both migrate PostgreSQL to
+  PostgreSQL, which is not the migration most people need. This is the adoption
+  blocker rather than a correctness one, and it is the next piece of work.
+- Multi-source and multi-region topologies
 - Causal claims. Gantry reports correlation with its strength basis stated, and
   does not assert cause.
+
+Closed since v1:
+
+- ~~Cutover gates and approvals~~ — shipped in v1.1
+- ~~Starting a Movement against an Operation already executing half-runs
+  instead of refusing~~ — fixed before Migration was built, because a cutover
+  gate reads Operation state to decide whether it is safe to move production
+  traffic, and a gate above a state machine that half-runs can say yes when the
+  answer is no.

@@ -624,8 +624,41 @@ underneath. **The claim holds.**
   flip your traffic**.
 - Tag `v0.2.0`.
 
-**Exit — v1.1:** a stranger clones, runs a migration end to end with a gated cutover and a
-rollback, and can say afterward exactly which facts the decision rested on.
+**Exit: met.** Verified by dropping every table on all three databases and the entire metadata
+schema, then following the README:
+
+```text
+$ gantry migration prepare …
+ready orders-to-warehouse: ready, creating 2 target(s)
+  + will create target public.customers
+  + will create target public.orders
+
+$ gantry migration start …
+ready_for_cutover orders-to-warehouse
+  public.orders agrees below 200000 in 4 queries
+
+$ gantry migration gates …
+orders-to-warehouse: blocked by requireApproval
+
+$ gantry migration cutover … --approved-by arvind --reason "release window"
+cut over at 38810574752 by arvind
+  drain: ok · final_reconcile: ok — 2 dataset(s) agree · record_position: ok
+
+$ gantry migration rollback … --decided-by arvind --reason "checkout errors spiked"
+rolled back orders-to-warehouse from 38810574752 by arvind
+
+$ gantry migration audit orders-to-warehouse
+  ready_for_cutover -> cutting_over   operator (arvind)
+      gates: allPartitionsVerified=passed, maxCdcLag=disabled, …
+```
+
+The last line is the criterion: *exactly which facts the decision rested on*, recovered from
+the trail rather than reconstructed.
+
+**Shipped:** `docs/migration.md`, Migration guarantees and — the section that matters — its
+absences in `docs/guarantees.md`, RFC 0 with what v1.1 proved about §5.2 and four deviations
+written down, README with Migration in "How do you use it?" and traffic-routing added to "What
+Gantry is not", and `v0.2.0`.
 
 ---
 

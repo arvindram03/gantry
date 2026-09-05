@@ -38,6 +38,7 @@ be a different tool.
 | **An orchestrator or scheduler** | Airflow, Dagster, Temporal, cron | Gantry runs *on* Temporal by default. It is the thing your orchestrator calls, not a replacement for it. |
 | **A CDC tool** | Debezium, Kafka | Gantry drives real Debezium over real Kafka. What it adds is owning the applied position itself, so correctness does not depend on connector bookkeeping. |
 | **A BI or visualisation layer** | Looker, Metabase, Superset | Gantry produces a `Result` — structured, verified, with provenance. Rendering it is someone else's job. |
+| **A traffic router or proxy** | your load balancer, your deploy system | Gantry decides whether you *may* cut a migration over and records why. **It never moves your traffic.** Holding a connection string would make it a proxy. |
 | **An AI agent** | Claude, an in-house planner, a human | Gantry is what an agent *calls*. There is no model inside it. It decides plenty — what verifies, what is permitted — but deterministically, in code, the same way every time. |
 
 **And two things it explicitly does not claim:**
@@ -382,6 +383,56 @@ came from — measured, statistical, or a model's opinion, labelled as such.
 `provenance` walks from a finding back to the artifact, the exact Dataset
 versions read, and the checkpoint the Movement that produced them had reached.
 
+### 5. Cut over — a Migration
+
+A Migration is a workflow **composed from** Movements. It adds what a Movement
+deliberately does not have: gates, a recorded human approval, and a rollback window.
+
+```yaml
+apiVersion: gantry.dev/v1alpha1
+kind: Migration
+metadata:
+  name: orders-to-warehouse
+movements:
+  - movement: orders-snapshot
+    spec: examples/postgres-to-postgres/movement.yaml
+cutover:
+  gates:
+    allPartitionsVerified: true
+    maxCdcLag: 2s
+    criticalVerificationFailures: 0
+    requireApproval: true        # an agent may propose; only a person approves
+rollback:
+  window: 24h
+  sourceRemainsAuthoritative: true
+```
+
+```bash
+gantry migration prepare  migration.yaml   # refuse an incompatible target, move nothing
+gantry migration start    migration.yaml   # run the Movements, reconcile
+gantry migration gates    migration.yaml   # why can you or can't you cut over
+gantry migration cutover  migration.yaml --approved-by NAME --reason WHY
+gantry migration window   migration.yaml   # where the rollback window stands
+gantry migration rollback migration.yaml --decided-by NAME --reason WHY
+gantry migration audit    orders-to-warehouse
+```
+
+```text
+gate                          outcome   measured          required
+allPartitionsVerified         passed    12/12             every partition verified
+maxCdcLag                     disabled  no change stream  not required
+criticalVerificationFailures  passed    0                 <= 0
+targetHealthy                 passed    healthy           reachable and writable
+schemaCompatible              passed    compatible        compatible
+requireApproval               failed    nobody            a named operator
+orders-to-warehouse: blocked by requireApproval
+```
+
+**Gantry decides whether you may cut over. It does not move your traffic**, and it does not
+roll back on its own — divergence during the window may mean the migration was wrong, or that
+your application is now writing to the target correctly and the source is stale by design.
+Nothing in the runtime can tell those apart. See [docs/migration.md](docs/migration.md).
+
 ### Letting an agent use it
 
 ```python
@@ -491,6 +542,8 @@ traces provenance and exercises the access ladder — about a minute, timed step
 - **Repair** — one partition, not the table
 - **Provenance** — a finding traces to the Movement checkpoint its input data had reached
 - **Agent access** — a ladder enforced in code, not in a prompt
+- **Gated cutover** — a migration cuts over only when every declared gate passes and a
+  named person approves; an unmeasured gate blocks
 
 And what it does not — including the gaps found by its own rehearsal — is in
 [docs/guarantees.md](docs/guarantees.md). That document is meant to be read before the
@@ -502,6 +555,7 @@ feature list, not after.
 |---|---|
 | [architecture.md](docs/architecture.md) | the four resources, the shared lifecycle, the components |
 | [guarantees.md](docs/guarantees.md) | what v1 guarantees, and what it does not |
+| [migration.md](docs/migration.md) | the Migration workflow, its gates, and what it refuses to decide for you |
 | [adapters.md](docs/adapters.md) | the adapter interfaces and what each one owns |
 | [benchmarks.md](docs/benchmarks.md) | measured numbers, with the conditions they were measured under |
 | [rfcs/0000-gantry.md](docs/rfcs/0000-gantry.md) | the design document and its revisions |
@@ -510,7 +564,7 @@ feature list, not after.
 
 ## Status
 
-`v0.1.0`. Every guarantee above is exercised by tests against real databases, real Kafka and
+`v0.2.0` — Migration as a workflow over Movements. Every guarantee above is exercised by tests against real databases, real Kafka and
 real Debezium — not simulations — and by a rehearsal that runs the whole sequence through the
 CLI. It has not been run in production by anyone, including its authors.
 
@@ -520,7 +574,8 @@ CLI. It has not been run in production by anyone, including its authors.
 make check      # lint, strict typecheck, unit tests
 make test-int   # integration tests against the local stack
 make test-chaos # fault injection, including a real kill -9
-make rehearse   # the full end-to-end rehearsal, timed
+make rehearse   # the v1 end-to-end rehearsal, timed
+make rehearse-migration  # the Migration workflow, end to end
 ```
 
 `make help` lists every target. [CONTRIBUTING.md](CONTRIBUTING.md) covers the rest.
