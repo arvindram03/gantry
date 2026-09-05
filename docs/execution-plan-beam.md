@@ -11,24 +11,38 @@
 
 ## 0. What this proves
 
-Every version so far has moved bytes with its own code. `copy_partition` opens a
-connection to the source, streams through a bounded queue, and commits on the
-target — and the whole crash-replay guarantee rests on that call returning only
-after a durable commit, at which point the worker checkpoints.
+Every guarantee in this project reduces to one sentence in the Postgres
+backend: **`copy_partition` opens the transaction, and returns only after that
+transaction commits.** The worker checkpoints on the next line. Crash replay,
+idempotency, single-partition repair — all of it rests on Gantry choosing the
+commit boundary and observing the commit synchronously.
 
-Beam breaks that. A Beam pipeline is submitted to a runner, executes somewhere
-else, and finishes asynchronously. Gantry does not hold the connection, does not
-see the rows, and cannot observe the commit directly.
+Beam breaks *that*, and it is worth being precise about what it does not break.
 
-So the question is not "can we call Beam" — it is:
+It is tempting to say Gantry "is the data path" today and Beam takes it away.
+That is not the distinction. The Postgres backend does relay bytes — a bounded
+queue pipes one `COPY` stream into another — but the guarantee does not depend
+on it. Rewrite that path to use `postgres_fdw` or a server-side `COPY`, so no
+byte ever enters the Gantry process, and every guarantee holds unchanged.
+Topology is not what is load-bearing.
 
-> **Can Gantry own the execution contract over a data path it does not run?**
+What is load-bearing is three things, and Beam changes all of them:
+
+| | Postgres backend | Beam |
+|---|---|---|
+| Who chooses the commit boundary | Gantry — one transaction per partition | the runner — bundle boundaries |
+| Is the commit synchronously observable | yes, the call returns after `COMMIT` | no — submit, then poll |
+| Who retries, and can Gantry see it | Gantry, visibly | the runner, invisibly |
+
+So the question is not "can we call Beam", and not "who moves the bytes". It is:
+
+> **Can Gantry keep the commit boundary its guarantees are defined in terms of,
+> when the commit happens inside a runtime with its own?**
 
 That is the thesis under test. Gantry claims to own checkpoints, replay,
-ordering, idempotency, verification and provenance while engines own the data.
-Postgres-to-Postgres never really tested it, because Gantry *was* the data path.
-Beam is the first case where something else moves the bytes and Gantry still has
-to be able to say what is durable.
+ordering, idempotency, verification and provenance while engines own the data —
+and Postgres-to-Postgres never tested it, because Gantry chose every transaction
+boundary itself.
 
 ### The measurement
 
@@ -91,10 +105,10 @@ possible and they differ in what a crash costs. Spike all three far enough to
 measure; pick with numbers.
 
 **(A) One job per partition.** Gantry submits a pipeline per partition, awaits
-it, checkpoints. The commit-then-checkpoint ordering is *unchanged* — "commit"
-becomes "the job reported success" — so every guarantee holds as written. The
-cost is job submission: seconds on the Direct runner, a minute or more on
-Dataflow, paid per partition.
+it, checkpoints. This is **buying the commit boundary back** by making the job
+the unit: "commit" becomes "the job reported success", the ordering is unchanged,
+and every guarantee holds as written. The cost is job submission: seconds on the
+Direct runner, a minute or more on Dataflow, paid per partition.
 
 **(B) One job for the dataset, Gantry polls.** Cheap to submit, and checkpoint
 granularity collapses to the whole dataset. A crash at 95% re-runs everything.
@@ -119,7 +133,8 @@ claimed.
 
 - **[A]** `BeamMovementBackend` beside `MovementExecutor`, behind the same
   interface the worker already calls. The worker must not learn which backend
-  moved the bytes — if it has to, the seam is in the wrong place.
+  ran — it asks for a node to be executed and is told when the result is
+  durable. If it has to learn, the seam is in the wrong place.
 - **[A]** Pipeline construction from a `PlanNode`: the partition bounds the plan
   recorded, not recomputed. Recomputing at execution time lets a partition move
   under a replay, which is the bug the Postgres path already documents.
@@ -280,7 +295,7 @@ ambiguous, including the ones that are fine.
 - [ ] Data lands in one non-Postgres target, verified or explicitly unverifiable
 - [ ] **`docs/guarantees.md` states what holds per backend**, and a reader can choose from it
 - [ ] Two consecutive clean rehearsal runs
-- [ ] Nothing in `gantry/movement/worker` or the scheduler knows which backend moved the bytes
+- [ ] Nothing in `gantry/movement/worker` or the scheduler knows which backend ran
 
 ---
 
