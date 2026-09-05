@@ -13,11 +13,12 @@ Dataset - and re-profiling an unchanged table registers nothing new.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from typing import Protocol
 
 from gantry.core.dataset import DatasetManifest
 from gantry.core.positions import SourcePosition
+from gantry.movement.partitioning import Partition
 
 
 class SourceAdapter(Protocol):
@@ -37,6 +38,22 @@ class SourceAdapter(Protocol):
         Must not scan the table. Partition planning needs the key range,
         distinct-key count and null rates, all of which the database already
         estimates from its own sample.
+        """
+        ...
+
+    def read_partition(
+        self, manifest: DatasetManifest, partition: Partition, *, batch_size: int = 10_000
+    ) -> AsyncIterator[Sequence[tuple[object, ...]]]:
+        """Stream one partition in batches.
+
+        Rows are fetched through a server-side cursor: materialising a
+        five-million-row partition in the worker would put Python on the data
+        path, which is the one thing the runtime must not do.
+
+        The read runs at REPEATABLE READ, so a partition read twice inside one
+        transaction returns the same rows. Sharing one snapshot across every
+        partition - so the whole snapshot phase is consistent as of the CDC
+        start position - lands with the snapshot/CDC handoff.
         """
         ...
 

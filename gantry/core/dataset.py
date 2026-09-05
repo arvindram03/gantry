@@ -75,6 +75,13 @@ class DatasetStatistics(BaseModel):
     key_max: str | None = None
     distinct_keys: int | None = Field(default=None, ge=0)
     null_rates: dict[FieldName, float] = {}
+    # Equi-depth boundaries per column, each interval holding roughly the same
+    # number of rows. This is what makes partitioning skew-aware without
+    # scanning: equal key spans are not equal row counts, and the database
+    # already keeps a sample that knows the difference. Kept per column because
+    # a dataset may be partitioned by its key or by a time field, and those are
+    # rarely the same column.
+    histograms: dict[FieldName, tuple[str, ...]] = {}
     # True when the planner's own statistics were missing or stale, so callers
     # can tell "no skew" from "no information".
     stale_statistics: bool = False

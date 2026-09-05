@@ -6,13 +6,14 @@ registered Dataset resources, not a snapshot private to the Movement planner.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, datetime
 
 import pytest
 from gantry.core.dataset import DatasetManifest, DatasetRef, DatasetStatistics, PhysicalRef
 from gantry.core.positions import PositionKind, SourcePosition
 from gantry.core.schema import DatasetSchema, FieldSchema, ForeignKey, Index
+from gantry.movement.partitioning import Partition
 from gantry.registry import InMemoryDatasetRegistry
 from gantry.registry.discovery import discover_into_registry
 
@@ -76,6 +77,12 @@ class FakeSourceAdapter:
 
     async def current_position(self) -> SourcePosition:
         return SourcePosition(kind=PositionKind.LSN, value="0/16B3748")
+
+    async def read_partition(
+        self, manifest: DatasetManifest, partition: Partition, *, batch_size: int = 10_000
+    ) -> AsyncIterator[Sequence[tuple[object, ...]]]:
+        """Discovery never reads rows; this exists to satisfy the contract."""
+        yield ()
 
 
 async def test_discovery_registers_datasets() -> None:

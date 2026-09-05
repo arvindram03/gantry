@@ -139,3 +139,123 @@ async def test_rediscovery_against_a_live_source_is_free(adapter: PostgresSource
     await discover_into_registry(adapter, registry)
     await discover_into_registry(adapter, registry)
     assert len(await registry.versions("public.orders")) == 1
+
+
+# --- partitioning and reads (Day 7) ---------------------------------------
+
+
+async def test_partitions_cover_the_table_exactly(adapter: PostgresSourceAdapter) -> None:
+    """No row may be missed, and none may be copied twice."""
+    from gantry.movement.partitioning import plan_partitions
+    from gantry.state.database import transaction
+    from sqlalchemy import text
+
+    manifest = await adapter.profile(await orders(adapter))
+    plan = plan_partitions(manifest, target_partitions=16)
+
+    counts: list[int] = []
+    async with transaction(adapter._engine) as connection:
+        total = (await connection.execute(text("SELECT count(*) FROM public.orders"))).scalar_one()
+        for partition in plan.partitions:
+            clauses, params = [], {}
+            if partition.lo is not None:
+                clauses.append("order_id >= CAST(CAST(:lo AS text) AS bigint)")
+                params["lo"] = partition.lo
+            if partition.hi is not None:
+                clauses.append("order_id < CAST(CAST(:hi AS text) AS bigint)")
+                params["hi"] = partition.hi
+            where = " AND ".join(clauses) or "TRUE"
+            counts.append(
+                (
+                    await connection.execute(
+                        text(f"SELECT count(*) FROM public.orders WHERE {where}"),
+                        params,
+                    )
+                ).scalar_one()
+            )
+
+    assert sum(counts) == total, "partitions must tile the table exactly"
+
+
+async def test_partitions_are_balanced(adapter: PostgresSourceAdapter) -> None:
+    """Equal key spans are not equal row counts; equi-depth boundaries are.
+
+    The bound is loose because histogram resolution sets a floor: with 100
+    buckets and N partitions, each spans either floor or ceil of 100/N buckets.
+    """
+    from gantry.movement.partitioning import plan_partitions
+    from gantry.state.database import transaction
+    from sqlalchemy import text
+
+    manifest = await adapter.profile(await orders(adapter))
+    plan = plan_partitions(manifest, target_partitions=16)
+    if plan.method.value != "histogram":
+        pytest.skip("source has no histogram; run ANALYZE")
+
+    counts: list[int] = []
+    async with transaction(adapter._engine) as connection:
+        for partition in plan.partitions:
+            clauses, params = [], {}
+            if partition.lo is not None:
+                clauses.append("order_id >= CAST(CAST(:lo AS text) AS bigint)")
+                params["lo"] = partition.lo
+            if partition.hi is not None:
+                clauses.append("order_id < CAST(CAST(:hi AS text) AS bigint)")
+                params["hi"] = partition.hi
+            where = " AND ".join(clauses) or "TRUE"
+            counts.append(
+                (
+                    await connection.execute(
+                        text(f"SELECT count(*) FROM public.orders WHERE {where}"),
+                        params,
+                    )
+                ).scalar_one()
+            )
+
+    assert min(counts) > 0
+    assert max(counts) / min(counts) < 2.0, f"imbalanced: {min(counts)}..{max(counts)}"
+
+
+async def test_reading_a_partition_twice_yields_identical_rows(
+    adapter: PostgresSourceAdapter,
+) -> None:
+    from gantry.movement.partitioning import plan_partitions
+
+    manifest = await adapter.profile(await orders(adapter))
+    partition = plan_partitions(manifest, target_partitions=64).partitions[5]
+
+    first = [row async for batch in adapter.read_partition(manifest, partition) for row in batch]
+    second = [row async for batch in adapter.read_partition(manifest, partition) for row in batch]
+
+    assert first == second
+    assert first, "partition should not be empty"
+
+
+async def test_partition_reads_stay_within_bounds(adapter: PostgresSourceAdapter) -> None:
+    from gantry.movement.partitioning import plan_partitions
+
+    manifest = await adapter.profile(await orders(adapter))
+    partition = plan_partitions(manifest, target_partitions=64).partitions[5]
+    assert partition.lo is not None and partition.hi is not None
+
+    keys = [
+        int(str(row[0]))
+        async for batch in adapter.read_partition(manifest, partition)
+        for row in batch
+    ]
+    assert min(keys) >= int(partition.lo)
+    assert max(keys) < int(partition.hi)
+
+
+async def test_partition_reads_stream_rather_than_materialise(
+    adapter: PostgresSourceAdapter,
+) -> None:
+    """The first batch must arrive without reading the whole partition."""
+    from gantry.movement.partitioning import plan_partitions
+
+    manifest = await adapter.profile(await orders(adapter))
+    partition = plan_partitions(manifest, target_partitions=8).partitions[3]
+
+    batches = adapter.read_partition(manifest, partition, batch_size=1_000)
+    first = await anext(aiter(batches))
+    assert len(first) == 1_000

@@ -9,7 +9,8 @@ operation, not a read of 100M rows.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import re
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -19,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from gantry.core.dataset import DatasetManifest, DatasetStatistics, PhysicalRef
 from gantry.core.positions import PositionKind, SourcePosition
 from gantry.core.schema import DatasetSchema, FieldSchema, ForeignKey, Index
+from gantry.movement.partitioning import Partition
 from gantry.state.database import transaction
 
 ADAPTER = "postgres"
@@ -99,7 +101,13 @@ _FOREIGN_KEYS = text(
 
 _STATS = text(
     """
-    SELECT attname AS column_name, null_frac, n_distinct
+    SELECT attname AS column_name,
+           null_frac,
+           n_distinct,
+           -- histogram_bounds is anyarray; the double cast is the only way to
+           -- read it generically. CAST(...) rather than `::` because text()
+           -- reads a colon as bind-parameter syntax.
+           CAST(CAST(histogram_bounds AS text) AS text[]) AS histogram_bounds
       FROM pg_stats
      WHERE schemaname = :schema_name
        AND tablename = :table_name
@@ -195,6 +203,7 @@ class PostgresSourceAdapter:
         rows = manifest.physical.estimated_rows or 0
         null_rates = {row.column_name: float(row.null_frac) for row in stats}
         distinct = _distinct_keys(stats, keys, rows)
+        histograms = _histograms(stats)
 
         return manifest.model_copy(
             update={
@@ -205,6 +214,7 @@ class PostgresSourceAdapter:
                     key_max=key_max,
                     distinct_keys=distinct,
                     null_rates=null_rates,
+                    histograms=histograms,
                     # No planner statistics means "unknown", which is a
                     # different thing from "uniform" - partitioning must not
                     # read the absence of skew as evidence of its absence.
@@ -212,6 +222,41 @@ class PostgresSourceAdapter:
                 )
             }
         )
+
+    async def read_partition(
+        self, manifest: DatasetManifest, partition: Partition, *, batch_size: int = 10_000
+    ) -> AsyncIterator[Sequence[tuple[object, ...]]]:
+        """Stream one partition through a server-side cursor."""
+        preparer = self._engine.dialect.identifier_preparer
+        table = ".".join(preparer.quote(part) for part in manifest.physical.reference.split("."))
+        column = preparer.quote(partition.column)
+
+        # Partition bounds are type-agnostic strings by design, so the adapter
+        # re-types them from the schema it discovered. This is why the manifest
+        # travels with the partition rather than the bounds carrying a type.
+        # The parameter is pinned to text first: asyncpg infers a bind's type
+        # from its cast target, so CAST(:lo AS bigint) would demand an int.
+        column_type = _column_type(manifest, partition.column)
+
+        clauses: list[str] = []
+        params: dict[str, str] = {}
+        if partition.lo is not None:
+            clauses.append(f"{column} >= CAST(CAST(:lo AS text) AS {column_type})")
+            params["lo"] = partition.lo
+        if partition.hi is not None:
+            clauses.append(f"{column} < CAST(CAST(:hi AS text) AS {column_type})")
+            params["hi"] = partition.hi
+        where = " AND ".join(clauses) if clauses else "TRUE"
+
+        # Ordered by key so a partition read twice yields rows in one order,
+        # which is what makes a checksum over it reproducible.
+        query = text(f"SELECT * FROM {table} WHERE {where} ORDER BY {column}")
+
+        async with self._engine.connect() as connection:
+            await connection.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
+            result = await connection.stream(query, params)
+            async for batch in result.partitions(batch_size):
+                yield tuple(tuple(row) for row in batch)
 
     async def current_position(self) -> SourcePosition:
         async with transaction(self._engine) as connection:
@@ -273,3 +318,37 @@ def _distinct_keys(
     if value < 0:
         return round(-value * rows)
     return int(value)
+
+
+def _histograms(
+    stats: Sequence[Row[tuple[object, ...]]],
+) -> dict[str, tuple[str, ...]]:
+    """Read every column's equi-depth histogram, where the planner has one.
+
+    A column that is entirely most-common-values has no histogram, and neither
+    does an unanalyzed table. Both are simply absent here, which the
+    partitioner treats as missing information rather than as uniformity.
+    """
+    return {
+        row.column_name: tuple(str(bound) for bound in row.histogram_bounds)
+        for row in stats
+        if row.histogram_bounds
+    }
+
+
+# Catalog type names are trusted but still validated: nothing built into SQL
+# text should be able to carry a surprise, however it got there.
+_SAFE_TYPE = re.compile(r"^[a-z][a-z0-9 _]*(\(\d+(,\s*\d+)?\))?(\[\])?$")
+
+
+def _column_type(manifest: DatasetManifest, column: str) -> str:
+    """The source-declared type of a partition column."""
+    field = manifest.dataset_schema.field(column)
+    if field is None:
+        raise ValueError(
+            f"dataset {manifest.name!r} has no field {column!r}; "
+            f"discover the source before reading partitions"
+        )
+    if not _SAFE_TYPE.match(field.type):
+        raise ValueError(f"unsupported column type for partitioning: {field.type!r}")
+    return field.type
