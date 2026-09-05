@@ -118,10 +118,17 @@ async def test_profiling_does_not_scan_the_table(adapter: PostgresSourceAdapter)
 
 
 async def test_current_position_returns_an_lsn(adapter: PostgresSourceAdapter) -> None:
-    """Captured before a snapshot so CDC resumes with no gap."""
+    """Captured before a snapshot so CDC resumes with no gap.
+
+    Numeric rather than the `7/9B77D6D0` text form: this value is compared
+    against the LSN Debezium reports in each change event, which is
+    pg_wal_lsn_diff(lsn, '0/0'). Two representations of one position that
+    cannot be compared are worse than one.
+    """
     position = await adapter.current_position()
     assert position.kind is PositionKind.LSN
-    assert "/" in position.value
+    assert position.value.isdigit()
+    assert int(position.value) > 0
 
 
 async def test_discovery_registers_datasets_end_to_end(adapter: PostgresSourceAdapter) -> None:

@@ -232,6 +232,47 @@ runtime captures its snapshot position the same way rather than as the `7/9B77D6
 text form. Two representations of the same position that cannot be compared are
 worse than one.
 
+## What the Analysis compiler will and will not do
+
+Gantry compiles a **fixed vocabulary** — normalise, join, window, aggregate —
+onto engines that already have query languages. It is not one itself, and the
+places it refuses are as much of the design as the SQL it emits.
+
+**Signals are named, not written.** A spec asks for `p95_latency`; it cannot
+supply an expression. Unknown signals are a compile error listing what is
+known, and a signal whose required columns the inputs do not provide fails at
+compile time rather than at execution time, when it has already cost something.
+Adding a signal is a deliberate act: a definition in `gantry/analysis/signals.py`
+and a note here. That friction is intended.
+
+**Temporal joins take exactly one row.** `nearest_preceding` compiles to a
+lateral subquery ordered and limited to one, not to a join on a time
+comparison — which would match every candidate within the distance and multiply
+the left side by however many there are. That is the row-expansion failure the
+verification layer exists to catch, and it is better not to generate it.
+
+**An Analysis spanning engines is refused.** v1 compiles onto a single engine;
+saying so beats picking one and reading the rest wrongly.
+
+**`nearest` is not supported.** Nearest in which direction is a question the
+spec does not answer.
+
+### Determinism
+
+The same Analysis compiles to the same artifact, byte for byte. Compilation
+time is deliberately outside the content hash, so recompiling produces the same
+identity whenever it happens — which is what makes an artifact hash usable in
+provenance.
+
+### Semantics discovery cannot supply
+
+A catalog knows a column is `timestamptz`; it does not know that column is what
+orders the data, and a temporal join has to be told. Declarations of that kind
+— the time field, sensitive fields, agent access policy — live in a Dataset
+spec, and **rediscovery preserves them**. Without that, registering a Dataset
+spec and then rediscovering would alternate between two manifests for one
+table, which is the version churn content addressing exists to prevent.
+
 ## Not yet
 
 - Adaptive concurrency and rate limits (v1.1)

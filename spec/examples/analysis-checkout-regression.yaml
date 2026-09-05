@@ -1,0 +1,55 @@
+# The RFC's checkout-latency scenario, narrowed to Postgres-resident data.
+#
+# Same shape as the design document's example - normalise, temporal join,
+# aggregate signals - without needing a log store. `deploy_events` is joined by
+# nearest_preceding: each request is attributed to the deploy that was live
+# when it happened.
+apiVersion: gantry.dev/v1alpha1
+kind: Analysis
+
+metadata:
+  name: checkout-regression
+
+objective:
+  explain: checkout latency regression after a deploy
+
+inputs:
+  - dataset: public.request_logs
+  - dataset: public.deploy_events
+
+window:
+  start: "2026-09-03T00:00:00Z"
+  end: "2026-09-04T00:00:00Z"
+
+normalize:
+  fields:
+    service:
+      aliases: [svc, service_name]
+    commit_sha:
+      aliases: [commit_sha]
+
+joins:
+  - left: public.request_logs
+    right: public.deploy_events
+    on: [service]
+    temporal:
+      strategy: nearest_preceding
+      maxDistance: 24h
+
+signals:
+  - row_count
+  - p95_latency
+  - error_rate
+  - timeout_count
+  - database_calls_per_request
+  - database_wait_time
+
+execution:
+  engine: auto
+
+verify:
+  - rowExpansion:
+      max: 1.1
+  - nullRate:
+      field: commit_sha
+      max: 0.05

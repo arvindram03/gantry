@@ -202,3 +202,21 @@ dead_letters = Table(
     ForeignKeyConstraint(["operation"], ["operations.name"], name="fk_dead_letters_operation"),
     Index("ix_dead_letters_pending", "operation", "replayed_at"),
 )
+
+
+analysis_artifacts = Table(
+    "analysis_artifacts",
+    metadata,
+    # Content-addressed: an artifact either is the one a Result came from, or
+    # is a different artifact. Storing by hash makes recompiling free and makes
+    # "which SQL produced this" answerable without guessing.
+    Column("content_hash", String(71), primary_key=True),
+    Column("analysis", String(253), nullable=False),
+    Column("engine", String(32), nullable=False),
+    Column("language", String(16), nullable=False),
+    Column("body", Text, nullable=False),
+    Column("inputs", ARRAY(String), nullable=False, server_default="{}"),
+    Column("parameters", JSONB, nullable=False, server_default="{}"),
+    Column("generated_at", TIMESTAMP, nullable=False),
+    Index("ix_analysis_artifacts_analysis", "analysis", "generated_at"),
+)

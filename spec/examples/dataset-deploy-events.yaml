@@ -1,0 +1,18 @@
+apiVersion: gantry.dev/v1alpha1
+kind: Dataset
+
+metadata:
+  name: public.deploy_events
+
+physical:
+  adapter: postgres
+  reference: public.deploy_events
+
+schema:
+  keys: [deploy_id]
+
+semantics:
+  timeField: deployed_at
+
+access:
+  agentPolicy: aggregate_or_masked
