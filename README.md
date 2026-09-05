@@ -1,6 +1,8 @@
-<img src="docs/assets/gantry-logo-512.jpg" alt="Gantry" width="110" align="left" style="margin-right: 12px;">
+<p align="center">
+  <img src="docs/assets/gantry-logo-512.jpg" alt="Gantry" width="110">
+</p>
 
-<big><big><big><big><big><strong>Reliability and execution layer for data</strong></big></big></big></big></big>
+<h1>Reliability and execution layer for data</h1>
 <p>Gantry sits <strong>above</strong> the transport and processing infrastructure you already run. It does not
 own the bytes on the wire — it owns the execution contract around them: checkpoints, replay,
 ordering boundaries, idempotency, verification, policy, provenance and recovery. An engine reporting <code>SUCCESS</code> is not a correct result. Verification decides.</p>
