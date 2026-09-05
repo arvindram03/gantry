@@ -30,6 +30,10 @@ from gantry.state.database import transaction
 
 ADAPTER = "postgres"
 
+# The column carrying the source position. A snapshot stamps it with the
+# position the snapshot represents; CDC stamps it with each change's own LSN.
+SNAPSHOT_LSN_COLUMN = "source_lsn"
+
 # Catalog-derived, but validated anyway: nothing interpolated into SQL text
 # should be able to carry a surprise, however it got there.
 _SAFE_TYPE = re.compile(r"^[a-z][a-z0-9 _]*(\(\d+(,\s*\d+)?\))?(\[\])?$")
@@ -128,6 +132,7 @@ class PostgresTargetAdapter:
         source: AsyncConnection,
         query: str,
         query_params: Sequence[object] = (),
+        snapshot_lsn: int | None = None,
     ) -> CommitResult:
         """Stream a partition source-to-target without materialising rows.
 
@@ -158,7 +163,9 @@ class PostgresTargetAdapter:
             )
 
             merged = await connection.execute(
-                text(_merge_sql(target, staging, names, list(schema.keys)))
+                text(
+                    _merge_sql(target, staging, names, list(schema.keys), snapshot_lsn=snapshot_lsn)
+                )
             )
             outcomes = [row[0] for row in merged.all()]
             staged = (
@@ -190,7 +197,9 @@ def _upsert_sql(
     )
 
 
-def _conflict_action(target: str, names: Sequence[str], keys: Sequence[str]) -> str:
+def _conflict_action(
+    target: str, names: Sequence[str], keys: Sequence[str], *, extra_guard: str | None = None
+) -> str:
     """What to do when a row already exists.
 
     The WHERE clause is what makes a replay a no-op. Without it, ON CONFLICT DO
@@ -204,16 +213,51 @@ def _conflict_action(target: str, names: Sequence[str], keys: Sequence[str]) -> 
     distinct = " OR ".join(
         f"{_qualified(target)}.{_quote(n)} IS DISTINCT FROM EXCLUDED.{_quote(n)}" for n in updatable
     )
-    return f"DO UPDATE SET {assignments} WHERE {distinct}"
+    condition = distinct if extra_guard is None else f"({distinct}) AND {extra_guard}"
+    return f"DO UPDATE SET {assignments} WHERE {condition}"
 
 
-def _merge_sql(target: str, staging: str, names: Sequence[str], keys: Sequence[str]) -> str:
+def _merge_sql(
+    target: str,
+    staging: str,
+    names: Sequence[str],
+    keys: Sequence[str],
+    *,
+    snapshot_lsn: int | None = None,
+) -> str:
+    """Merge staged rows into the target.
+
+    When a snapshot position is given, every row is stamped with it and the
+    merge refuses to overwrite anything newer. That is what makes the snapshot
+    and the change stream safe to run at the same time: a snapshot represents
+    the source as of one position, so a change that happened after that
+    position must win, even if the snapshot writes it second.
+
+    Without the guard, a partition copied slowly enough would silently undo
+    changes CDC had already applied - and nothing downstream could tell,
+    because the row would look consistent.
+    """
     columns = ", ".join(_quote(name) for name in names)
+    if snapshot_lsn is None:
+        projection = columns
+        guard = None
+    else:
+        projection = ", ".join(
+            f"{snapshot_lsn}::bigint AS {_quote(name)}"
+            if name == SNAPSHOT_LSN_COLUMN
+            else _quote(name)
+            for name in names
+        )
+        guard = (
+            f"{_qualified(target)}.{_quote(SNAPSHOT_LSN_COLUMN)} < "
+            f"EXCLUDED.{_quote(SNAPSHOT_LSN_COLUMN)}"
+        )
+
     return (
         f"INSERT INTO {_qualified(target)} ({columns}) "
-        f"SELECT {columns} FROM {staging} "
+        f"SELECT {projection} FROM {staging} "
         f"ON CONFLICT ({', '.join(_quote(key) for key in keys)}) "
-        f"{_conflict_action(target, names, keys)} "
+        f"{_conflict_action(target, names, keys, extra_guard=guard)} "
         f"RETURNING (xmax = 0) AS inserted"
     )
 

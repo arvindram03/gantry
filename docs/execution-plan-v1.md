@@ -259,7 +259,9 @@ The cost is real and I am not going to hide it. Four weeks does not buy four abs
 - **[B]** Live-write test: continuous source writes throughout a full snapshot, then catch up.
 - **[B]** Prometheus metrics for the §14 progress/CDC/reliability/correctness families (folded in here; the abstraction work displaced the standalone telemetry day).
 
-**Exit — M2/M3:** snapshot + CDC under continuous writes converges to a byte-identical target, checksum-verified, lag < 2s. **The technical heart of Movement — if a day must slip, protect this one.**
+**Exit — M2/M3: passed.** A 50,000-row snapshot taken while writes continued throughout, then caught up: 279 changes applied, final lag 1.48 s against a 2 s threshold, source and target checksums identical. Verified by checksum rather than row count, because a count cannot see a row that is present on both sides and stale — which is exactly what a mishandled handoff produces.
+
+**What makes it work.** The snapshot is stamped with the position it represents, and its merge refuses to overwrite anything newer. Without that, a partition copied slowly enough silently undoes changes the stream has already applied, and the row still looks consistent afterwards. Overlap between the two phases is absorbed by idempotency rather than avoided — avoiding it would mean locking the source.
 
 ---
 

@@ -184,8 +184,58 @@ Depth is a first-class signal: a growing queue means the stream is producing
 changes the target will not take, which is a different problem from being slow
 and needs a different response.
 
+## Snapshot and change stream together
+
+The ordering is the whole of it, and getting it wrong produces a target that
+looks correct and is not.
+
+1. **Create the replication slot**, and wait for it to exist.
+2. **Capture the source position P**, after the slot exists.
+3. **Snapshot**, stamping every row with P.
+4. **Apply changes** from the stream; anything at or before P is refused.
+
+Each step exists because of a specific way the alternatives fail.
+
+**The slot comes first.** A slot created after the snapshot begins does not
+capture the changes made during it, and those changes are lost with nothing to
+indicate they ever happened.
+
+**The position is captured after the slot exists.** A position captured first
+names a point the stream cannot replay from.
+
+**The snapshot is stamped with P**, not with whatever the source's own column
+holds. A snapshot represents the source as of one position; saying so lets the
+ordinary stale-write guard settle every subsequent conflict.
+
+**Overlap is expected, not avoided.** Changes between the slot's creation and P
+appear in both phases. They are applied twice and refused the second time,
+which is what idempotency is for. Making the phases disjoint instead would
+require locking the source — the thing this design exists to avoid.
+
+### The failure the stamping prevents
+
+Without it, a partition copied slowly enough silently undoes changes the stream
+has already applied, and nothing downstream can tell, because the row still
+looks consistent. The snapshot merge therefore refuses to overwrite anything
+newer:
+
+```sql
+ON CONFLICT (key) DO UPDATE SET …
+ WHERE (target IS DISTINCT FROM excluded)
+   AND target.source_lsn < EXCLUDED.source_lsn
+```
+
+### One numeric space
+
+Debezium reports each change's LSN as `pg_wal_lsn_diff(lsn, '0/0')`, so the
+runtime captures its snapshot position the same way rather than as the `7/9B77D6D0`
+text form. Two representations of the same position that cannot be compared are
+worse than one.
+
 ## Not yet
 
-- Snapshot and CDC coordination, and catch-up lag (Day 15)
+- Adaptive concurrency and rate limits (v1.1)
+- Cutover gates and approvals (v1.1)
+- Analysis verification: row expansion, join coverage, temporal alignment
 - Cutover gates and approvals (v1.1)
 - Analysis verification: row expansion, join coverage, temporal alignment (Day 18)

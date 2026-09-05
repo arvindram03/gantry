@@ -287,9 +287,20 @@ class PostgresSourceAdapter:
         return f"SELECT {columns} FROM {table} WHERE {where}", tuple(params)
 
     async def current_position(self) -> SourcePosition:
+        """The source's current WAL position, as a number.
+
+        Numeric rather than the `7/9B77D6D0` text form, because this value is
+        compared against the LSN Debezium puts in each change event - and
+        Debezium reports `pg_wal_lsn_diff(lsn, '0/0')`. Two representations of
+        the same position that cannot be compared are worse than one.
+        """
         async with transaction(self._engine) as connection:
-            lsn = (await connection.execute(text("SELECT pg_current_wal_lsn()::text"))).scalar_one()
-        return SourcePosition(kind=PositionKind.LSN, value=str(lsn))
+            lsn = (
+                await connection.execute(
+                    text("SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0')::bigint")
+                )
+            ).scalar_one()
+        return SourcePosition(kind=PositionKind.LSN, value=str(int(lsn)))
 
     async def _key_range(
         self, connection: object, manifest: DatasetManifest, keys: tuple[str, ...]

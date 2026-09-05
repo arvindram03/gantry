@@ -185,6 +185,28 @@ target:
 Repair costs seconds because it re-copies one partition, not the migration.
 That is only safe because the copy is idempotent.
 
+## Day 15 — snapshot and CDC together (M3)
+
+A 50,000-row table snapshotted while writes continued throughout, then caught
+up:
+
+| | |
+|---|---|
+| Snapshot | 50,000 rows in 0.4 s, with 80 live writes during it |
+| Catch-up | 279 changes applied in 1.5 s |
+| Final lag | **1.48 s** (threshold 2.00 s) |
+| Convergence | source and target checksums **identical** |
+
+Verified by checksum rather than row count: a count cannot see a row that is
+present on both sides and stale, which is precisely what a mishandled handoff
+produces.
+
+**What these lag figures do and do not show.** The broker is a single-node
+KRaft Kafka in the same Docker network as the consumer, with no replication and
+no network between them. The number demonstrates that the handoff converges and
+that lag is measured against the source's own clock; it is not a claim about
+lag under production topology, replication, or load.
+
 ## Not yet measured
 
-- CDC apply rate and lag (Days 13–15)
+- Adaptive concurrency under target pressure (v1.1)
