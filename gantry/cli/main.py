@@ -28,6 +28,7 @@ from gantry.analysis.artifact import GeneratedArtifact
 from gantry.api.aggregates import Aggregate, AggregateFunction, AggregateQuery
 from gantry.api.datasets import Datasets, QueryOutcome
 from gantry.core.dataset import DatasetManifest, DatasetRef, DatasetVersion
+from gantry.core.evidence import VerificationResult
 from gantry.core.results import Result
 from gantry.core.sizes import format_byte_size
 from gantry.lifecycle.migration import IllegalMigrationTransitionError
@@ -37,10 +38,17 @@ from gantry.lifecycle.states import (
     OperationInFlightError,
     StateTransition,
 )
+from gantry.migration.gates import GateFacts, GateOutcome, GateReport, evaluate
 from gantry.migration.model import Migration
-from gantry.migration.prepare import PrepareReport, prepare
+from gantry.migration.prepare import (
+    PrepareCheck,
+    PrepareReport,
+    check_reachable,
+    prepare,
+)
 from gantry.migration.reconcile import ReconciliationReport, reconcile
 from gantry.migration.service import (
+    CutoverRefusedError,
     MigrationService,
     MigrationStatus,
     Preparer,
@@ -1471,6 +1479,187 @@ def migration_start(
         marker = "[green]✓[/green]" if movement.complete else " "
         console.print(f"  {marker} {movement.describe()}")
     _render_reconciliation(status.reconciliation)
+
+
+async def _gather_facts(
+    migration: Migration,
+    *,
+    movements: MovementService,
+    source: AsyncEngine,
+    target: AsyncEngine,
+    meta: AsyncEngine,
+    approved_by: str | None = None,
+) -> GateFacts:
+    """Read what the runtime already measured. Nothing here computes a verdict.
+
+    Every value is either a real reading or left as None, and None means
+    "nobody measured this" rather than zero — the evaluator treats an
+    unmeasured gate as blocking, so quietly substituting a default here would
+    turn a missing probe into a green light.
+    """
+    verifications = PostgresVerificationStore(meta)
+    operations = OperationStore(meta)
+
+    total = 0
+    verified = 0
+    results: list[VerificationResult] = []
+    streaming = False
+
+    for name in migration.runnable:
+        parsed = load_movement_spec(migration.movement_specs[name]).to_movement()
+        streaming = streaming or parsed.mode is not MovementMode.SNAPSHOT
+        try:
+            record = await operations.get(name)
+        except UnknownOperationError:
+            continue
+        if record.current_plan_version is None:
+            continue
+        progress = await movements.progress(name)
+        total += progress.tasks_total
+        verified += progress.tasks_done
+        results.extend(await verifications.for_operation(name, record.current_plan_version))
+
+    healthy = (
+        await check_reachable(target, check=PrepareCheck.TARGET_REACHABLE, label="target") is None
+    )
+
+    return GateFacts(
+        partitions_total=total or None,
+        partitions_verified=verified if total else None,
+        streaming=streaming,
+        # No lag reading here: the CDC adapter is owned by a running Movement,
+        # not by the CLI. A streaming migration therefore reports `unknown` and
+        # blocks, which is the correct answer until something measures it.
+        verification=tuple(results) if results else None,
+        target_healthy=healthy,
+        prepare=await _preparer(movements, source, target, migration)(migration),
+        approved_by=approved_by,
+    )
+
+
+def _render_gates(report: GateReport) -> None:
+    table = Table(box=None, pad_edge=False)
+    for column in ("gate", "outcome", "measured", "required"):
+        table.add_column(column)
+    colours = {
+        GateOutcome.PASSED: "green",
+        GateOutcome.FAILED: "red",
+        GateOutcome.UNKNOWN: "yellow",
+        GateOutcome.DISABLED: "dim",
+    }
+    for result in report.results:
+        colour = colours[result.outcome]
+        table.add_row(
+            result.gate.value,
+            f"[{colour}]{result.outcome.value}[/{colour}]",
+            result.measured,
+            result.required,
+        )
+    console.print(table)
+    for result in report.blocking:
+        if result.detail:
+            err_console.print(f"  [dim]{result.gate.value}: {result.detail}[/dim]")
+
+
+@migration_app.command("gates")
+def migration_gates(
+    spec: SpecArg,
+    approved_by: Annotated[
+        str | None, typer.Option("--approved-by", help="Pretend this operator has approved.")
+    ] = None,
+    source_url: SourceUrlOpt = None,
+    target_url: TargetUrlOpt = None,
+    meta_url: MetaUrlOpt = None,
+) -> None:
+    """Show every cutover gate and why it passes or blocks.
+
+    Read-only: asking why you cannot cut over must never move the workflow.
+    """
+    try:
+        migration = load_migration_spec(spec).to_migration()
+    except SpecError as exc:
+        _fail(str(exc))
+        return
+
+    movements, engines = _service(source_url, target_url, meta_url)
+    source = create_engine(source_url or _source_url())
+    target = create_engine(target_url or _target_url())
+    meta = create_engine(meta_url or database_url())
+
+    async def run() -> GateReport:
+        try:
+            facts = await _gather_facts(
+                migration,
+                movements=movements,
+                source=source,
+                target=target,
+                meta=meta,
+                approved_by=approved_by,
+            )
+            return evaluate(migration.name, migration.cutover, facts)
+        finally:
+            for engine in (source, target, meta):
+                await engine.dispose()
+            await _dispose(engines)
+
+    report = asyncio.run(run())
+    _render_gates(report)
+    console.print(report.describe())
+    if not report.passed:
+        raise typer.Exit(code=1)
+
+
+@migration_app.command("cutover")
+def migration_cutover(
+    spec: SpecArg,
+    approved_by: Annotated[str, typer.Option("--approved-by", help="Who is approving this.")],
+    reason: Annotated[str, typer.Option(help="Why now.")],
+    source_url: SourceUrlOpt = None,
+    target_url: TargetUrlOpt = None,
+    meta_url: MetaUrlOpt = None,
+) -> None:
+    """Move traffic, if every gate agrees.
+
+    Gates are re-evaluated here rather than trusted from an earlier `gates`
+    call — a report from ten minutes ago is a claim about ten minutes ago.
+    """
+    try:
+        migration = load_migration_spec(spec).to_migration()
+    except SpecError as exc:
+        _fail(str(exc))
+        return
+
+    movements, engines = _service(source_url, target_url, meta_url)
+    source = create_engine(source_url or _source_url())
+    target = create_engine(target_url or _target_url())
+    meta = create_engine(meta_url or database_url())
+    service = MigrationService(migrations=MigrationStore(meta), operations=OperationStore(meta))
+
+    async def run() -> GateReport:
+        try:
+            facts = await _gather_facts(
+                migration, movements=movements, source=source, target=target, meta=meta
+            )
+            return await service.cutover(
+                migration, approved_by=approved_by, reason=reason, facts=facts
+            )
+        finally:
+            for engine in (source, target, meta):
+                await engine.dispose()
+            await _dispose(engines)
+
+    try:
+        report = asyncio.run(run())
+    except CutoverRefusedError as exc:
+        err_console.print(f"[red]refused[/red] {exc.report.describe()}")
+        _render_gates(exc.report)
+        raise typer.Exit(code=1) from None
+    except (IllegalMigrationTransitionError, UnknownMigrationError) as exc:
+        _fail(str(exc))
+        return
+
+    console.print(f"[green]cutting over[/green] {migration.name}  approved by {approved_by}")
+    _render_gates(report)
 
 
 if __name__ == "__main__":

@@ -388,9 +388,60 @@ threshold the spec declared.**
 - **[B]** `gantry migration gates <name>` prints the table, so "why can't I cut over" is one
   command rather than an investigation.
 
-**Exit:** cutover is refused with a gate report naming the failing gate and its measured
-value; an agent-proposed cutover is refused for want of approval; an approved cutover with all
-gates green proceeds. All three recorded.
+**Exit: met**, all three against the real stack.
+
+```text
+$ gantry migration gates spec/examples/migration-orders-to-warehouse.yaml
+gate                          outcome   measured          required
+allPartitionsVerified         passed    12/12             every partition verified
+maxCdcLag                     disabled  no change stream  not required
+criticalVerificationFailures  passed    0                 <= 0
+targetHealthy                 passed    healthy           reachable and writable
+schemaCompatible              passed    compatible        compatible
+requireApproval               failed    nobody            a named operator
+orders-to-warehouse: blocked by requireApproval
+```
+
+Altering the target *after* planning, then attempting cutover, is refused on `schemaCompatible`
+— which is the point of re-evaluating rather than trusting an earlier report. And approved:
+
+```text
+$ gantry migration cutover … --approved-by arvind --reason "release window, gates green"
+cutting over orders-to-warehouse  approved by arvind
+
+  ready_for_cutover -> cutting_over   operator (arvind)   release window, gates green
+```
+
+### Unmeasured is not passed
+
+The property that makes the rest trustworthy. A gate nobody supplied a reading for is
+`unknown`, and unknown **blocks** — otherwise forgetting to wire a probe is indistinguishable
+from wiring one that always says yes. `GateFacts` is all-optional and `None` means "nobody
+measured this" rather than zero, which is why a missing CDC lag reading and a lag of zero
+cannot be confused.
+
+The one exception is stated rather than fudged: a snapshot-only migration has no stream, so
+`maxCdcLag` is `disabled` with "no change stream" as its measured value. Faking a zero would
+have been easier and would read as a measurement nobody took.
+
+**A disabled gate is recorded, not omitted.** An operator reading the report afterwards needs
+to see that a check was turned off, not merely fail to see that it ran. Same reasoning for
+keeping the gates that passed: the question a post-mortem asks is *what did we believe when we
+decided*, and a record of only the failures cannot answer it.
+
+### The retry loop, which was broken
+
+Reconciliation disagreeing sends the workflow back to `CATCHING_UP`, and running again has to
+walk `CATCHING_UP → VERIFYING` from where it already is. Every phase transition was
+unconditional, so the self-edge raised — **the one path the design most expects to be taken
+was the one that failed**, and it only surfaced by driving a real refusal and then retrying.
+Phase transitions now no-op when already in the target state.
+
+### The measurement
+
+**No change to `gantry/movement/` or `gantry/verification/`.** Gates read facts; they do not
+change how facts are made. Five of the six read something v1 already measured, and the two new
+ones — target health and approval — are a connection probe and a recorded human decision.
 
 ### Day 6 — Cutover and the rollback window
 

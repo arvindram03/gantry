@@ -14,7 +14,7 @@ was wrong, and that is worth finding out here rather than arguing about.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
@@ -22,6 +22,7 @@ from typing import Protocol
 from gantry.core.operation import TERMINAL_STATES, OperationState
 from gantry.lifecycle.migration import MigrationState
 from gantry.lifecycle.states import ActorKind
+from gantry.migration.gates import GateFacts, GateReport, evaluate
 from gantry.migration.model import Migration
 from gantry.migration.prepare import PrepareReport
 from gantry.migration.reconcile import ReconciliationReport
@@ -39,6 +40,20 @@ class PrepareRefusedError(Exception):
 
     def __init__(self, migration: str, report: PrepareReport) -> None:
         super().__init__(f"migration {migration!r} not ready: {report.describe()}")
+        self.migration = migration
+        self.report = report
+
+
+class CutoverRefusedError(Exception):
+    """A gate said no.
+
+    Carries the report so nothing has to be re-derived, and so the operator
+    sees every gate rather than only the first one that refused — fixing them
+    one round trip at a time is the experience this avoids.
+    """
+
+    def __init__(self, migration: str, report: GateReport) -> None:
+        super().__init__(f"cutover refused: {report.describe()}")
         self.migration = migration
         self.report = report
 
@@ -242,16 +257,14 @@ class MigrationService:
         # snapshot-only Movement passes through it in zero time, and skipping
         # the state would make the trail of a snapshot migration and a
         # streaming one different shapes for no reason.
-        await self._migrations.transition(
+        await self._advance(
             migration.name,
             MigrationState.CATCHING_UP,
-            actor=ActorKind.RUNTIME,
             reason="applying changes made during the snapshot",
         )
-        await self._migrations.transition(
+        await self._advance(
             migration.name,
             MigrationState.VERIFYING,
-            actor=ActorKind.RUNTIME,
             reason="reconciling source against target",
         )
 
@@ -315,6 +328,93 @@ class MigrationService:
         return MigrationStatus(
             record=record, movements=tuple(statuses), reconciliation=reconciliation
         )
+
+    async def _advance(
+        self,
+        name: str,
+        to_state: MigrationState,
+        *,
+        reason: str,
+        actor: ActorKind = ActorKind.RUNTIME,
+        evidence: Mapping[str, object] | None = None,
+    ) -> None:
+        """Move to a state, or stay put if already there.
+
+        The retry loop is why this exists. Reconciliation disagreeing sends the
+        workflow back to CATCHING_UP, and running again has to walk
+        CATCHING_UP -> VERIFYING from where it already is. A blind transition
+        raises on the self-edge, which made the one path the design most
+        expects to be taken the one that failed.
+        """
+        current = await self._migrations.get(name)
+        if current.state is to_state:
+            return
+        await self._migrations.transition(
+            name, to_state, actor=actor, reason=reason, evidence=evidence
+        )
+
+    async def gates(self, migration: Migration, *, facts: GateFacts | None = None) -> GateReport:
+        """Evaluate the declared gates against what was measured.
+
+        Read-only. Asking "why can't I cut over" must never move the workflow,
+        because an operator will ask it repeatedly while fixing whatever is
+        wrong.
+        """
+        return evaluate(migration.name, migration.cutover, facts or GateFacts())
+
+    async def cutover(
+        self,
+        migration: Migration,
+        *,
+        approved_by: str,
+        reason: str,
+        facts: GateFacts | None = None,
+    ) -> GateReport:
+        """Move traffic, if every gate agrees.
+
+        The gates are evaluated **here**, immediately before the transition,
+        rather than trusted from an earlier `gates` call. A report from ten
+        minutes ago is a claim about ten minutes ago, and the stream has been
+        moving since.
+        """
+        measured = facts or GateFacts()
+        report = evaluate(
+            migration.name,
+            migration.cutover,
+            GateFacts(
+                partitions_total=measured.partitions_total,
+                partitions_verified=measured.partitions_verified,
+                streaming=measured.streaming,
+                cdc_lag=measured.cdc_lag,
+                verification=measured.verification,
+                target_healthy=measured.target_healthy,
+                prepare=measured.prepare,
+                reconciliation=measured.reconciliation,
+                approved_by=approved_by,
+            ),
+        )
+
+        if not report.passed:
+            # Recorded on the way out. A refused cutover is a decision, and the
+            # trail should show that someone tried and what stopped them.
+            await self._migrations.transition(
+                migration.name,
+                MigrationState.CATCHING_UP,
+                actor=ActorKind.RUNTIME,
+                reason=f"cutover refused: {report.describe()}",
+                evidence=report.as_evidence(),
+            )
+            raise CutoverRefusedError(migration.name, report)
+
+        await self._migrations.transition(
+            migration.name,
+            MigrationState.CUTTING_OVER,
+            actor=ActorKind.OPERATOR,
+            actor_id=approved_by,
+            reason=reason,
+            evidence=report.as_evidence(),
+        )
+        return report
 
     async def pause(self, name: str, *, reason: str, actor_id: str | None = None) -> None:
         await self._migrations.transition(

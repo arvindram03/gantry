@@ -20,11 +20,13 @@ import pytest
 from gantry.core.operation import OperationState, OperationType
 from gantry.lifecycle.migration import MigrationState
 from gantry.lifecycle.states import ActorKind
+from gantry.migration.gates import GateFacts, GateName
 from gantry.migration.model import Migration
+from gantry.migration.prepare import PrepareReport
 from gantry.migration.reconcile import ReconciliationReport
-from gantry.migration.service import MigrationService
+from gantry.migration.service import CutoverRefusedError, MigrationService
 from gantry.state.database import create_engine, transaction
-from gantry.state.migrations import MigrationStore
+from gantry.state.migrations import ApprovalRequiredError, MigrationStore
 from gantry.state.operations import OperationStore
 from gantry.state.tables import migration_transitions, migrations
 from sqlalchemy import delete
@@ -283,3 +285,131 @@ async def test_reconciliation_disagreeing_returns_to_catching_up(
     last = (await MigrationStore(meta).history(NAME))[-1]
     assert "disagreeing" in last.reason
     assert last.evidence is not None, "what disagreed must survive into the trail"
+
+
+async def ready_for_cutover(meta: AsyncEngine) -> None:
+    """Walk a Migration to the one state cutover is reachable from."""
+    store = MigrationStore(meta)
+    await store.ensure(migration())
+    for state in (
+        MigrationState.DISCOVERING,
+        MigrationState.PLANNED,
+        MigrationState.PREPARING,
+        MigrationState.SNAPSHOTTING,
+        MigrationState.CATCHING_UP,
+        MigrationState.VERIFYING,
+        MigrationState.READY_FOR_CUTOVER,
+    ):
+        await store.transition(NAME, state, actor=ActorKind.RUNTIME, reason="test setup")
+
+
+def green_facts() -> GateFacts:
+    return GateFacts(
+        partitions_total=4,
+        partitions_verified=4,
+        streaming=False,
+        verification=(),
+        target_healthy=True,
+        prepare=PrepareReport(migration=NAME),
+    )
+
+
+async def test_cutover_is_refused_with_a_report_naming_the_failing_gate(
+    meta: AsyncEngine,
+) -> None:
+    await ready_for_cutover(meta)
+    facts = GateFacts(**{**green_facts().__dict__, "partitions_verified": 2})
+
+    with pytest.raises(CutoverRefusedError) as caught:
+        await service(meta).cutover(
+            migration(), approved_by="arvind", reason="release window", facts=facts
+        )
+
+    blocking = caught.value.report.blocking
+    assert [result.gate for result in blocking] == [GateName.ALL_PARTITIONS_VERIFIED]
+    assert blocking[0].measured == "2/4"
+
+    status = await service(meta).status(NAME)
+    assert status.state is MigrationState.CATCHING_UP, "refused, and said what to do next"
+
+    last = (await MigrationStore(meta).history(NAME))[-1]
+    assert "cutover refused" in last.reason
+    assert last.evidence is not None, "a refused cutover is a decision worth keeping"
+
+
+async def test_an_agent_cannot_reach_cutover_however_it_asks(meta: AsyncEngine) -> None:
+    """The access-ladder principle applied to a state machine: the refusal is
+    in the transition function, not in a policy that could be relaxed."""
+    await ready_for_cutover(meta)
+
+    with pytest.raises(ApprovalRequiredError, match="operator decision"):
+        await MigrationStore(meta).transition(
+            NAME,
+            MigrationState.CUTTING_OVER,
+            actor=ActorKind.AGENT,
+            actor_id="planner-1",
+            reason="all the gates look green to me",
+        )
+
+    status = await service(meta).status(NAME)
+    assert status.state is MigrationState.READY_FOR_CUTOVER, "the workflow did not move"
+
+
+async def test_an_approved_cutover_with_green_gates_proceeds_and_is_attributed(
+    meta: AsyncEngine,
+) -> None:
+    await ready_for_cutover(meta)
+
+    report = await service(meta).cutover(
+        migration(),
+        approved_by="arvind",
+        reason="release window, gates green",
+        facts=green_facts(),
+    )
+
+    assert report.passed
+    status = await service(meta).status(NAME)
+    assert status.state is MigrationState.CUTTING_OVER
+
+    last = (await MigrationStore(meta).history(NAME))[-1]
+    assert last.actor is ActorKind.OPERATOR
+    assert last.actor_id == "arvind"
+    assert last.evidence is not None
+    gates = last.evidence["gates"]
+    assert isinstance(gates, list)
+    assert len(gates) == len(GateName), "every gate recorded, not only the blocking ones"
+
+
+async def test_gates_are_re_evaluated_at_cutover_not_trusted_from_earlier(
+    meta: AsyncEngine,
+) -> None:
+    """A report from ten minutes ago is a claim about ten minutes ago."""
+    await ready_for_cutover(meta)
+    migration_service = service(meta)
+
+    # `gates` is read-only and takes no approver of its own, so the dry run
+    # supplies one to see what a cutover *would* find.
+    dry_run = GateFacts(**{**green_facts().__dict__, "approved_by": "arvind"})
+    earlier = await migration_service.gates(migration(), facts=dry_run)
+    assert earlier.passed
+
+    degraded = GateFacts(**{**green_facts().__dict__, "target_healthy": False})
+    with pytest.raises(CutoverRefusedError):
+        await migration_service.cutover(
+            migration(), approved_by="arvind", reason="release window", facts=degraded
+        )
+
+
+async def test_asking_why_you_cannot_cut_over_does_not_move_the_workflow(
+    meta: AsyncEngine,
+) -> None:
+    """An operator will ask repeatedly while fixing whatever is wrong."""
+    await ready_for_cutover(meta)
+    migration_service = service(meta)
+
+    before = len(await MigrationStore(meta).history(NAME))
+    await migration_service.gates(migration(), facts=GateFacts())
+    await migration_service.gates(migration(), facts=GateFacts())
+
+    assert len(await MigrationStore(meta).history(NAME)) == before
+    assert (await migration_service.status(NAME)).state is MigrationState.READY_FOR_CUTOVER
