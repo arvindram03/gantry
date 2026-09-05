@@ -23,17 +23,11 @@ from gantry.scheduler.temporal.runner import connect, workflow_id
 from gantry.state.database import create_engine, transaction
 from gantry.state.operations import OperationStore
 from gantry.state.plans import PlanMismatchError, PostgresPlanStore
-from gantry.state.tables import (
-    checkpoints,
-    operations,
-    plan_versions,
-    results,
-    state_transitions,
-    tasks,
-)
-from sqlalchemy import delete, text
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 from temporalio.client import Client
+
+from .conftest import clear_operation
 
 pytestmark = pytest.mark.integration
 
@@ -48,19 +42,7 @@ AT = datetime(2026, 9, 19, tzinfo=UTC)
 async def meta() -> AsyncIterator[AsyncEngine]:
     engine = create_engine(META_URL)
     try:
-        async with transaction(engine) as connection:
-            await connection.execute(delete(results).where(results.c.operation == OPERATION))
-            await connection.execute(
-                delete(checkpoints).where(checkpoints.c.operation == OPERATION)
-            )
-            await connection.execute(
-                delete(state_transitions).where(state_transitions.c.operation == OPERATION)
-            )
-            await connection.execute(delete(tasks).where(tasks.c.operation == OPERATION))
-            await connection.execute(
-                delete(plan_versions).where(plan_versions.c.operation == OPERATION)
-            )
-            await connection.execute(delete(operations).where(operations.c.name == OPERATION))
+        await clear_operation(engine, OPERATION)
         yield engine
     finally:
         await engine.dispose()

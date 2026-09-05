@@ -113,6 +113,45 @@ A replay changes zero rows but still transfers and stages every one of them to
 discover that. Retries are cheap in *effect*, not in *work* — which is an
 argument for partitions small enough that replaying one is not expensive.
 
+## Day 10 — M1 scale run
+
+PostgreSQL to PostgreSQL, two containers, from an empty target.
+
+| | |
+|---|---|
+| Rows | **101,000,000** (100M orders + 1M customers) |
+| Wall time | **462.7 s** (7m 43s) |
+| Throughput | **218,271 rows/sec** |
+| Partitions | 55, all complete |
+| Checkpoints | 61 |
+| Target vs source | exact — 100,000,000 distinct `order_id` |
+
+```bash
+gantry start examples/postgres-to-postgres/movement.yaml --backend temporal
+```
+
+### Dispatch backend matters more than expected
+
+Identical work, identical adapters, 1M rows:
+
+| Backend | Throughput |
+|---|---|
+| Temporal (parallel activities) | 284,433 rows/sec |
+| Leased queue (one worker) | 96,044 rows/sec |
+
+The gap is concurrency, not efficiency: the queue path ran one worker at a
+time, while Temporal dispatched up to 8 activities in parallel. A multi-worker
+queue would close most of it. The figure to take from this is that partition
+concurrency dominates, which is why Day 17's adaptive controller tunes it.
+
+### What the earlier interrupted runs cost
+
+The first attempt at this run was interrupted twice by bugs and finished on a
+different backend, reporting `7,419 rows/sec`. That number measures re-copying
+already-complete partitions to discover they were no-ops, not copying data.
+Recorded here because it is the kind of figure that looks like a benchmark and
+is not.
+
 ## Not yet measured
 
 - Checksum computation by key range (Day 12)

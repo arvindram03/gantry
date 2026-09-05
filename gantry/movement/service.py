@@ -219,9 +219,27 @@ class MovementService:
         )
 
     async def progress(self, name: str, plan: PlanVersion | None = None) -> Progress:
+        """Where an operation has got to, independent of who dispatched it.
+
+        Progress is measured in checkpoints against the stored plan, not in
+        task rows. Both execution backends write checkpoints; only the leased
+        queue writes tasks, so reading tasks would report a Temporal-dispatched
+        Movement as unfinished long after it completed. Dispatch state is an
+        implementation detail of a backend; the checkpoint is the runtime's own
+        record of what is durable.
+        """
         record = await self._operations.get(name)
+        stored = plan or (
+            await self._plans.get(name, record.current_plan_version)
+            if record.current_plan_version
+            else None
+        )
+        total = len(stored.nodes) if stored else 0
+        done = len(await self._checkpoints.all(name))
+
+        # Task counts are still worth showing when the queue is in use, and are
+        # simply zero otherwise.
         tasks = await self._backend_factory(name).tasks(name)
-        checkpoints = await self._checkpoints.all(name)
         by_state = dict.fromkeys(TaskState, 0)
         for task in tasks:
             by_state[task.state] += 1
@@ -229,12 +247,12 @@ class MovementService:
         return Progress(
             state=record.state,
             plan_version=record.current_plan_version,
-            tasks_total=len(tasks),
-            tasks_done=by_state[TaskState.DONE],
-            tasks_pending=by_state[TaskState.PENDING] + by_state[TaskState.LEASED],
+            tasks_total=total or len(tasks),
+            tasks_done=done,
+            tasks_pending=max(0, (total or len(tasks)) - done),
             tasks_leased=by_state[TaskState.LEASED],
             tasks_quarantined=by_state[TaskState.QUARANTINED],
-            checkpoints=len(checkpoints),
+            checkpoints=done,
         )
 
     async def pause(self, name: str, *, reason: str) -> None:

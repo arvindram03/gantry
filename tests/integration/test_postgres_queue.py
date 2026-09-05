@@ -20,9 +20,11 @@ from gantry.scheduler.backend import TaskState
 from gantry.scheduler.postgres import PostgresWorkflowBackend
 from gantry.spec import load_movement_spec
 from gantry.state.database import create_engine, transaction
-from gantry.state.tables import checkpoints, operations, state_transitions, tasks
-from sqlalchemy import delete, insert
+from gantry.state.tables import operations
+from sqlalchemy import insert
 from sqlalchemy.ext.asyncio import AsyncEngine
+
+from .conftest import clear_all_operations
 
 pytestmark = pytest.mark.integration
 
@@ -40,12 +42,8 @@ def plan() -> PlanVersion:
 async def engine() -> AsyncIterator[AsyncEngine]:
     created = create_engine()
     try:
+        await clear_all_operations(created)
         async with transaction(created) as connection:
-            # Everything referencing operations has to go first.
-            await connection.execute(delete(checkpoints))
-            await connection.execute(delete(state_transitions))
-            await connection.execute(delete(tasks))
-            await connection.execute(delete(operations))
             await connection.execute(
                 insert(operations).values(
                     name=plan().operation,

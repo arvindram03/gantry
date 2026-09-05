@@ -204,7 +204,11 @@ The cost is real and I am not going to hide it. Four weeks does not buy four abs
 - **[A]** **`MovementResult`**: rows moved, partitions verified, checkpoint state, duration, source manifest versions, lineage to the output Dataset. The first real instance of the Result abstraction.
 - **[B]** Scale run: 100M orders end to end. Record wall time, throughput, target load in `docs/benchmarks.md`.
 
-**Exit — M1:** 100M rows copied with durable state, retries, checkpoints, idempotent writes, pause/resume — emitting a persisted, queryable `MovementResult`.
+**Exit — M1: passed.** 101,000,000 rows copied in 7m 43s at 218,271 rows/sec, from an empty target, with source and target counts matching exactly and 100,000,000 distinct keys. Durable state, retries, checkpoints, idempotent writes and pause/resume all in place, emitting a persisted `MovementResult` queryable from the metadata store.
+
+**Scheduler decision revised.** Day 5 deferred Temporal and Day 10 adopted it, earlier than that review recommended. Temporal now owns dispatch, retries and timeouts; the leased queue remains behind `--backend queue` until Temporal has proved itself on more runs. Two gaps it forced closed were worth closing regardless: plans are now persisted rather than reconstructed, and they pin the Dataset versions they were compiled against.
+
+**Known limitation.** The two backends do not share progress state — the queue tracks dispatch in `tasks`, Temporal in workflow history — so switching mid-operation re-runs every node. Safe, because effects are idempotent, but wasteful. Progress reporting is backend-neutral (checkpoints against the stored plan); dispatch state is not.
 
 ---
 

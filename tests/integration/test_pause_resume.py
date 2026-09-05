@@ -18,11 +18,11 @@ from gantry.core.operation import LifecycleStage, OperationState, OperationType
 from gantry.lifecycle.plan import NodeKind, PlanNode, PlanVersion, node_id
 from gantry.lifecycle.states import ActorKind, IllegalTransitionError
 from gantry.scheduler.postgres import PostgresWorkflowBackend
-from gantry.state.database import create_engine, transaction
+from gantry.state.database import create_engine
 from gantry.state.operations import ConcurrentUpdateError, OperationStore
-from gantry.state.tables import checkpoints, operations, results, state_transitions, tasks
-from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncEngine
+
+from .conftest import clear_operation
 
 pytestmark = pytest.mark.integration
 
@@ -38,16 +38,7 @@ LEASE = timedelta(seconds=30)
 async def meta() -> AsyncIterator[AsyncEngine]:
     engine = create_engine(META_URL)
     try:
-        async with transaction(engine) as connection:
-            await connection.execute(delete(results).where(results.c.operation == OPERATION))
-            await connection.execute(
-                delete(checkpoints).where(checkpoints.c.operation == OPERATION)
-            )
-            await connection.execute(
-                delete(state_transitions).where(state_transitions.c.operation == OPERATION)
-            )
-            await connection.execute(delete(tasks).where(tasks.c.operation == OPERATION))
-            await connection.execute(delete(operations).where(operations.c.name == OPERATION))
+        await clear_operation(engine, OPERATION)
         yield engine
     finally:
         await engine.dispose()
