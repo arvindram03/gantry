@@ -12,6 +12,7 @@ is append-only. Evidence that can be rewritten is not evidence.
 from __future__ import annotations
 
 from sqlalchemy import (
+    BigInteger,
     CheckConstraint,
     Column,
     DateTime,
@@ -181,4 +182,23 @@ tasks = Table(
     Column("last_error", Text, nullable=True),
     ForeignKeyConstraint(["operation"], ["operations.name"], name="fk_tasks_operation"),
     Index("ix_tasks_leasable", "operation", "state"),
+)
+
+
+dead_letters = Table(
+    "dead_letters",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("operation", String(253), nullable=False),
+    Column("dataset", String(253), nullable=False),
+    Column("key_text", String(1024), nullable=True),
+    Column("source_lsn", BigInteger, nullable=True),
+    Column("reason", Text, nullable=False),
+    # The whole event, so it can be replayed once the cause is fixed. A
+    # dead-letter queue that discards the payload is a counter.
+    Column("payload", JSONB, nullable=False),
+    Column("occurred_at", TIMESTAMP, nullable=False),
+    Column("replayed_at", TIMESTAMP, nullable=True),
+    ForeignKeyConstraint(["operation"], ["operations.name"], name="fk_dead_letters_operation"),
+    Index("ix_dead_letters_pending", "operation", "replayed_at"),
 )

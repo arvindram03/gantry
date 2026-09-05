@@ -122,8 +122,70 @@ than warning. Continuing to stream while the source fills its disk trades a
 stalled migration for a stopped database, which is much worse than the outcome
 being avoided.
 
+## Ordering and stale writes
+
+Ordering is scoped per entity key, the design document's default. Two changes
+to the same row are applied in source order; two changes to different rows are
+not ordered against each other, so the runtime never pays for the global
+ordering the document warns about buying by accident.
+
+**Routing by key hash** is what makes that enforceable with more than one
+worker: every change to a key lands in the same lane, so no two workers can
+race on one row. The hash is stable across processes — Python's `hash()` is
+randomised per process, and two workers would disagree about the same key.
+
+**Stale writes are rejected, not applied.** Every write carries the source LSN
+it came from, and the target accepts a change only if it is newer than what it
+holds:
+
+```sql
+ON CONFLICT (key) DO UPDATE SET … WHERE target.source_lsn < EXCLUDED.source_lsn
+```
+
+An equal LSN is a duplicate delivery and is declined by the same guard.
+Rejections are counted and reported, never silent — the count is how an
+operator sees that delivery order is not being trusted.
+
+Measured on a real target: the same eight events, shuffled and delivered three
+times, produce **an identical final state** to the ordered stream, with 16
+rejections instead of zero.
+
+### Deleted rows stay deleted
+
+A delete removes the row, which removes the LSN the guard compares against — so
+an insert that arrives after the delete but originated before it would
+resurrect the row. A **tombstone** records the position at which a key was
+deleted, and a change older than the tombstone is refused. A genuinely newer
+insert is still applied, because a key can be deleted and re-created.
+
+Tombstones live in the **target** database, not the metadata store. They have
+to be written in the same transaction as the delete they describe: a crash
+between deleting a row and recording that it was deleted leaves nothing for a
+later out-of-order insert to be checked against. That atomicity is worth a
+Gantry-owned side table in the target, which already carries a Gantry-owned
+`source_lsn` column.
+
+**Requirement:** the target must carry a `source_lsn` column. Without it there
+is nothing to compare against, and the applier refuses to start rather than
+silently applying whatever arrives last.
+
+### What is not applied automatically
+
+`TRUNCATE` is dead-lettered rather than applied. One event should not be able
+to empty a target without a human deciding that is what should happen.
+
+## Dead letters
+
+An event the runtime cannot apply is kept, not dropped — with its payload, so
+it can be replayed once the cause is fixed. A queue that records the fact and
+discards the event is a counter.
+
+Depth is a first-class signal: a growing queue means the stream is producing
+changes the target will not take, which is a different problem from being slow
+and needs a different response.
+
 ## Not yet
 
-- Stale-write rejection and ordering (Day 14)
+- Snapshot and CDC coordination, and catch-up lag (Day 15)
 - Cutover gates and approvals (v1.1)
 - Analysis verification: row expansion, join coverage, temporal alignment (Day 18)
