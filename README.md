@@ -77,9 +77,172 @@ history is manual archaeology.
 warehouse, replace your orchestrator, or make an LLM trustworthy. It makes what
 an LLM (or a person, or a cron job) does with your data *checkable*.
 
+## The model
+
+Four resources. One noun, two verbs, and the thing you are allowed to believe at the end.
+
+```text
+                                ┌─────────────────┐
+                      ┌────────►│     DATASET     │◄────────┐
+                      │         │                 │         │
+                      │         │  schema, keys,  │         │
+                   produces     │  time, stats,   │       reads
+                      │         │  policy —       │         │
+                      │         │  versioned by   │         │
+                      │         │  content hash   │         │
+                      │         └─────────────────┘         │
+                      │                                     │
+              ┌───────┴───────┐                     ┌───────┴───────┐
+              │   MOVEMENT    │                     │   ANALYSIS    │
+              │               │                     │               │
+              │  snapshot,    │                     │  normalise,   │
+              │  change       │                     │  join,        │
+              │  stream,      │                     │  aggregate,   │
+              │  repair       │                     │  derive       │
+              └───────┬───────┘                     └───────┬───────┘
+                      │                                     │
+                      └──────────────────┬──────────────────┘
+                                         ▼
+                                ┌─────────────────┐
+                                │     RESULT      │
+                                │                 │
+                                │  what is true,  │
+                                │  the evidence,  │
+                                │  and where the  │
+                                │  data came from │
+                                └─────────────────┘
+```
+
+### Dataset — the thing everything else is about
+
+A Dataset is **a named unit of data plus everything Gantry knows about it**: its columns and
+types, which column is the key, which column carries time, how many rows it has, how skewed
+they are, which fields are sensitive, and what an agent may do with it.
+
+Most of that is discovered for you. `gantry discover` reads the catalog and profiles the
+table; you only declare what a catalog cannot know — that `created_at` is the column that
+*orders* the data, that `email` is sensitive.
+
+The important part is that a Dataset is **versioned by content**. Register the same
+description twice and nothing happens. Change something real — a new column, a fresh profile —
+and you get version 2, with version 1 still intact.
+
+That matters because everything downstream pins a *version*:
+
+> An Analysis that ran last Tuesday says it read `public.orders@4`. Not "orders", not
+> "orders as it was, probably". Version 4, identified by a hash of its description. If
+> someone asks in March what that number was computed over, the answer is exact.
+
+### Movement — make or keep a Dataset available somewhere
+
+A Movement copies a Dataset from one place to another and **keeps proving it arrived**.
+Replicating a production table into a warehouse. Migrating between databases. Keeping a
+mirror in sync as rows change.
+
+You describe the destination, the key, and how to split the work. You do **not** write
+partition boundaries — those come from the data itself at plan time, so they reflect how it
+is actually distributed rather than a guess made months ago.
+
+What you *do* write is what must be true when it finishes:
+
+```yaml
+verification:
+  required: [row_count, chunk_checksum]
+```
+
+Gantry then owns the awkward parts: splitting a hundred million rows into partitions of even
+size, checkpointing each one as it commits, resuming exactly where it stopped when a worker
+dies, rejecting a change event that arrives out of order, and — when a checksum disagrees —
+finding *which rows* differ and re-copying only the partition holding them.
+
+### Analysis — compute over one or more Datasets
+
+An Analysis is **a question asked of your data, written down in a way that can be checked**.
+"Did the deploy at noon make checkout slower?" is an Analysis: it reads request logs and
+deploy events, lines them up in time, and compares before against after.
+
+You describe *what to compute*, not how:
+
+- **`normalize`** — reconcile names. One source calls it `svc`, the other `service_name`.
+- **`joins`** with **`temporal`** — line up two streams of events in time. `nearest_preceding`
+  attributes each request to the deploy that was actually live when it happened, rather than
+  to every deploy in range.
+- **`signals`** — named measures like `p95_latency` or `error_rate`, from a fixed vocabulary
+  rather than SQL you write. A spec that accepted arbitrary SQL would make Gantry a query
+  language, and your engine already is one.
+- **`verify`** — what must hold for the answer to mean anything.
+
+That last block is the one that earns its keep. `rowExpansion: {max: 1.1}` says: if this join
+multiplies my rows, the aggregates over it are counting some rows twice, so do not hand me
+the answer.
+
+### Result — what you are allowed to believe
+
+A Result is not a number in a Slack message. It carries:
+
+- **the findings** — each with the measurements behind it, and a label saying whether the
+  confidence is *measured*, *statistical*, or *a model's opinion*. A number that sometimes
+  means one and sometimes the other is worse than no number.
+- **the verification record** — every check that ran, what it measured, what was allowed.
+- **the provenance** — the exact SQL that ran (by content hash), the exact Dataset versions
+  read, and the Movement checkpoints those Datasets had reached.
+
+If verification fails, the findings are **withheld**, not published with a warning attached —
+a caveat gets dropped the moment someone quotes the number. The Result is still written,
+because *why* nothing could be concluded is itself worth keeping.
+
+## One lifecycle, two Operations
+
+Movement and Analysis differ in what they *do* at each stage, not in the stages they pass
+through. That is why they share one state machine, one plan format, one checkpoint store and
+one verification framework — rather than three of each, drifting apart.
+
+```text
+  Plan ──► Generate ──► Validate ──► Execute ──► Verify ──► Result
+    │          │            │            │          │          │
+    │          │            │            │          │          └── what may now be asserted
+    │          │            │            │          └───────────── may it be believed?
+    │          │            │            └──────────────────────── the engine does the work
+    │          │            └───────────────────────────────────── may this run at all?
+    │          └────────────────────────────────────────────────── compile to something runnable
+    └───────────────────────────────────────────────────────────── decide what to do, pin what to read
+```
+
+| Stage | Movement | Analysis |
+|---|---|---|
+| **Plan** | discover, profile, partition, order by dependency | resolve inputs, pin Dataset versions |
+| **Generate** | partition bounds, copy statements, connector config | compile the spec to engine SQL |
+| **Validate** | check the target's shape, key and write mode | plan the query, estimate cost, sample it |
+| **Execute** | copy partitions, apply changes, checkpoint | run the artifact on an engine |
+| **Verify** | row counts, checksums, key uniqueness, referential integrity | row expansion, join coverage, temporal alignment, null rate |
+| **Result** | `MovementResult` | `AnalysisResult` with findings |
+
+### The guarantee boundary
+
+The whole point of the diagram above is the gap between its last two stages.
+
+```text
+                                      ┌───────────────┐   ┌───────────────┐
+   Plan ─► Generate ─► Validate ─────►│    EXECUTE    │──►│    VERIFY     │──► Result
+                                      └───────┬───────┘   └───────┬───────┘
+                                              │                   │
+                                       "the query ran"   "the answer holds"
+                                         the engine            Gantry
+                                        answers this        answers this
+```
+
+These are two different questions and they get two different answers. `SUCCESS` from an
+engine means the query it was handed ran to completion — nothing more. A join that multiplied
+forty thousand rows into eighty thousand succeeds; so does one that matched almost nothing.
+Verify is where Gantry asks whether the numbers mean what the spec said they would, and it is
+the only stage that can say no on grounds the engine has no opinion about.
+
+Every guarantee in this project lives in that gap.
+
 ## How do you use it?
 
-Three things you write, and one thing you read.
+Three things you write, and one thing you read. The concepts are above; this is the
+shape of the files and the commands that act on them.
 
 ### 1. Describe your data — a Dataset
 
@@ -99,9 +262,8 @@ access:
   agentPolicy: aggregate_or_masked
 ```
 
-Most of this is discovered for you — `gantry discover` reads the catalog and
-profiles the table. You only declare what a catalog cannot know: which column
-carries time, which fields are sensitive, and what an agent may reach.
+`gantry discover` fills in the columns, types and statistics. What you write by hand is
+only what a catalog cannot know.
 
 ### 2. Move it — a Movement
 
@@ -139,8 +301,10 @@ gantry verify movement.yaml    # check the target against the source
 gantry repair movement.yaml public.orders/00004   # fix one partition
 ```
 
-You do not write partition boundaries. They come from the data at plan time.
-You write what must be **true** at the end, and Gantry decides how to check it.
+`plan` compiles an immutable, content-addressed PlanVersion — recompiling after the data
+changes gives you version 2 rather than quietly rewriting version 1. `repair` takes a single
+partition id, which is what makes a checksum failure a five-minute problem instead of a
+re-copy.
 
 ### 3. Analyse it — an Analysis
 
@@ -172,12 +336,8 @@ verify:
   - nullRate: {field: commit_sha, max: 0.05}
 ```
 
-You describe *what to compute*, not how. Signals come from a fixed vocabulary
-rather than being SQL you write — a spec that accepted arbitrary SQL would make
-Gantry a query language, and your engine already is one.
-
-`verify:` is the part that matters. It is what makes the difference between "the
-query ran" and "the answer can be believed".
+Run it with `gantry` or through the Python API. Either way the `verify:` block decides
+whether you get findings back or a refusal with the evidence for it.
 
 ### 4. Read the answer — a Result
 
@@ -227,28 +387,6 @@ your infrastructure (PostgreSQL, Kafka, Debezium, DuckDB, Temporal)
 Gantry does not move the bytes itself and does not want to. It decides what
 runs, records what happened, and refuses to call something correct until it has
 checked.
-
-## The model
-
-Four core resources:
-
-```text
-Dataset        addressable logical data unit + manifest
-   │
-   ├── Movement    make or keep a Dataset reliably available
-   │
-   └── Analysis    compute over one or more Datasets
-                    │
-                    ▼
-                 Result    bounded, structured, provenanced output
-```
-
-Movement and Analysis are both Operations over Datasets, and both traverse one lifecycle
-under a single guarantee boundary:
-
-```text
-Plan → Generate → Validate → Execute → Verify → Result
-```
 
 ## Quickstart
 
