@@ -250,7 +250,8 @@ class MovementService:
         )
         await self._results.put(result)
 
-        if progress.tasks_pending == 0 and progress.tasks_quarantined == 0 and verification.passed:
+        all_work_done = progress.tasks_pending == 0 and progress.tasks_quarantined == 0
+        if all_work_done and verification.passed:
             current = await self._operations.get(movement.name)
             if current.state is OperationState.EXECUTING:
                 await self._operations.transition(
@@ -259,7 +260,35 @@ class MovementService:
                     actor=ActorKind.RUNTIME,
                     reason="every partition complete; verification pending",
                 )
+            await self._settle(
+                movement.name,
+                verified=True,
+                reason="verification passed on every dataset",
+            )
         return result
+
+    async def _settle(self, name: str, *, verified: bool, reason: str) -> None:
+        """Move a finished Movement past VERIFYING to what verification decided.
+
+        v1 stopped at VERIFYING and stayed there: a Movement that had copied
+        and verified everything still reported as unfinished forever, which
+        `gantry status` showed and nobody chased. Composing a Migration over it
+        made the gap unmissable, because a workflow gate asking "are the
+        Movements done?" could never get a yes.
+
+        The rule is the state machine's own (`gantry/core/operation.py`):
+        COMPLETED is reachable only through verification, and an engine
+        reporting success does not by itself get you there.
+        """
+        current = await self._operations.get(name)
+        if current.state is not OperationState.VERIFYING:
+            return
+        await self._operations.transition(
+            name,
+            OperationState.COMPLETED if verified else OperationState.VERIFICATION_FAILED,
+            actor=ActorKind.RUNTIME,
+            reason=reason,
+        )
 
     async def _completed_partitions(self, name: str, plan: PlanVersion) -> int:
         partition_nodes = {
@@ -394,6 +423,11 @@ class MovementService:
                     actor=ActorKind.RUNTIME,
                     reason="every partition complete; verification pending",
                 )
+            await self._settle(
+                movement.name,
+                verified=True,
+                reason="verification passed on every dataset",
+            )
         return result
 
     async def _advance_to_executing(self, name: str, plan_version: int | None = None) -> None:

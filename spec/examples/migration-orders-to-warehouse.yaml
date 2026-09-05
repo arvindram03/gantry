@@ -12,7 +12,10 @@ metadata:
 description: Move orders and customers onto the warehouse, then cut over.
 
 movements:
-  - orders-snapshot
+  # Named with the path to its own spec: the Migration drives the Movement,
+  # it does not contain it.
+  - movement: orders-snapshot
+    spec: examples/postgres-to-postgres/movement.yaml
 
 cutover:
   gates:

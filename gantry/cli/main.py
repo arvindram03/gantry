@@ -30,12 +30,14 @@ from gantry.api.datasets import Datasets, QueryOutcome
 from gantry.core.dataset import DatasetRef, DatasetVersion
 from gantry.core.results import Result
 from gantry.core.sizes import format_byte_size
+from gantry.lifecycle.migration import IllegalMigrationTransitionError
 from gantry.lifecycle.plan import PlanVersion
 from gantry.lifecycle.states import (
     IllegalTransitionError,
     OperationInFlightError,
     StateTransition,
 )
+from gantry.migration.service import MigrationService, MigrationStatus
 from gantry.movement.result import MovementResult
 from gantry.movement.service import MovementService, Progress
 from gantry.policy.audit import access_log_for
@@ -61,6 +63,7 @@ from gantry.spec.errors import SpecError
 from gantry.spec.loader import (
     SUPPORTED_KINDS,
     load_dataset_spec,
+    load_migration_spec,
     load_movement_spec,
     load_spec,
     spec_json_schema,
@@ -69,6 +72,12 @@ from gantry.spec.movement import MovementSpec
 from gantry.state.artifacts import PostgresArtifactStore
 from gantry.state.checkpoints import PostgresCheckpointStore
 from gantry.state.database import DATABASE_URL_ENV, create_engine, database_url
+from gantry.state.migrations import (
+    MigrationRecord,
+    MigrationStore,
+    MigrationTransition,
+    UnknownMigrationError,
+)
 from gantry.state.operations import OperationStore, UnknownOperationError
 from gantry.state.plans import PostgresPlanStore
 from gantry.state.registry import PostgresDatasetRegistry
@@ -91,10 +100,14 @@ schema_app = typer.Typer(name="schema", help="Emit JSON Schema for specs.", no_a
 policy_app = typer.Typer(
     name="policy", help="Inspect the agent access policy.", no_args_is_help=True
 )
+migration_app = typer.Typer(
+    name="migration", help="Run and inspect Migration workflows.", no_args_is_help=True
+)
 app.add_typer(dataset_app)
 app.add_typer(results_app)
 app.add_typer(schema_app)
 app.add_typer(policy_app)
+app.add_typer(migration_app)
 
 console = Console()
 err_console = Console(stderr=True)
@@ -1102,6 +1115,175 @@ def _agent_call(
     for row in outcome.rows:
         table.add_row(*(str(value) for value in row.values()))
     console.print(table)
+
+
+def _migration_service(meta_url: str | None) -> tuple[MigrationService, AsyncEngine]:
+    meta = create_engine(meta_url or database_url())
+    return (
+        MigrationService(migrations=MigrationStore(meta), operations=OperationStore(meta)),
+        meta,
+    )
+
+
+@migration_app.command("plan")
+def migration_plan(spec: SpecArg, meta_url: MetaUrlOpt = None) -> None:
+    """Register a Migration and resolve the Movements it composes."""
+    try:
+        migration = load_migration_spec(spec).to_migration()
+    except SpecError as exc:
+        _fail(str(exc))
+        return
+
+    service, meta = _migration_service(meta_url)
+
+    async def run() -> MigrationRecord:
+        try:
+            return await service.plan(migration)
+        finally:
+            await meta.dispose()
+
+    record = asyncio.run(run())
+    console.print(f"[green]planned[/green] {record.name}  [dim]{record.state.value}[/dim]")
+    for movement in record.movements:
+        console.print(f"  movement  {movement}")
+
+
+@migration_app.command("status")
+def migration_status(
+    name: Annotated[str, typer.Argument(help="Migration name.")],
+    meta_url: MetaUrlOpt = None,
+) -> None:
+    """Show the workflow state and the Movements beneath it."""
+    service, meta = _migration_service(meta_url)
+
+    async def run() -> tuple[MigrationStatus, Sequence[MigrationTransition]]:
+        try:
+            return await service.status(name), await service.history(name)
+        finally:
+            await meta.dispose()
+
+    try:
+        status, history = asyncio.run(run())
+    except UnknownMigrationError as exc:
+        _fail(str(exc))
+        return
+
+    console.print(f"[bold]{status.record.name}[/bold]  state={status.state.value}")
+    for movement in status.movements:
+        marker = "[green]✓[/green]" if movement.complete else " "
+        console.print(f"  {marker} {movement.describe()}")
+
+    if history:
+        console.print("  recent transitions")
+        for entry in list(history)[-5:]:
+            console.print(f"    [dim]{entry.describe()}[/dim]")
+
+
+@migration_app.command("ls")
+def migration_ls(meta_url: MetaUrlOpt = None) -> None:
+    """List every Migration and where it has got to."""
+    meta = create_engine(meta_url or database_url())
+
+    async def run() -> Sequence[MigrationRecord]:
+        try:
+            return await MigrationStore(meta).list()
+        finally:
+            await meta.dispose()
+
+    records = asyncio.run(run())
+    if not records:
+        console.print("[dim]no migrations[/dim]")
+        return
+
+    table = Table(box=None, pad_edge=False)
+    for column in ("name", "state", "movements"):
+        table.add_column(column)
+    for record in records:
+        table.add_row(record.name, record.state.value, ", ".join(record.movements))
+    console.print(table)
+
+
+@migration_app.command("pause")
+def migration_pause(
+    name: Annotated[str, typer.Argument(help="Migration name.")],
+    reason: Annotated[str, typer.Option(help="Why.")],
+    actor: Annotated[str | None, typer.Option(help="Who is pausing it.")] = None,
+    meta_url: MetaUrlOpt = None,
+) -> None:
+    """Pause a Migration."""
+    service, meta = _migration_service(meta_url)
+
+    async def run() -> None:
+        try:
+            await service.pause(name, reason=reason, actor_id=actor)
+        finally:
+            await meta.dispose()
+
+    try:
+        asyncio.run(run())
+    except (UnknownMigrationError, IllegalMigrationTransitionError) as exc:
+        _fail(str(exc))
+        return
+    console.print(f"[yellow]paused[/yellow] {name}")
+
+
+@migration_app.command("start")
+def migration_start(
+    spec: SpecArg,
+    backend: Annotated[
+        ExecutionBackend,
+        typer.Option("--backend", help="Who owns dispatch, retries and timeouts."),
+    ] = ExecutionBackend.TEMPORAL,
+    source_url: SourceUrlOpt = None,
+    target_url: TargetUrlOpt = None,
+    meta_url: MetaUrlOpt = None,
+) -> None:
+    """Run the Movements this Migration composes, up to verification."""
+    try:
+        migration = load_migration_spec(spec).to_migration()
+    except SpecError as exc:
+        _fail(str(exc))
+        return
+
+    missing = [name for name in migration.movements if name not in migration.movement_specs]
+    if missing:
+        _fail(
+            f"no spec path given for movement(s) {', '.join(missing)}; "
+            f"add `spec:` beside the movement name so the migration can run it"
+        )
+        return
+
+    movements, engines = _service(source_url, target_url, meta_url)
+    meta = create_engine(meta_url or database_url())
+    service = MigrationService(migrations=MigrationStore(meta), operations=OperationStore(meta))
+
+    async def run_movement(name: str) -> object:
+        """Load and run one Movement. The Migration knows nothing of this."""
+        path = migration.movement_specs[name]
+        parsed = load_movement_spec(path).to_movement()
+        targets = {dataset.name: dataset.target for dataset in parsed.datasets}
+        compiled = await movements.plan(parsed)
+        if backend is ExecutionBackend.TEMPORAL:
+            return await movements.run_on_temporal(parsed, compiled, targets=targets)
+        return await movements.run(parsed, compiled, targets=targets)
+
+    async def run() -> MigrationStatus:
+        try:
+            return await service.run(migration, runner=run_movement)
+        finally:
+            await _dispose(engines)
+            await meta.dispose()
+
+    try:
+        status = asyncio.run(run())
+    except (OperationInFlightError, IllegalMigrationTransitionError) as exc:
+        _fail(str(exc))
+        return
+
+    console.print(f"[green]{status.state.value}[/green] {status.record.name}")
+    for movement in status.movements:
+        marker = "[green]✓[/green]" if movement.complete else " "
+        console.print(f"  {marker} {movement.describe()}")
 
 
 if __name__ == "__main__":

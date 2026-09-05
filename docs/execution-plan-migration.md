@@ -139,9 +139,13 @@ carried through now, on both the queue and Temporal paths.
 own verification. Each is a signal that the shared machinery did not fit, and each should be
 argued for out loud rather than quietly added.
 
-**Exit:** a Migration spec parses, its state machine rejects illegal transitions, and every
-transition lands in the metadata store with an actor. Nothing under `gantry/movement/` has
-changed.
+**Exit: met.** A Migration spec parses, the state machine rejects illegal transitions naming
+what would have been allowed, and `gantry/movement/` is untouched.
+
+Two decisions worth recording. **Gate defaults are the strict answer**, so an omitted gate is
+still enforced — otherwise the spec becomes a place to quietly turn checks off, and relaxing
+one has to be written down. And `CUTTING_OVER` / `ROLLING_BACK` are **operator-only by
+construction**: both move production traffic, and neither is something a model may decide.
 
 ### Day 2 — Composition and the migration store
 
@@ -155,9 +159,47 @@ changed.
 - **[B]** Dependency ordering across Movements, reusing the plan DAG rather than a second
   ordering implementation.
 
-**Exit:** `gantry migration start` runs a two-Dataset migration through `SNAPSHOTTING` and
-`CATCHING_UP` to `VERIFYING`, driving real Movements, and `gantry migration status` shows the
-tree. **Measure the Movement diff here** — if it is already large, stop and re-read §5.2.
+**Exit: met.** Against the real stack, driving the actual two-Dataset demo Movement:
+
+```text
+$ gantry migration start spec/examples/migration-orders-to-warehouse.yaml
+verifying orders-to-warehouse
+  ✓ orders-snapshot  completed  plan v1
+
+$ gantry migration status orders-to-warehouse
+orders-to-warehouse  state=verifying
+  ✓ orders-snapshot  completed  plan v1
+  recent transitions
+    draft -> discovering   runtime  resolving the movements this migration composes
+    discovering -> planned runtime  composed from 1 movement(s)
+    planned -> preparing   runtime  checking targets before moving anything
+    preparing -> snapshotting  runtime  running 1 movement(s)
+    snapshotting -> catching_up  runtime  applying changes made during the snapshot
+    catching_up -> verifying     runtime  reconciling source against target
+```
+
+### The measurement
+
+**35 lines added to `gantry/movement/`, in one function.** That is the number this plan exists
+to take, and it says the composition claim is holding so far.
+
+What those lines are is more interesting than how many. Composing a workflow over Movement
+exposed a real v1 bug: **a Movement never reached `COMPLETED`.** It stopped at `VERIFYING` and
+stayed there forever, even with every check passed — `gantry status` had been showing it and
+nobody chased it, because nothing in v1 ever asked the question. A workflow gate asking "are
+the Movements done?" could never have got a yes.
+
+The fix is the state machine's own rule, finally implemented: `COMPLETED` is reachable only
+through verification, and an engine reporting success does not by itself get you there. So the
+diff is not Migration reaching into Movement to bend it — it is Migration *asking a question
+v1 never asked* and finding the answer was missing.
+
+**How the workflow drives a Movement matters as much as that it does.** The runner is injected
+rather than constructed: `MigrationService.run` knows that a Movement can be asked to run and
+that it reports an Operation state. It does not know about engines, partitions, checkpoints or
+spec files, and the CLI supplies all of that. Movement state is **read** from the Operations
+on every `status` call rather than mirrored into the Migration — two records of one fact drift,
+and the one an operator happens to read decides what they believe.
 
 ---
 

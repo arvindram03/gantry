@@ -113,14 +113,16 @@ class RollbackBlock(BaseModel):
 class MovementRef(BaseModel):
     """One Movement this Migration drives.
 
-    Accepts either a bare name or `{movement: name}`, so a list reads naturally
-    either way and gains room for per-Movement options later without a breaking
-    change.
+    Accepts either a bare name or `{movement: name, spec: path}`. The spec path
+    is what lets the workflow *run* the Movement rather than only name it —
+    and it stays a reference rather than an inlined definition, because a
+    Movement is a resource with its own lifecycle.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     movement: ResourceName
+    spec: str | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -150,6 +152,7 @@ class MigrationSpec(OperationSpec):
         return Migration(
             name=self.metadata.name,
             movements=tuple(ref.movement for ref in self.movements),
+            movement_specs={ref.movement: ref.spec for ref in self.movements if ref.spec},
             cutover=self.cutover.gates.to_gates(),
             rollback=self.rollback.to_policy(),
             description=self.description,

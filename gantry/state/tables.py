@@ -266,3 +266,46 @@ def operation_dependents() -> tuple[Table, ...]:
             for key in constraint.elements
         )
     )
+
+
+migrations = Table(
+    "migrations",
+    metadata,
+    Column("name", String(253), primary_key=True),
+    Column("state", String(32), nullable=False),
+    # The Movements this workflow drives, in dependency order. Names, not
+    # embedded definitions: each is an Operation with its own row, its own
+    # plan versions and its own checkpoints.
+    Column("movements", ARRAY(String), nullable=False, server_default="{}"),
+    Column("spec", JSONB, nullable=False),
+    Column("created_at", TIMESTAMP, nullable=False),
+    Column("updated_at", TIMESTAMP, nullable=False),
+    # Optimistic concurrency, as for operations: two actors cannot both
+    # advance one Migration, and a cutover is the last place to discover
+    # that they did.
+    Column("row_version", Integer, nullable=False, server_default="1"),
+)
+
+
+migration_transitions = Table(
+    "migration_transitions",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("migration", String(253), nullable=False),
+    Column("from_state", String(32), nullable=False),
+    Column("to_state", String(32), nullable=False),
+    # Who caused it. A cutover with no accountable actor is the failure this
+    # workflow exists to prevent, so the column is not nullable.
+    Column("actor", String(16), nullable=False),
+    # The identity behind an operator decision. Null for runtime transitions,
+    # required for the ones an operator alone may make.
+    Column("actor_id", String(253), nullable=True),
+    Column("reason", Text, nullable=False),
+    # The gate report a cutover was approved against, kept whether the gates
+    # passed or failed: what a post-mortem asks is what we believed at the
+    # time, not only what went wrong.
+    Column("evidence", JSONB, nullable=True),
+    Column("occurred_at", TIMESTAMP, nullable=False),
+    ForeignKeyConstraint(["migration"], ["migrations.name"], name="fk_migration_transitions"),
+    Index("ix_migration_transitions_migration", "migration", "occurred_at"),
+)

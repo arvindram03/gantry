@@ -95,6 +95,10 @@ class Migration(BaseModel):
     # than embedded: a Movement is a resource with its own lifecycle, and
     # inlining it here would make the Migration own execution.
     movements: tuple[ResourceName, ...] = Field(min_length=1)
+    # Where each Movement's spec lives, for the ones that said. A Migration
+    # can name a Movement it cannot run - `status` still reports on it - so
+    # this is deliberately partial rather than required.
+    movement_specs: dict[ResourceName, str] = {}
     cutover: CutoverGates = CutoverGates()
     rollback: RollbackPolicy = RollbackPolicy()
     description: str | None = None
@@ -103,4 +107,12 @@ class Migration(BaseModel):
     def _check_migration(self) -> Migration:
         if len(set(self.movements)) != len(self.movements):
             raise ValueError(f"duplicate movements: {sorted(self.movements)}")
+        unknown = sorted(set(self.movement_specs) - set(self.movements))
+        if unknown:
+            raise ValueError(f"specs given for movements not listed: {unknown}")
         return self
+
+    @property
+    def runnable(self) -> tuple[ResourceName, ...]:
+        """The Movements this Migration knows how to run, in order."""
+        return tuple(name for name in self.movements if name in self.movement_specs)
