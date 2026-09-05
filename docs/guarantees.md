@@ -273,6 +273,52 @@ spec, and **rediscovery preserves them**. Without that, registering a Dataset
 spec and then rediscovering would alternate between two manifests for one
 table, which is the version churn content addressing exists to prevent.
 
+## Validation
+
+Generating an artifact is not permission to run it. Validation is the gate, and
+its output has a specific job: when it refuses, it must say what to change.
+
+Nothing in validation raises on a failure — failures are **values**, structured
+well enough for a planner or an agent to act on. A stack trace tells a human
+something went wrong and tells an agent nothing.
+
+| Check | What it catches | Suggested repair |
+|---|---|---|
+| `inputs_exist` | A dataset the registry does not hold | rediscover |
+| `syntax` / `plan` | A column that does not exist, a malformed query | edit spec |
+| `cost` | An artifact estimated to read more than policy allows | raise limit |
+| `sample` | Errors that only appear at execution time | edit spec |
+
+Checks run cheapest first and stop where later ones become meaningless: a plan
+that will not plan is never sampled, and an unregistered input is refused
+without asking the engine at all. Failure detail carries the **engine's own
+words**, trimmed to the line that identifies the problem.
+
+## Running on more than one engine
+
+Two engines is the minimum that keeps the abstraction honest. With one, "engine
+adapter" means whatever PostgreSQL happens to do. DuckDB reads the same
+PostgreSQL tables in place rather than being handed a copy — a copy would make
+the engines agree for the wrong reason.
+
+The same compiled SQL runs unmodified on both. Two differences are real, and
+recorded here rather than smoothed over in a comparison:
+
+**Interpolating aggregates agree only to the input's precision.**
+`percentile_cont` interpolates; DuckDB keeps the input's `DECIMAL` scale through
+the interpolation while PostgreSQL promotes to double. Over a `numeric(10,2)`
+column the two differ in the hundredths — `531.9505` against `531.95`. Counts
+and sums agree exactly; percentiles agree to about 1e-4 relative.
+
+**The engines disagree about Python types**, in both directions. The same
+aggregate returns `Decimal` from one and `float` from the other. Anything
+comparing results across engines has to normalise first, or it will report
+inequality on values that agree.
+
+**Estimates are not universally available.** PostgreSQL reports rows and cost on
+the first `EXPLAIN` line; DuckDB renders a tree with no such figure. The DuckDB
+adapter reports no estimate rather than parsing a number out of prose.
+
 ## Not yet
 
 - Adaptive concurrency and rate limits (v1.1)
