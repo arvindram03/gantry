@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The worker loop.
 
 The ordering in `_run_task` is the whole point, and it is enforced by types
@@ -24,8 +25,8 @@ from datetime import datetime, timedelta
 from typing import Protocol
 
 from gantry.core.commit import CommitResult
-from gantry.core.positions import Checkpoint, CheckpointScope, PositionKind, SourcePosition
-from gantry.lifecycle.plan import PlanNode, PlanVersion
+from gantry.core.positions import Checkpoint, PositionKind, SourcePosition
+from gantry.lifecycle.plan import PlanNode, PlanVersion, checkpoint_scope_for
 from gantry.scheduler.backend import Task, TaskState, WorkflowBackend
 from gantry.scheduler.failures import FailureClass, classify
 from gantry.state.checkpoints import CheckpointStore
@@ -128,7 +129,13 @@ class Worker:
         await self._checkpoints.advance(
             task.operation,
             Checkpoint(
-                scope=CheckpointScope.PARTITION,
+                # Scoped by what the node actually covers. The id stays the
+                # node id: two dataset-level nodes over one Dataset would
+                # otherwise share a checkpoint, and the later would overwrite
+                # the earlier, losing the per-node progress resume depends on.
+                # What a reader wants to see is the position's value, which
+                # carries the readable scope.
+                scope=checkpoint_scope_for(node.kind),
                 scope_id=task.node_id,
                 position=SourcePosition(
                     kind=PositionKind.PARTITION_ID, value=node.scope or task.node_id

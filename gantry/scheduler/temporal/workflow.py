@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The Movement workflow.
 
 Temporal replays workflow code from its event history to recover, so this

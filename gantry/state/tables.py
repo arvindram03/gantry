@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The metadata schema.
 
 Durable control state lives outside worker processes so workers stay

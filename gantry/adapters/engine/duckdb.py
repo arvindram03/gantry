@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Running artifacts on DuckDB.
 
 The second engine exists to keep the abstraction honest. With one

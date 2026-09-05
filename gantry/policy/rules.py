@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The agent access policy, as declared.
 
 This is the RFC's `agentAccess` block:

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """SQL helpers shared by the verifiers."""
 
 from __future__ import annotations

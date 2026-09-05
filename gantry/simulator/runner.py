@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The execution simulator.
 
 Runs a real plan through the real lifecycle engine and the real leasing rules,

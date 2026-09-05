@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Persisting verification results.
 
 Findings are append-only. A verification result is a statement about what was

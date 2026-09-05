@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Coordinating a snapshot with a change stream.
 
 The ordering here is the whole of it, and getting it wrong produces a target

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Operation state and its audit trail.
 
 Every state change goes through `transition`, which validates the move against

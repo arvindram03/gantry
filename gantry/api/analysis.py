@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """`gantry.analysis.{plan,execute,status}`.
 
 Thin on purpose. The lifecycle already lives in `AnalysisService`; this is the

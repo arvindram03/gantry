@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Agent access policy: the ladder, the rules, and where they are enforced."""
 
 from __future__ import annotations

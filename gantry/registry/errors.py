@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Registry errors."""
 
 from __future__ import annotations

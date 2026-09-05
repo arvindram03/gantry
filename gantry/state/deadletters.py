@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The dead-letter queue.
 
 An event the runtime cannot apply is kept, not dropped. A queue that records

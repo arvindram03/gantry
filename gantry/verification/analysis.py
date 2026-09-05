@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Analysis verifiers.
 
 These implement the same protocol as the Movement verifiers and produce the

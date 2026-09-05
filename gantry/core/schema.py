@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Logical schema of a Dataset."""
 
 from __future__ import annotations

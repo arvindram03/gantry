@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Running a Movement end to end.
 
 Holds the sequence the CLI drives: discover, compile, submit, run, and record

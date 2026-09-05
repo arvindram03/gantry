@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The Operation state machine.
 
 Transitions are the only way an Operation changes state, and every transition

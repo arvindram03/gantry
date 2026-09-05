@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Where agent access is decided.
 
 Every path that can put Dataset content in front of an agent goes through

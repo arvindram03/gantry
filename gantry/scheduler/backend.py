@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The workflow backend interface.
 
 Durable task dispatch sits behind this Protocol so the durability substrate can

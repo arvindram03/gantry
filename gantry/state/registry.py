@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The durable Dataset registry.
 
 Same contract as the in-memory and JSON stores, with the concurrency guarantee

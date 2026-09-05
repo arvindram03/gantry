@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Connecting to Temporal and running a Movement through it."""
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Provisioning a Debezium connector.
 
 Connector setup is part of Prepare and teardown is part of Finalize, both for

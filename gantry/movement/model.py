@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The Movement domain model.
 
 This is what the runtime plans and executes. It is deliberately not the spec

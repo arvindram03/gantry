@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Synthetic source data for the demo and for tests.
 
 Generation runs server-side. A hundred million rows produced by a Python loop
@@ -41,22 +42,27 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
 # Customers are seeded at a fixed ratio to orders so the foreign key stays
 # satisfiable and the key distribution is realistic rather than uniform.
 _CUSTOMERS_SQL = """
-INSERT INTO public.customers (customer_id, email, region, created_at)
+INSERT INTO public.customers (customer_id, email, region, created_at, source_lsn)
 SELECT g,
        'customer' || g || '@example.com',
        (ARRAY['us-east', 'us-west', 'eu-west', 'ap-south'])[1 + (g % 4)],
-       timestamptz '2026-01-01' + (g % 365) * interval '1 day'
+       timestamptz '2026-01-01' + (g % 365) * interval '1 day',
+       -- Written rather than left to the column default. The seeder is also
+       -- used against tables a target adapter created, and those carry the
+       -- column as NOT NULL without a default.
+       0
   FROM generate_series(CAST(1 AS bigint), CAST(:customers AS bigint)) AS g
     ON CONFLICT (customer_id) DO NOTHING
 """
 
 _ORDERS_SQL = """
-INSERT INTO public.orders (order_id, customer_id, amount, status, created_at)
+INSERT INTO public.orders (order_id, customer_id, amount, status, created_at, source_lsn)
 SELECT g,
        1 + (g % :customers),
        round((random() * 500 + 5)::numeric, 2),
        (ARRAY['placed', 'shipped', 'delivered', 'cancelled'])[1 + (g % 4)],
-       timestamptz '2026-01-01' + (g % 365) * interval '1 day'
+       timestamptz '2026-01-01' + (g % 365) * interval '1 day',
+       0
   FROM generate_series(CAST(:lo AS bigint), CAST(:hi AS bigint)) AS g
     ON CONFLICT (order_id) DO NOTHING
 """

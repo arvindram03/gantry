@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The `kind: Movement` spec.
 
 A Movement makes or keeps a Dataset reliably available. It does not imply a

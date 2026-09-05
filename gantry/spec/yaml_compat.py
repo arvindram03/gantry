@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """A YAML loader aligned with YAML 1.2 booleans.
 
 PyYAML implements YAML 1.1, which resolves `on`, `off`, `yes` and `no` as

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """JSON-file Dataset registry.
 
 Backs the CLI so registrations survive between invocations before the metadata

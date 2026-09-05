@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Consuming Debezium change events from Kafka.
 
 Design document open question #2, answered for v1: **Gantry owns the applied

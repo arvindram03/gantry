@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Provenance: why we believe a Result.
 
 RFC Provenance: every finding must trace to the Analysis version, the

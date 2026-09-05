@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Accepted spec API versions.
 
 The design documents disagree: the Movement example uses `gantry.io/v1alpha1`

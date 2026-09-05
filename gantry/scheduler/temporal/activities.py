@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Activities: everything that touches the outside world.
 
 Temporal owns dispatch, retries and timeouts here, which is the whole reason
@@ -17,7 +18,8 @@ from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
 from gantry.core.dataset import DatasetManifest, DatasetRef
-from gantry.core.positions import Checkpoint, CheckpointScope, PositionKind, SourcePosition
+from gantry.core.positions import Checkpoint, PositionKind, SourcePosition
+from gantry.lifecycle.plan import checkpoint_scope_for
 from gantry.movement.executor import MovementExecutor
 from gantry.registry.base import DatasetRegistry
 from gantry.scheduler.failures import FailureClass, classify
@@ -96,7 +98,13 @@ class MovementActivities:
         await self.checkpoints.advance(
             operation,
             Checkpoint(
-                scope=CheckpointScope.PARTITION,
+                # Scoped by what the node actually covers. The id stays the
+                # node id: two dataset-level nodes over one Dataset would
+                # otherwise share a checkpoint, and the later would overwrite
+                # the earlier, losing the per-node progress resume depends on.
+                # What a reader wants to see is the position's value, which
+                # carries the readable scope.
+                scope=checkpoint_scope_for(node.kind),
                 scope_id=node_id,
                 position=SourcePosition(
                     kind=PositionKind.PARTITION_ID, value=node.scope or node_id

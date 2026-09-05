@@ -44,7 +44,7 @@ from gantry.state.tables import results
 from sqlalchemy import delete, text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from tests.integration.conftest import clear_operation
+from tests.integration.conftest import clear_operation, ensure_checkout_scenario
 
 pytestmark = pytest.mark.integration
 
@@ -74,7 +74,7 @@ async def source() -> AsyncIterator[AsyncEngine]:
                 )
             ).scalar_one()
         if not present:
-            pytest.skip("scenario tables absent; seed request_logs and deploy_events")
+            await ensure_checkout_scenario(engine)
         yield engine
     finally:
         await engine.dispose()

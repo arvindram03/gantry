@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Chunk checksums.
 
 Comparing two large tables row by row is the obvious approach and the one that

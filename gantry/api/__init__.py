@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The typed Python API.
 
     async with gantry.connect(source_url=...) as session:

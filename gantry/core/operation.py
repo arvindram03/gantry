@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Operation identity and lifecycle states.
 
 Movement and Analysis are both Operations. The runtime enforces one lifecycle

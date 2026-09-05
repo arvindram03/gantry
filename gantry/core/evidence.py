@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Verification results.
 
 A verification result is evidence, and evidence has to answer more than

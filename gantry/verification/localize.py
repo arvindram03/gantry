@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Locating a mismatch without a full-table diff.
 
 A checksum says a range disagrees. Halving the range and re-checksumming says

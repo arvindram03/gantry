@@ -365,7 +365,38 @@ The API takes a **structured aggregate rather than SQL**, because `rows: deny, a
 - Apache-2.0 headers, `CONTRIBUTING.md`, RFC 0 as `docs/rfcs/0000-gantry.md` with the §0 deviations folded in, open questions filed as issues.
 - Tag `v0.1.0`.
 
-**Exit — v1:** a stranger clones, runs the quickstart, and reaches both a verified Movement and a provenanced Result without asking a question.
+**Exit — v1: met.** Verified by wiping the source tables, the target tables and the entire metadata schema, then following the README quickstart verbatim:
+
+```text
+$ gantry seed --rows 1000000
+seeded 1,000,000 orders
+seeded 40,000 request logs and 3 deploys
+
+$ gantry start examples/postgres-to-postgres/movement.yaml
+ok orders-snapshot.movement  1,010,000 rows in 8.1s (124,618 rows/sec)
+  partitions 2/2   checkpoints 8   inputs pinned 6
+  verification   8/8 checks passed
+
+$ make demo
+well-formed  ENGINE: SUCCESS   GANTRY: PASSED  row_expansion 1.0000x  → 4 findings
+expanding    ENGINE: SUCCESS   GANTRY: FAILED  row_expansion 2.0000x  → withheld
+
+$ gantry results provenance checkout-regression.analysis
+checkout-regression.analysis  1 artifacts, 2 dataset versions, 8 checkpoints
+  produced by  orders-snapshot.movement
+```
+
+**What that surfaced, and it is the reason the criterion was worth stating that way:** the Analysis half of the demo was *not* reproducible. `public.request_logs` and `public.deploy_events` existed only on the machine where they had been created by hand on Day 16. The specs referenced tables a clean clone did not have, and the four integration test files over them **skipped rather than failed** — the quietest way for a feature to stop being covered. `gantry seed --scenario checkout` now generates the scenario deterministically, and those tests seed their own fixture instead of hoping for one.
+
+Three more bugs came out of writing that seeder and re-running from clean:
+
+1. **A bind parameter inside an SQL comment.** SQLAlchemy scans comments for `:name`, so a comment explaining a casting rule became a required parameter.
+2. **`(g - 1) * :spacing` truncated to zero.** PostgreSQL inferred the bind's type from the integer it was multiplied by, so the fractional row spacing became `0` and every request landed at the same instant — the regression the demo exists to show simply was not there. Casting the bind fixed it.
+3. **The cross-engine percentile tolerance was relative.** The guarantee is agreement to the input column's scale, which is absolute; a relative bound calibrated on one dataset's magnitude silently changed meaning when the data did. The same 0.01 divergence read as `1e-6` at a latency of 532 and `1.4e-4` at 70.
+
+And one improvement to provenance itself: every plan node checkpointed as `partition`, so a dataset-level verification and a single partition copy were indistinguishable in the trail, rendered as `partition/<node hash>`. Checkpoint scope is now derived from the node kind. The scope **id** stays the node id — making it readable would let two dataset-level nodes over one Dataset share a checkpoint, and the later would overwrite the earlier, losing the per-node progress resume depends on. The readable name lives in the position, which is what the CLI now renders.
+
+**Shipped:** `docs/architecture.md`, `docs/adapters.md`, `CONTRIBUTING.md`, RFC 0 with seven deviations written down rather than left to be discovered, runnable walkthroughs under `examples/`, SPDX headers across the package, `NOTICE`, and `v0.1.0`.
 
 ---
 

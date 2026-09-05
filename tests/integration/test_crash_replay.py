@@ -25,7 +25,7 @@ from gantry.state.database import create_engine, transaction
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from .conftest import clear_all_operations
+from .conftest import clear_all_operations, ensure_source_scale
 
 pytestmark = [pytest.mark.integration, pytest.mark.chaos]
 
@@ -52,11 +52,18 @@ LEASE_SECONDS = 2
 @pytest.fixture
 async def target() -> AsyncIterator[AsyncEngine]:
     engine = create_engine(TARGET_URL)
+    source = create_engine(SOURCE_URL)
     try:
+        # The plan partitions public.customers at 100,000 rows and the test
+        # kills the worker after three commits, so it needs enough customers to
+        # make several partitions. Short of that it fails looking like a
+        # crash-replay bug when it is a short table.
+        await ensure_source_scale(source, orders=1_000_000, customers=1_000_000)
         async with transaction(engine) as connection:
             await connection.execute(text(f"DROP TABLE IF EXISTS {TARGET_TABLE}"))
         yield engine
     finally:
+        await source.dispose()
         await engine.dispose()
 
 

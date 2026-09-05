@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """In-memory workflow backend.
 
 The reference implementation of the leasing rules, and the fake the simulator

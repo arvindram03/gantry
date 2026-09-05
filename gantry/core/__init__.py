@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Shared domain vocabulary.
 
 Every other module depends on these types, and this module depends on none of

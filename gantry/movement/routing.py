@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Routing changes so ordering means something.
 
 Design document section 8.3: ordering is scoped explicitly, and the default is

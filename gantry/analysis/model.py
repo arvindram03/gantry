@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The Analysis domain model.
 
 The sibling of `Movement`, and the same seam: the spec layer owns YAML shape

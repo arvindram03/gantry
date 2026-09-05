@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Running the verification a plan requires.
 
 Verification is a lifecycle stage, not a report produced afterwards. A

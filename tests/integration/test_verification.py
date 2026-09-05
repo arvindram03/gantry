@@ -42,6 +42,8 @@ from gantry.verification.runner import MovementVerificationRunner
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from .conftest import ensure_source_scale
+
 pytestmark = pytest.mark.integration
 
 SOURCE_URL = os.environ.get(
@@ -59,6 +61,16 @@ async def engines() -> AsyncIterator[tuple[AsyncEngine, AsyncEngine]]:
     source = create_engine(SOURCE_URL)
     target = create_engine(TARGET_URL)
     try:
+        # Both databases, and the reason is subtle: `copy_source` below runs
+        # CREATE TABLE ... AS SELECT on the *target*, so it reads the target's
+        # own public.customers, not the source's. That only ever matched
+        # because an earlier Movement had synced them. The seeder is
+        # deterministic, so seeding both to one scale gives identical tables.
+        # Stated rather than assumed: these tests corrupt customer_id 777777,
+        # and a shorter table makes a checksum test fail as though the checksum
+        # were wrong.
+        for engine in (source, target):
+            await ensure_source_scale(engine, orders=1_000_000, customers=1_000_000)
         # A fresh copy of the source, so a test can damage it freely.
         async with transaction(target) as connection:
             await connection.execute(text(f"DROP TABLE IF EXISTS {TARGET_TABLE}"))

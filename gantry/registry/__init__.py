@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Dataset registry.
 
 Datasets are registered, versioned and resolved by name. Manifests are

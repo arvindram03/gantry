@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Loading an agent access policy from YAML.
 
 The RFC writes the policy as a standalone block rather than a resource:

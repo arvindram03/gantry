@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Validated identifiers shared by every Gantry resource.
 
 Names are part of the public contract: they appear in specs, CLI arguments,

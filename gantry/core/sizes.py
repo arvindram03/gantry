@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Byte-size parsing for spec fields written for humans.
 
 Dataset manifests carry sizes like `14.2TB`. Specs stay readable; everything

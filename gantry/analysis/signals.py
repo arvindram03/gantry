@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The signal vocabulary.
 
 Signals are named and defined here rather than written as expressions in a

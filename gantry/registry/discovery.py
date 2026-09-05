@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Discovery as a registry operation.
 
 Discovering a source registers Dataset resources. This is where making Dataset

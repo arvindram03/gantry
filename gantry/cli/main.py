@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Gantry command line interface.
 
 Commands that are not built yet exit 2 and name the day they land, so the CLI
@@ -21,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from gantry import __version__
 from gantry.adapters.engine.postgres import PostgresEngineAdapter
 from gantry.adapters.source.postgres import PostgresSourceAdapter
+from gantry.adapters.source.scenario import seed_checkout_scenario
 from gantry.adapters.source.seed import seed as seed_source
 from gantry.analysis.artifact import GeneratedArtifact
 from gantry.api.aggregates import Aggregate, AggregateFunction, AggregateQuery
@@ -92,6 +94,19 @@ app.add_typer(policy_app)
 
 console = Console()
 err_console = Console(stderr=True)
+
+
+class SeedScenario(StrEnum):
+    """Which demo data to write.
+
+    Two scenarios, because the demo has two halves. `orders` feeds the
+    Movement; `checkout` feeds the Analysis, and used to exist only on machines
+    where someone had created those tables by hand.
+    """
+
+    ORDERS = "orders"
+    CHECKOUT = "checkout"
+    ALL = "all"
 
 
 class ExecutionBackend(StrEnum):
@@ -494,9 +509,12 @@ def seed(
         int | None,
         typer.Option(help="Customers to generate. Default: one per hundred orders."),
     ] = None,
+    scenario: Annotated[
+        SeedScenario, typer.Option(help="Which demo data to seed.")
+    ] = SeedScenario.ALL,
     source_url: SourceUrlOpt = None,
 ) -> None:
-    """Seed the source database with synthetic orders.
+    """Seed the source database with the demo data.
 
     Customers default to a hundredth of the orders, which is a plausible shape
     but ties the two together. They can be set separately because some work
@@ -508,13 +526,23 @@ def seed(
 
     # One event loop for the whole command: a second asyncio.run() would try to
     # dispose connections created in a loop that no longer exists.
-    async def run() -> int:
+    async def run() -> tuple[int, int]:
         try:
-            return await seed_source(engine, orders=rows, customers=customers)
+            seeded = 0
+            if scenario in (SeedScenario.ORDERS, SeedScenario.ALL):
+                seeded = await seed_source(engine, orders=rows, customers=customers)
+            requests = 0
+            if scenario in (SeedScenario.CHECKOUT, SeedScenario.ALL):
+                requests = await seed_checkout_scenario(engine)
+            return seeded, requests
         finally:
             await engine.dispose()
 
-    console.print(f"[green]seeded[/green] {asyncio.run(run()):,} orders")
+    orders, requests = asyncio.run(run())
+    if orders:
+        console.print(f"[green]seeded[/green] {orders:,} orders")
+    if requests:
+        console.print(f"[green]seeded[/green] {requests:,} request logs and 3 deploys")
 
 
 @app.command()
@@ -810,9 +838,12 @@ def results_provenance(
     if chain.checkpoints:
         console.print(f"  checkpoints  {len(chain.checkpoints)}")
         for checkpoint in chain.checkpoints[:5]:
+            # The position's value, not the scope id: the id is a node hash,
+            # unique so resume can key on it, and unreadable for the same
+            # reason. Provenance is for a person to read.
             console.print(
-                f"    [dim]{checkpoint.scope.value}/{checkpoint.scope_id} "
-                f"at {checkpoint.position.kind.value}={checkpoint.position.value}[/dim]"
+                f"    [dim]{checkpoint.scope.value}/{checkpoint.position.value} "
+                f"at {checkpoint.position.kind.value}[/dim]"
             )
         if len(chain.checkpoints) > 5:
             console.print(f"    [dim]… {len(chain.checkpoints) - 5} more[/dim]")

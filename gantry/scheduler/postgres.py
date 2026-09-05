@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The durable leased task queue.
 
 Leasing uses `FOR UPDATE SKIP LOCKED`, so many workers can claim work

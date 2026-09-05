@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The progressive access ladder.
 
 The RFC's ordering, as a type:

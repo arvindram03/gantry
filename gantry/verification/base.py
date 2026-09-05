@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The verifier interface.
 
 Written against Operations, not against Movement. An Analysis verifier bounding

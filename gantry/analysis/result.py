@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The Result an Analysis produces.
 
 The sibling of `MovementResult`, carrying findings instead of row counts and

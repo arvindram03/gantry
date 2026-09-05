@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The target adapter interface.
 
 A target is responsible for two things the runtime cannot provide from outside:

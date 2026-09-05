@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Fault-injecting fakes.
 
 These exist to make failure ordinary. The runtime's guarantees are claims about

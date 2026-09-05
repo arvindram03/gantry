@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """YAML spellings for verification requirements.
 
 The design documents write these two ways. A Movement lists bare check names:

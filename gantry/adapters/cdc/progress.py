@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Recording how far a change stream has been applied.
 
 Both positions live in Gantry's checkpoint store, for different jobs:

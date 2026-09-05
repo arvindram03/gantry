@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The source adapter interface.
 
 Discovery returns Dataset manifests rather than an adapter-private snapshot.

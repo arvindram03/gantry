@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """PostgreSQL source adapter.
 
 Discovery and profiling both read the catalog and the planner's own statistics.

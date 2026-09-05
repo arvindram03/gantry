@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The Dataset resource.
 
 Spec (Core Resource Model, rev 1): Dataset is the first of four core resources

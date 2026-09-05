@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """`gantry.results.{get,explain,provenance,refresh}`.
 
 The same four verbs the CLI exposes, returning values rather than printing

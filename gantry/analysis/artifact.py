@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Generated executable artifacts.
 
 The design document is explicit that generation is not execution: an artifact

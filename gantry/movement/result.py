@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The Result a Movement produces.
 
 The first concrete instance of the Result abstraction, and it inherits the

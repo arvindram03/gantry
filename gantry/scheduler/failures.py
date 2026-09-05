@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Failure classification.
 
 A worker that treats every error the same way either gives up on a transient

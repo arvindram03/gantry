@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Compile a Movement into an execution plan.
 
 Partition bounds come from a Dataset manifest, so a plan compiled without

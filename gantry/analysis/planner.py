@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Compile an Analysis into an execution plan.
 
 The shape is the lifecycle itself: generate an engine artifact, validate it

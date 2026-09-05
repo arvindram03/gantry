@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Half-open time windows.
 
 Analysis specs declare a window; verification and provenance record the window

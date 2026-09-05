@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Verification requirements.
 
 Domain vocabulary shared by Movement and Analysis. Movement checks compare a

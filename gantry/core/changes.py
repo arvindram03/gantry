@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Change events.
 
 The common shape a CDC adapter produces, whatever the source. A Debezium

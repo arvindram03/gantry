@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Load and validate spec documents."""
 
 from __future__ import annotations

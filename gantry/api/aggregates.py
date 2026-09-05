@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The aggregate vocabulary an agent may ask for over a Dataset.
 
 The RFC sketches `dataset.query(sql, params)`. This takes a structured request

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Duration parsing for spec fields written for humans.
 
 Specs express time as `2s`, `30m`, `24h`. Everything downstream works in

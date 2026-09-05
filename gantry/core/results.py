@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The Result resource.
 
 Spec: a Result is a bounded, structured output of a Movement or an Analysis,

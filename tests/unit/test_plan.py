@@ -10,11 +10,13 @@ from pathlib import Path
 import pytest
 from gantry.analysis.planner import compile_analysis
 from gantry.core.operation import LifecycleStage, OperationType
+from gantry.core.positions import CheckpointScope
 from gantry.lifecycle.plan import (
     NodeKind,
     PlanNode,
     PlanVersion,
     ReplanRequiredError,
+    checkpoint_scope_for,
     next_version,
     node_id,
 )
@@ -316,3 +318,37 @@ class TestVersioningAfterTheDataChanges:
 
     def test_a_first_plan_is_version_one(self) -> None:
         assert next_version(None, self.FINGERPRINT, proposed_content="sha256:" + "1" * 64) == 1
+
+
+class TestCheckpointScoping:
+    """A checkpoint is evidence, so it has to say what it is evidence about.
+
+    Every node used to checkpoint as `partition`, which made a dataset-level
+    verification and a single partition copy indistinguishable in the trail -
+    and rendered as `partition/<node hash>`, which tells a reader nothing.
+    """
+
+    def test_a_partition_copy_is_scoped_to_the_partition(self) -> None:
+        assert checkpoint_scope_for(NodeKind.SNAPSHOT_PARTITION) is CheckpointScope.PARTITION
+
+    @pytest.mark.parametrize(
+        "kind", [NodeKind.START_CDC, NodeKind.APPLY_CDC, NodeKind.WAIT_FOR_LAG]
+    )
+    def test_change_stream_work_is_scoped_to_the_stream(self, kind: NodeKind) -> None:
+        assert checkpoint_scope_for(kind) is CheckpointScope.STREAM
+
+    @pytest.mark.parametrize("kind", [NodeKind.CREATE_SCHEMA, NodeKind.VERIFY_DATASET])
+    def test_everything_else_is_scoped_to_the_dataset(self, kind: NodeKind) -> None:
+        assert checkpoint_scope_for(kind) is CheckpointScope.DATASET
+
+    @pytest.mark.parametrize("kind", [NodeKind.DISCOVER, NodeKind.PROFILE])
+    def test_discovery_covers_the_operation_not_a_dataset(self, kind: NodeKind) -> None:
+        """These are the nodes that decide what the Datasets are, so they
+        cannot be scoped to one - and labelling them by node hash was what
+        made the trail unreadable."""
+        assert checkpoint_scope_for(kind) is CheckpointScope.OPERATION
+
+    def test_every_node_kind_has_a_scope(self) -> None:
+        """A new node kind must not silently inherit a wrong label."""
+        for kind in NodeKind:
+            assert checkpoint_scope_for(kind) in CheckpointScope

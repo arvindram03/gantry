@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The Dataset registry interface.
 
 Registration is content-addressed and idempotent: re-registering an unchanged

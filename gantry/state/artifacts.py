@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Storing generated artifacts.
 
 Generated code is provenance, not a transient string. A Result that cannot show

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Deriving findings from what an Analysis computed.
 
 Findings are produced by comparing measured groups, not by asking a model what

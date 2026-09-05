@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Spec parsing and validation.
 
 Owns the YAML surface: document shape, aliases, deprecated spellings and error

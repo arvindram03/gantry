@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Masking what a decision said to mask.
 
 A `REDACT` decision is a promise about the bytes that come back, and a promise

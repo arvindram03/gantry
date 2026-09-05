@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The `kind: Analysis` spec.
 
 An Analysis computes over one or more Datasets and produces a Result. It is a

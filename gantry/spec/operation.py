@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The shared base for Movement and Analysis specs.
 
 Both are Operations over Datasets, and both traverse one lifecycle:

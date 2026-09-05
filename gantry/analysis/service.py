@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Running an Analysis through the lifecycle.
 
 Plan, generate, validate, execute, verify, result - the same sequence a

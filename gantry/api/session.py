@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The entry point: `gantry.connect()`.
 
 Holds the engines and the stores so the three namespaces - datasets, analysis,

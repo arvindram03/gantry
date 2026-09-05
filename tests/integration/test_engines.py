@@ -33,6 +33,8 @@ from gantry.state.database import create_engine, transaction
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from tests.integration.conftest import ensure_checkout_scenario
+
 pytestmark = pytest.mark.integration
 
 SOURCE_URL = os.environ.get(
@@ -56,7 +58,7 @@ async def source() -> AsyncIterator[AsyncEngine]:
                 )
             ).scalar_one()
         if not present:
-            pytest.skip("scenario tables absent")
+            await ensure_checkout_scenario(engine)
         yield engine
     finally:
         await engine.dispose()
@@ -145,9 +147,13 @@ async def test_percentiles_agree_only_to_the_inputs_precision(
     left = {row["commit_sha"]: row for row in (await postgres.execute(artifact)).as_dicts()}
     right = {row["commit_sha"]: row for row in (await duck.execute(artifact)).as_dicts()}
 
+    # Absolute, not relative. The guarantee is that they agree to the scale of
+    # the input column - a numeric(10,2), so one hundredth - and that does not
+    # get looser as the values get larger. A relative bound calibrated against
+    # one dataset's magnitude silently changes meaning on the next.
     for commit in left:
         assert number(left[commit]["p95_latency"]) == pytest.approx(
-            number(right[commit]["p95_latency"]), rel=1e-4
+            number(right[commit]["p95_latency"]), abs=0.01
         )
 
 

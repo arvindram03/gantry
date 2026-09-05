@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Applying change events to a target.
 
 Two guarantees live here, and both are enforced in SQL rather than by careful

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Re-running the computation a Result came from.
 
 A Result is a claim about data as it was. Refresh asks the narrow, answerable

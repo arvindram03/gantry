@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The record of what agents asked for.
 
 `evidence.persist: true` in the RFC's policy block. What makes this worth

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Movement verifiers.
 
 Each one compares what the source says against what the target says, or checks

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The `kind: Dataset` spec.
 
 Mirrors the manifest format in the design document, then converts to the core

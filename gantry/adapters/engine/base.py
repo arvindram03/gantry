@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The execution engine interface.
 
 Engines own scans, joins, sorting, aggregation and shuffle. Gantry owns

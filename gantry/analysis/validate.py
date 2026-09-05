@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Validating a generated artifact before it runs.
 
 The design document is explicit that generation succeeding is not permission to

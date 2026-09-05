@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Source positions and checkpoints.
 
 Spec section 8.2: a checkpoint is durable evidence of committed progress, and

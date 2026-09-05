@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Immutable, content-addressed execution plans.
 
 A plan is compiled from a domain Operation, never from a spec. That matters:
@@ -23,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from gantry.core.names import ContentHash, ResourceName
 from gantry.core.operation import LifecycleStage, OperationType
+from gantry.core.positions import CheckpointScope
 
 
 class NodeKind(StrEnum):
@@ -222,3 +224,22 @@ def next_version(
     if proposed_content is not None and previous.content_hash != proposed_content:
         return previous.version + 1
     return previous.version
+
+
+def checkpoint_scope_for(kind: NodeKind) -> CheckpointScope:
+    """The scope a checkpoint over this node covers.
+
+    Every node used to checkpoint as `partition`, which made a dataset-level
+    verify and a single partition copy indistinguishable in the trail. A
+    checkpoint is evidence, and evidence labelled with the wrong scope answers
+    a question nobody asked.
+    """
+    if kind is NodeKind.SNAPSHOT_PARTITION:
+        return CheckpointScope.PARTITION
+    if kind in (NodeKind.START_CDC, NodeKind.APPLY_CDC, NodeKind.WAIT_FOR_LAG):
+        return CheckpointScope.STREAM
+    # Discovery and profiling cover the source, not any one Dataset - they are
+    # the nodes that decide what the Datasets are.
+    if kind in (NodeKind.DISCOVER, NodeKind.PROFILE):
+        return CheckpointScope.OPERATION
+    return CheckpointScope.DATASET

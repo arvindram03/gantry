@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Replication slot monitoring.
 
 A replication slot is the mechanism that makes CDC reliable and the mechanism

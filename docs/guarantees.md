@@ -319,8 +319,11 @@ recorded here rather than smoothed over in a comparison:
 **Interpolating aggregates agree only to the input's precision.**
 `percentile_cont` interpolates; DuckDB keeps the input's `DECIMAL` scale through
 the interpolation while PostgreSQL promotes to double. Over a `numeric(10,2)`
-column the two differ in the hundredths — `531.9505` against `531.95`. Counts
-and sums agree exactly; percentiles agree to about 1e-4 relative.
+column the two differ in the hundredths — `70.0499…` against `70.04`. Counts
+and sums agree exactly; percentiles agree **to the scale of the input column**,
+which is an absolute bound rather than a relative one. Stating it relatively
+makes the guarantee weaker on large values and unmeetable on small ones — the
+same divergence that read as `1e-6` at a latency of 532 reads as `1.4e-4` at 70.
 
 **The engines disagree about Python types**, in both directions. The same
 aggregate returns `Decimal` from one and `float` from the other. Anything

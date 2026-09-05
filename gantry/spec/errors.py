@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Spec errors carrying YAML field paths.
 
 A spec error is read by a human editing YAML, or by an agent repairing a

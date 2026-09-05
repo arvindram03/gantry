@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Evidence that a write was durably committed.
 
 Design document section 8.2: a checkpoint may only advance after the side

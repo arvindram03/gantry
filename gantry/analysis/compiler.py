@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Compiling an Analysis into engine SQL.
 
 The compiler translates a fixed vocabulary - normalise, join, window,

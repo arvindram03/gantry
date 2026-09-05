@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The Dataset half of the agent-facing API.
 
 One rule holds this file together: every method that can return content calls

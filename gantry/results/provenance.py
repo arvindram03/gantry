@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Resolving why a Result should be believed.
 
 The chain the design document asks for, walked in one call:

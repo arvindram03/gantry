@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Persisting compiled plans.
 
 A plan has to outlive the process that compiled it. Any worker picking up a

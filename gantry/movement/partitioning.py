@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Partition planning.
 
 Partitions are derived from a pinned Dataset manifest, never from a live query.

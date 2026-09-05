@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """In-memory Dataset registry.
 
 The test fake for the registry Protocol, and the reference implementation of

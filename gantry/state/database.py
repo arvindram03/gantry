@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Async database access for the metadata store."""
 
 from __future__ import annotations

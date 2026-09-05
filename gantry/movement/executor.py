@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Executing Movement plan nodes against real adapters.
 
 Each node kind maps to one adapter call. The executor's only other job is to
