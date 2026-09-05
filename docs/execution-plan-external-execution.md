@@ -17,7 +17,13 @@
 
 A job is whatever actually moves bytes: a transaction script, a Beam pipeline, a
 Flink job, an ETL container, a binary someone else wrote. Gantry does not care
-which, and that is the point — it cares about the four things it keeps.
+which, and that is the point — it cares about the five things it keeps.
+
+**The default is a SQL transaction script**, and it replaces the relay outright.
+It is also the *best* of the job kinds on every axis that matters: the commit
+boundary stays Gantry's, checkpoints stay partition-granular, and there is no
+external runtime to operate. Beam is for what SQL cannot reach — another engine,
+or scale beyond one server.
 
 **The relay goes.** v1's `_pipe_copy` streams one `COPY` into another through a
 bounded queue *inside the Gantry worker*, which makes a single Python process
@@ -28,6 +34,25 @@ The line being drawn is precise: **control flows through Gantry; data does
 not.** Issuing a statement over a connection and waiting for it is submission.
 Holding the rows in a queue is being the mover. The first is fine at any scale;
 the second is what is being removed.
+
+### The `sql` kind, and what it does *not* require
+
+A SQL job is a generated transaction script. **How that script reaches the
+source is a property of the deployment, not of the job kind**, and the
+distinction matters because it decides what a deployment must install:
+
+| Source and target are | The script reaches across via | Requires |
+|---|---|---|
+| the same database | a plain `INSERT … SELECT` | **nothing** |
+| different databases | `postgres_fdw` (or `dblink`) | an extension, a server, a user mapping |
+
+So the default path has no prerequisite at all for same-database movements, and
+a stated one for cross-database. Prepare detects which case applies and refuses
+early with the privilege named, rather than failing at row zero.
+
+Where neither extension can be installed *and* the databases differ, the `sql`
+kind cannot reach across and the answer is `beam` or a container. That is a
+specific deployment shape rather than a hole in the default.
 
 ### What a job is
 
@@ -103,7 +128,7 @@ the plan. A single-partition job repairs, under any executor.
 
 | Job kind | Commit boundary | Checkpoint unit | What a checkpoint asserts |
 |---|---|---|---|
-| `sql` (transaction script) | Gantry's — the script commits or does not | partition | committed **and** verified |
+| `sql` (transaction script) — **default** | Gantry's — the script commits or does not | partition | committed **and** verified |
 | `beam` (Dataflow batch) | the runner's — bundle-level, no user checkpoint | partition **group** | committed **and** verified |
 | `container` / arbitrary | none — exit code only | whatever it was given | **verified**, and nothing else |
 
@@ -208,8 +233,10 @@ per-kind guarantee table filled in as far as it can be before code exists.
 - **[A]** `JobExecutor` protocol — `submit` / `poll` — and the worker driving it
   uniformly. The worker must not learn *which* executor ran; anything that leaks
   is the seam being in the wrong place.
-- **[A]** `execution:` on a Movement spec, declared rather than inferred, because
-  changing the job kind changes what a crash costs.
+- **[A]** `execution:` on a Movement spec, **defaulting to `sql`**. Declared
+  rather than inferred where it differs, because changing the job kind changes
+  what a crash costs — and `sql` is the default precisely because it is the kind
+  that costs the least.
 - **[B]** `ArtifactLanguage` gains real members. An enum with one value has never
   been tested.
 
@@ -218,12 +245,17 @@ and polls through the interface.
 
 ### Day 2 — The `sql` executor, and the relay's replacement
 
-- **[A]** Generate a transaction script per partition: `postgres_fdw` setup as a
-  Prepare-time concern, then one statement per partition inside a transaction
-  Gantry opens. The commit boundary stays Gantry's, so every guarantee **should**
-  hold — and the chaos suite is what says whether "should" was right.
-- **[A]** A missing extension or user mapping is a **Prepare-time refusal naming
-  the privilege needed**, not a runtime error at row zero.
+- **[A]** Generate a transaction script per partition — one statement inside a
+  transaction Gantry opens. The commit boundary stays Gantry's, so every
+  guarantee **should** hold, and the chaos suite is what says whether "should"
+  was right.
+- **[A]** **Reach detection at Prepare.** Same database → a plain
+  `INSERT … SELECT`, no prerequisite. Different databases → `postgres_fdw`, and
+  a missing extension, server or user mapping is a **refusal naming the
+  privilege needed**, not a runtime error at row zero.
+- **[B]** The generated script is readable. It is retained as provenance and an
+  operator will eventually run one by hand to work out what happened; SQL that
+  reads like machine output wastes that.
 - **[A]** **Run the whole chaos suite against the `sql` executor.** New fixtures,
   **no new assertions** — the guarantees are the same guarantees.
 - **[A]** **Only once that passes: delete `_pipe_copy` and the relay.** In that
@@ -362,7 +394,8 @@ however long the replacement takes.
 |---|---|---|---|
 | **Handing execution outside becomes handing over the contract** | **Critical** | **Medium** | §1 lists what stays Gantry's: partitioning, the commit boundary, verification, checkpoints, provenance. An executor that wants to decide any of them is a replacement, not an executor |
 | The `sql` kind is slower than the relay was | Medium | **Confirmed: ~30%** | Measured on Day 0 and published. The principle costs throughput here; pretending otherwise would be the dishonesty this release exists to correct |
-| `postgres_fdw` cannot be installed where it matters | High | **Medium** | **No fallback now that the relay is gone.** Either the job kind grows a variant that does not need it — a script the operator runs, a container — or that environment cannot use Gantry for Postgres→Postgres. Decide this on Day 0, not on the day someone hits it |
+| `postgres_fdw` cannot be installed where it matters | Medium | Medium | Only affects *cross-database* movements; same-database needs no extension. Where it bites, the answer is `beam` or a container, and Prepare says so before anything moves |
+| The default job kind is chosen by convenience rather than by guarantee | Medium | Low | `sql` is the default because it is the strongest kind — partition-granular, commit boundary retained. If that ever stops being true, the default moves |
 | Deleting the relay before its replacement is proven | **Critical** | Low | Day 2's ordering is explicit and is in the never-cut list |
 | Cross-language transforms drag in a Java expansion service | High | **High** | Prove the JDBC path on Day 0. If it needs a Java sidecar, that is a stack change and belongs in the same decision as the architecture |
 | Beam's Python SDK weight and startup cost | Medium | High | Optional extra (`gantry[beam]`), never a core dependency (§17) |
@@ -407,8 +440,9 @@ cost.
 than Day 8 is what Day 0 is for. Note what it would not undo: the `sql` kind is
 what removes Gantry from the data path, and it stands whether or not Beam ships.
 
-**What replaces the relay where `postgres_fdw` cannot be installed.** The relay
-was the answer with no prerequisites and it is being removed. A `container` or
-operator-run script job kind is the obvious candidate — Gantry generates it,
-something else runs it, and verification is the only acceptance test — but it is
-not designed here and Day 0 has to say whether it is needed.
+**Whether a `container` job kind is needed at all.** It is the obvious answer
+for cross-database movement where no extension can be installed — Gantry
+generates it, something else runs it, verification is the only acceptance test —
+but with `sql` as the default and same-database movement needing no
+prerequisite, it may be a smaller gap than it looked. Day 0 says whether anyone
+is actually in that position.

@@ -25,8 +25,12 @@ job, an ETL container.
 
 The line is precise: **control flows through Gantry; data does not.** Issuing a
 statement and waiting for it is submission. Holding the rows in a queue is being
-the mover, and that is what goes. See
-[execution-plan-external-execution.md](execution-plan-external-execution.md).
+the mover, and that is what goes.
+
+**The default job is a SQL transaction script**, which is also the strongest
+kind: the commit boundary stays Gantry's and checkpoints stay partition-granular.
+Beam is for what SQL cannot reach — another engine, or scale beyond one server.
+See [execution-plan-external-execution.md](execution-plan-external-execution.md).
 
 ## Four resources
 
