@@ -524,6 +524,7 @@ feature list, not after.
 | [benchmarks.md](docs/benchmarks.md) | measured numbers, with the conditions they were measured under |
 | [rfcs/0000-gantry.md](docs/rfcs/0000-gantry.md) | the design document and its revisions |
 | [execution-plan-v1.md](docs/execution-plan-v1.md) | how v1 was built, day by day, with what each day found |
+| [execution-plan-migration.md](docs/execution-plan-migration.md) | what v1.1 does next: Migration as a workflow over Movements |
 
 ## Status
 

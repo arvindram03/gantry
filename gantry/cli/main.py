@@ -31,7 +31,11 @@ from gantry.core.dataset import DatasetRef, DatasetVersion
 from gantry.core.results import Result
 from gantry.core.sizes import format_byte_size
 from gantry.lifecycle.plan import PlanVersion
-from gantry.lifecycle.states import IllegalTransitionError, StateTransition
+from gantry.lifecycle.states import (
+    IllegalTransitionError,
+    OperationInFlightError,
+    StateTransition,
+)
 from gantry.movement.result import MovementResult
 from gantry.movement.service import MovementService, Progress
 from gantry.policy.audit import access_log_for
@@ -255,7 +259,11 @@ def plan(
         finally:
             await _dispose(engines)
 
-    compiled = asyncio.run(run())
+    try:
+        compiled = asyncio.run(run())
+    except OperationInFlightError as exc:
+        _fail(str(exc))
+        return
     partitions = sum(1 for node in compiled.nodes if node.kind.value == "snapshot_partition")
     console.print(
         f"[green]planned[/green] {compiled.operation} v{compiled.version}  "
@@ -294,7 +302,11 @@ def start(
         finally:
             await _dispose(engines)
 
-    result = asyncio.run(run())
+    try:
+        result = asyncio.run(run())
+    except OperationInFlightError as exc:
+        _fail(str(exc))
+        return
     rate = result.rows_per_second
     console.print(
         f"[green]{result.status.value}[/green] {result.name}  "

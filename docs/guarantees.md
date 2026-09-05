@@ -480,15 +480,35 @@ a threshold is a decision about a specific dataset's sensitivity that the
 runtime cannot make for an operator. It is called out here rather than left to
 be discovered.
 
+## One plan version at a time
+
+Partition bounds come from the data, so recompiling after the source changes
+produces a new plan version. Submitting that version while an earlier one is
+still executing is refused, and the refusal names both versions and the way
+out.
+
+**Resuming the same version stays legal, and that distinction is the whole
+point.** A crashed worker picks its own work back up through exactly this path;
+a guard that blocked both would break crash recovery to fix a bookkeeping
+problem. Only a *different* version on a live run is refused.
+
+The refusal recommends `pause`, not `abort`. Pausing drains in-flight work and
+returns to `PLANNED`; aborting reaches `FAILED`, which is terminal by design —
+repair starts a new attempt rather than reviving one. Recommending abort would
+hand the operator an Operation they could not restart, so the test for this
+follows the message's own advice end to end rather than just matching its text.
+
+The version the guard compares against now travels with the transition into
+`EXECUTING`. It used to keep whatever the record last saw, which meant the
+comparison could be made against a stale number.
+
+Before this, an interrupted run left leases and quarantined partitions behind,
+and a fresh plan version ran the partitions it named alongside them — then
+reported a verification failure, which reads as a data bug and is not one.
+
 ## Not yet
 
 - Adaptive concurrency and rate limits (v1.1)
 - Cutover gates and approvals (v1.1)
-- **Starting a Movement against an Operation that is already executing.** The
-  Day 19 rehearsal hit this: a run interrupted mid-execution leaves leases and
-  quarantined partitions, and starting again on a fresh plan version ran the
-  partitions the new plan named while the old state was still in place, then
-  reported a verification failure. It should refuse and say what to clear
-  instead of half-running (v1.1)
 - Causal claims: Gantry reports correlation with its strength basis stated, and
   does not assert cause

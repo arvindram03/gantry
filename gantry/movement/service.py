@@ -23,7 +23,7 @@ from gantry.core.positions import Checkpoint, CheckpointScope, PositionKind, Sou
 from gantry.core.provenance import DatasetPin, Lineage, Provenance
 from gantry.core.results import ResultStatus
 from gantry.lifecycle.plan import NodeKind, PlanVersion, next_version
-from gantry.lifecycle.states import ActorKind
+from gantry.lifecycle.states import ActorKind, OperationInFlightError
 from gantry.movement.executor import MovementExecutor
 from gantry.movement.model import Movement
 from gantry.movement.partitioning import Partition, PartitionMethod
@@ -35,7 +35,7 @@ from gantry.scheduler.backend import TaskState, WorkflowBackend
 from gantry.scheduler.temporal.runner import connect, movement_worker, start_movement
 from gantry.scheduler.worker import Worker
 from gantry.state.checkpoints import CheckpointStore
-from gantry.state.operations import OperationStore
+from gantry.state.operations import OperationRecord, OperationStore
 from gantry.state.plans import PlanStore
 from gantry.state.verifications import VerificationStore
 from gantry.verification.runner import MovementVerificationRunner, VerificationReport
@@ -61,6 +61,20 @@ class Progress:
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+def _refuse_if_in_flight(record: OperationRecord, requested: int) -> None:
+    """Refuse a plan version that is not the one already executing.
+
+    Only `EXECUTING` blocks. A paused Operation is deliberately replannable -
+    pausing is how an operator stops to change something - and every other
+    state has no work in flight to conflict with.
+    """
+    if record.state is not OperationState.EXECUTING:
+        return
+    if record.current_plan_version == requested:
+        return
+    raise OperationInFlightError(record.name, record.current_plan_version, requested)
 
 
 class MovementService:
@@ -137,6 +151,11 @@ class MovementService:
         self._pins = tuple(DatasetPin.from_version(version) for version in registered)
         self._manifests = manifests
 
+        # Compiling is always safe; submitting is not. Enqueuing a new
+        # version's nodes beside an in-flight run is what produced a
+        # half-finished Movement that then reported a verification failure.
+        _refuse_if_in_flight(record, plan.version)
+
         # The plan has to outlive this process: a Temporal activity worker, or
         # any other worker, reconstructs it rather than recompiling.
         await self._plans.put(plan, self._pins)
@@ -156,6 +175,10 @@ class MovementService:
         backend = self._backend_factory(movement.name)
 
         record = await self._operations.get(movement.name)
+        # Resuming the same version is replay, and the whole design rests on
+        # it. Starting a *different* version on top of a live run is not.
+        _refuse_if_in_flight(record, plan.version)
+
         if record.state in (OperationState.PLANNED, OperationState.PAUSED):
             await self._operations.transition(
                 movement.name,
@@ -168,8 +191,15 @@ class MovementService:
         record = await self._operations.get(movement.name)
         for step in (OperationState.VALIDATED, OperationState.EXECUTING):
             if record.state is not step and _precedes(record.state, step):
+                # Carry the plan version onto the Operation. Without it the
+                # record keeps whatever version it last saw, and the in-flight
+                # guard ends up comparing against a stale number.
                 await self._operations.transition(
-                    movement.name, step, actor=ActorKind.RUNTIME, reason="advancing to execute"
+                    movement.name,
+                    step,
+                    actor=ActorKind.RUNTIME,
+                    reason="advancing to execute",
+                    plan_version=plan.version,
                 )
                 record = await self._operations.get(movement.name)
 
@@ -310,9 +340,10 @@ class MovementService:
         who owns dispatch, retries and timeouts.
         """
         started = self._clock()
+        _refuse_if_in_flight(await self._operations.get(movement.name), plan.version)
         connection = client or await connect()
 
-        await self._advance_to_executing(movement.name)
+        await self._advance_to_executing(movement.name, plan.version)
 
         async with movement_worker(
             connection,
@@ -365,12 +396,16 @@ class MovementService:
                 )
         return result
 
-    async def _advance_to_executing(self, name: str) -> None:
+    async def _advance_to_executing(self, name: str, plan_version: int | None = None) -> None:
         """Walk the operation forward to EXECUTING, whatever state it is in."""
         record = await self._operations.get(name)
         if record.state is OperationState.PAUSED:
             await self._operations.transition(
-                name, OperationState.EXECUTING, actor=ActorKind.OPERATOR, reason="run requested"
+                name,
+                OperationState.EXECUTING,
+                actor=ActorKind.OPERATOR,
+                reason="run requested",
+                plan_version=plan_version,
             )
             return
         for step in (
@@ -381,8 +416,15 @@ class MovementService:
         ):
             record = await self._operations.get(name)
             if _precedes(record.state, step):
+                # The plan version travels with the transition so the record
+                # says which version is actually running - the number the
+                # in-flight guard compares against.
                 await self._operations.transition(
-                    name, step, actor=ActorKind.RUNTIME, reason="advancing to execute"
+                    name,
+                    step,
+                    actor=ActorKind.RUNTIME,
+                    reason="advancing to execute",
+                    plan_version=plan_version,
                 )
 
     async def verify(

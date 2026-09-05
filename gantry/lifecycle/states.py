@@ -67,6 +67,39 @@ class ActorKind(StrEnum):
     AGENT = "agent"
 
 
+class OperationInFlightError(Exception):
+    """A new plan version was aimed at an Operation that is still executing.
+
+    The Day 19 rehearsal found the behaviour this replaces. An interrupted run
+    leaves leases and quarantined partitions behind; planning again produces a
+    new version, because partition bounds come from data that has since moved.
+    Submitting that version enqueued its nodes alongside the old ones, ran the
+    partitions the new plan named, and then reported a verification failure -
+    which reads as a data bug and is not one.
+
+    Refusing is the only honest answer. The runtime cannot know whether the
+    operator wants to resume the old run or replace it, and those need
+    opposite actions.
+    """
+
+    def __init__(self, operation: str, in_flight: int | None, requested: int) -> None:
+        running = "an earlier version" if in_flight is None else f"version {in_flight}"
+        # `pause`, not `abort`. Pausing drains in-flight work and can go back
+        # to PLANNED; aborting reaches FAILED, which is terminal by design -
+        # repair starts a new attempt rather than reviving one. Recommending
+        # abort would leave the operator with an Operation they cannot restart.
+        super().__init__(
+            f"operation {operation!r} is still executing {running}; "
+            f"refusing to start version {requested} alongside it. "
+            f"Wait for it to finish, or `gantry pause {operation} --reason ...` "
+            f"to drain it and then plan again. `gantry status {operation}` shows "
+            f"what is still in flight."
+        )
+        self.operation = operation
+        self.in_flight = in_flight
+        self.requested = requested
+
+
 class IllegalTransitionError(Exception):
     def __init__(self, operation: str, current: OperationState, requested: OperationState) -> None:
         allowed = sorted(state.value for state in _TRANSITIONS[current])
