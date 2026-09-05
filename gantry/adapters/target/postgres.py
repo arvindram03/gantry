@@ -1,0 +1,312 @@
+"""PostgreSQL target adapter.
+
+Two write paths, for two different jobs.
+
+`write_batch` is the correctness path: one `INSERT ... ON CONFLICT DO UPDATE`
+with a `WHERE` clause that skips rows already identical, so a replayed batch
+reports every row unchanged and touches nothing.
+
+`copy_partition` is the throughput path. Rows move source-to-target as COPY
+byte streams into a staging table, then a single `INSERT ... SELECT` merges
+them. Python moves buffers; the engines move rows. Materialising five million
+rows as Python objects to write them back out would put the orchestration layer
+on the data path, which is the one thing the design forbids.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import re
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from datetime import UTC, datetime
+from typing import Protocol, cast
+
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
+
+from gantry.core.commit import CommitResult
+from gantry.core.dataset import DatasetManifest
+from gantry.state.database import transaction
+
+ADAPTER = "postgres"
+
+# Catalog-derived, but validated anyway: nothing interpolated into SQL text
+# should be able to carry a surprise, however it got there.
+_SAFE_TYPE = re.compile(r"^[a-z][a-z0-9 _]*(\(\d+(,\s*\d+)?\))?(\[\])?$")
+_SAFE_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
+
+
+class UnpreparedTargetError(Exception):
+    """Raised when a dataset cannot be written because it lacks a usable key."""
+
+
+class PostgresTargetAdapter:
+    """Writes to a PostgreSQL target."""
+
+    def __init__(self, engine: AsyncEngine) -> None:
+        self._engine = engine
+
+    async def prepare(self, manifest: DatasetManifest, *, target: str) -> None:
+        """Create the target table if it does not exist.
+
+        Secondary indexes are deliberately not created. Every index has to be
+        maintained on each of a hundred million inserts, which is the single
+        largest avoidable cost in a bulk load. The primary key is the exception:
+        idempotent upserts need it to detect a conflict, so it has to exist
+        before the first row lands.
+
+        The deferred indexes are the caller's to create after the snapshot, and
+        before cutover - the plan knows about them because discovery recorded
+        them on the manifest.
+        """
+        schema = manifest.dataset_schema
+        if not schema.fields:
+            raise UnpreparedTargetError(
+                f"dataset {manifest.name!r} has no discovered fields; discover the source first"
+            )
+        if not schema.keys:
+            raise UnpreparedTargetError(
+                f"dataset {manifest.name!r} has no key; idempotent writes need a stable key"
+            )
+
+        columns = ", ".join(
+            f"{_quote(field.name)} {_checked_type(field.type)}"
+            + ("" if field.nullable else " NOT NULL")
+            for field in schema.fields
+        )
+        key = ", ".join(_quote(column) for column in schema.keys)
+        table = _qualified(target)
+
+        async with transaction(self._engine) as connection:
+            await connection.execute(
+                text(f"CREATE TABLE IF NOT EXISTS {table} ({columns}, PRIMARY KEY ({key}))")
+            )
+
+    async def write_batch(
+        self,
+        manifest: DatasetManifest,
+        *,
+        target: str,
+        rows: Sequence[Sequence[object]],
+    ) -> CommitResult:
+        """Upsert rows, reporting exactly what changed."""
+        if not rows:
+            return CommitResult(committed_at=datetime.now(UTC))
+
+        schema = manifest.dataset_schema
+        names = [field.name for field in schema.fields]
+        types = [field.type for field in schema.fields]
+
+        # One statement over column arrays rather than one statement per row.
+        # executemany cannot return rows, and a row-at-a-time loop would put
+        # Python back on the data path.
+        columns = list(zip(*rows, strict=True))
+        payload = {f"v{index}": list(column) for index, column in enumerate(columns)}
+
+        async with transaction(self._engine) as connection:
+            result = await connection.execute(
+                text(_upsert_sql(target, names, types, list(schema.keys))), payload
+            )
+            outcomes = [row[0] for row in result.all()]
+
+        inserted = sum(1 for outcome in outcomes if outcome)
+        # Rows the statement declined to touch never come back from RETURNING,
+        # which is precisely what makes a replay observable: it returns nothing.
+        touched = len(outcomes)
+        return CommitResult(
+            rows_inserted=inserted,
+            rows_updated=touched - inserted,
+            rows_unchanged=len(rows) - touched,
+            committed_at=datetime.now(UTC),
+        )
+
+    async def copy_partition(
+        self,
+        manifest: DatasetManifest,
+        *,
+        target: str,
+        source: AsyncConnection,
+        query: str,
+        query_params: Sequence[object] = (),
+    ) -> CommitResult:
+        """Stream a partition source-to-target without materialising rows.
+
+        The data never becomes Python objects. COPY produces a byte stream on
+        the source connection, a bounded queue hands those bytes to a COPY on
+        the target connection, and the merge from staging happens entirely
+        inside the target. Python moves buffers; the engines move rows.
+        """
+        schema = manifest.dataset_schema
+        names = [field.name for field in schema.fields]
+        staging = _staging_name(target)
+
+        source_raw = _copy_connection(await source.get_raw_connection())
+
+        async with transaction(self._engine) as connection:
+            target_raw = _copy_connection(await connection.get_raw_connection())
+            await connection.execute(
+                text(f"CREATE TEMP TABLE {staging} (LIKE {_qualified(target)}) ON COMMIT DROP")
+            )
+
+            await _pipe_copy(
+                source_raw,
+                target_raw,
+                query=query,
+                params=query_params,
+                staging=staging,
+                columns=names,
+            )
+
+            merged = await connection.execute(
+                text(_merge_sql(target, staging, names, list(schema.keys)))
+            )
+            outcomes = [row[0] for row in merged.all()]
+            staged = (
+                await connection.execute(text(f"SELECT count(*) FROM {staging}"))
+            ).scalar_one()
+
+        inserted = sum(1 for outcome in outcomes if outcome)
+        return CommitResult(
+            rows_inserted=inserted,
+            rows_updated=len(outcomes) - inserted,
+            rows_unchanged=staged - len(outcomes),
+            committed_at=datetime.now(UTC),
+        )
+
+
+def _upsert_sql(
+    target: str, names: Sequence[str], types: Sequence[str], keys: Sequence[str]
+) -> str:
+    columns = ", ".join(_quote(name) for name in names)
+    arrays = ", ".join(
+        f"CAST(:v{index} AS {_checked_type(declared)}[])" for index, declared in enumerate(types)
+    )
+    return (
+        f"INSERT INTO {_qualified(target)} ({columns}) "
+        f"SELECT * FROM unnest({arrays}) "
+        f"ON CONFLICT ({', '.join(_quote(key) for key in keys)}) "
+        f"{_conflict_action(target, names, keys)} "
+        f"RETURNING (xmax = 0) AS inserted"
+    )
+
+
+def _conflict_action(target: str, names: Sequence[str], keys: Sequence[str]) -> str:
+    """What to do when a row already exists.
+
+    The WHERE clause is what makes a replay a no-op. Without it, ON CONFLICT DO
+    UPDATE rewrites every row with identical values, reporting work that did
+    not happen and producing WAL that need not exist.
+    """
+    updatable = [name for name in names if name not in keys]
+    if not updatable:
+        return "DO NOTHING"
+    assignments = ", ".join(f"{_quote(n)} = EXCLUDED.{_quote(n)}" for n in updatable)
+    distinct = " OR ".join(
+        f"{_qualified(target)}.{_quote(n)} IS DISTINCT FROM EXCLUDED.{_quote(n)}" for n in updatable
+    )
+    return f"DO UPDATE SET {assignments} WHERE {distinct}"
+
+
+def _merge_sql(target: str, staging: str, names: Sequence[str], keys: Sequence[str]) -> str:
+    columns = ", ".join(_quote(name) for name in names)
+    return (
+        f"INSERT INTO {_qualified(target)} ({columns}) "
+        f"SELECT {columns} FROM {staging} "
+        f"ON CONFLICT ({', '.join(_quote(key) for key in keys)}) "
+        f"{_conflict_action(target, names, keys)} "
+        f"RETURNING (xmax = 0) AS inserted"
+    )
+
+
+class CopyCapableConnection(Protocol):
+    """The COPY surface of the underlying driver connection.
+
+    asyncpg owns the COPY protocol; SQLAlchemy does not expose it. Declaring
+    the shape here keeps that dependency explicit and type-checked rather than
+    reaching into an untyped attribute.
+    """
+
+    async def copy_from_query(
+        self,
+        query: str,
+        /,
+        *args: object,
+        output: Callable[[bytes], Awaitable[None]],
+        format: str,  # noqa: A002 - the driver's parameter name
+    ) -> str: ...
+
+    async def copy_to_table(
+        self,
+        table_name: str,
+        /,
+        *,
+        source: AsyncIterator[bytes],
+        columns: Sequence[str],
+        format: str,  # noqa: A002 - the driver's parameter name
+    ) -> str: ...
+
+
+def _copy_connection(raw: object) -> CopyCapableConnection:
+    driver = getattr(raw, "driver_connection", None)
+    if driver is None or not hasattr(driver, "copy_from_query"):
+        raise TypeError("target adapter requires an asyncpg connection for COPY")
+    return cast(CopyCapableConnection, driver)
+
+
+async def _pipe_copy(
+    source: CopyCapableConnection,
+    target: CopyCapableConnection,
+    *,
+    query: str,
+    params: Sequence[object],
+    staging: str,
+    columns: Sequence[str],
+) -> None:
+    """Pipe one COPY stream into another with bounded memory.
+
+    The queue is what keeps this a pipe rather than a buffer: collecting the
+    whole stream first would hold a five-million-row partition in memory, which
+    is the failure mode this path exists to avoid.
+    """
+    queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=64)
+
+    async def produce() -> None:
+        try:
+            await source.copy_from_query(query, *params, output=queue.put, format="binary")
+        finally:
+            await queue.put(None)
+
+    async def consume() -> AsyncIterator[bytes]:
+        while (chunk := await queue.get()) is not None:
+            yield chunk
+
+    producer = asyncio.create_task(produce())
+    try:
+        await target.copy_to_table(
+            staging, source=consume(), columns=list(columns), format="binary"
+        )
+    finally:
+        await producer
+
+
+def _quote(identifier: str) -> str:
+    if not _SAFE_IDENT.match(identifier):
+        raise ValueError(f"unsafe identifier: {identifier!r}")
+    return f'"{identifier}"'
+
+
+def _qualified(reference: str) -> str:
+    return ".".join(_quote(part) for part in reference.split("."))
+
+
+def _staging_name(target: str) -> str:
+    suffix = target.replace(".", "_")
+    if not _SAFE_IDENT.match(suffix):
+        raise ValueError(f"unsafe target name: {target!r}")
+    return f"gantry_staging_{suffix}"
+
+
+def _checked_type(declared: str) -> str:
+    if not _SAFE_TYPE.match(declared):
+        raise ValueError(f"unsupported column type: {declared!r}")
+    return declared

@@ -258,6 +258,34 @@ class PostgresSourceAdapter:
             async for batch in result.partitions(batch_size):
                 yield tuple(tuple(row) for row in batch)
 
+    def copy_query(
+        self, manifest: DatasetManifest, partition: Partition
+    ) -> tuple[str, tuple[str, ...]]:
+        """A COPY-able SELECT for one partition, with positional parameters.
+
+        COPY does not go through SQLAlchemy, so this uses the driver's own $N
+        placeholders. Columns are named explicitly and in manifest order: the
+        binary COPY format carries no column names, so both sides must agree on
+        the order or the bytes land in the wrong columns.
+        """
+        preparer = self._engine.dialect.identifier_preparer
+        table = ".".join(preparer.quote(part) for part in manifest.physical.reference.split("."))
+        column = preparer.quote(partition.column)
+        column_type = _column_type(manifest, partition.column)
+        columns = ", ".join(preparer.quote(field.name) for field in manifest.dataset_schema.fields)
+
+        clauses: list[str] = []
+        params: list[str] = []
+        if partition.lo is not None:
+            params.append(partition.lo)
+            clauses.append(f"{column} >= CAST(CAST(${len(params)} AS text) AS {column_type})")
+        if partition.hi is not None:
+            params.append(partition.hi)
+            clauses.append(f"{column} < CAST(CAST(${len(params)} AS text) AS {column_type})")
+        where = " AND ".join(clauses) if clauses else "TRUE"
+
+        return f"SELECT {columns} FROM {table} WHERE {where}", tuple(params)
+
     async def current_position(self) -> SourcePosition:
         async with transaction(self._engine) as connection:
             lsn = (await connection.execute(text("SELECT pg_current_wal_lsn()::text"))).scalar_one()

@@ -73,8 +73,47 @@ of across all buckets, which left the edge partitions covering a different
 number of buckets than the rest and produced **6.08×**. Coverage was exact in
 both cases, which is why balance is measured rather than assumed.
 
+## Day 8 — target writes
+
+962,507 rows (one partition of the 100M-row source), Postgres to Postgres
+across two containers. Target for the day was ≥ 50k rows/sec.
+
+| Path | Time | Throughput |
+|---|---|---|
+| `write_batch` — rows through Python | 10.0 s | **96,044 rows/sec** |
+| `copy_partition` — bytes only | 5.8 s | **166,238 rows/sec** |
+
+Both clear the target. The split of the Python path is where the cost actually
+sits:
+
+| Stage | Time | Throughput |
+|---|---|---|
+| read (server-side cursor) | 1.8 s | 527,299 rows/sec |
+| write (`unnest` + `ON CONFLICT`) | 8.2 s | 117,434 rows/sec |
+
+### Why two paths
+
+`write_batch` materialises the partition as Python objects. That is fine for
+correctness tests and for CDC batches, and unacceptable for a five-million-row
+partition — the memory is unbounded and the orchestration layer ends up on the
+data path.
+
+`copy_partition` moves the same rows as COPY byte streams through a bounded
+queue into a staging table, then merges with one `INSERT ... SELECT`. Python
+moves buffers; the engines move rows. It is 1.7× faster and, more importantly,
+its memory does not scale with partition size.
+
+### Replay costs almost as much as the first write
+
+| | First write | Replay |
+|---|---|---|
+| `copy_partition` | 5.5 s | 4.5 s |
+
+A replay changes zero rows but still transfers and stages every one of them to
+discover that. Retries are cheap in *effect*, not in *work* — which is an
+argument for partitions small enough that replaying one is not expensive.
+
 ## Not yet measured
 
-- Bulk copy throughput (Day 8 — target ≥ 50k rows/sec)
 - Checksum computation by key range (Day 12)
 - CDC apply rate and lag (Days 13–15)
