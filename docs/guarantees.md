@@ -72,8 +72,58 @@ re-verifies only it. This is safe because the copy is idempotent: re-running a
 partition restores exactly the rows that are missing or stale and touches
 nothing else.
 
+## Who owns the CDC position
+
+Design document open question #2, answered for v1: **Gantry owns the applied
+position.** Kafka's consumer group offsets are a transport detail and the
+runtime does not rely on them.
+
+The reason is not distrust of Kafka. A consumer group commit is a *separate
+durability domain* from the target write, so committing an offset after
+applying a change is a second commit that can fail independently — the
+distributed-transaction problem, reintroduced through the back door. Recording
+the transport position in the same store as the checkpoint puts progress in one
+place that either advances or does not.
+
+Two positions are recorded, because they answer different questions:
+
+| Position | Answers | Used for |
+|---|---|---|
+| Stream position (topic:partition:offset) | Where do I resume reading? | Restart |
+| Source LSN | How old is this row version? | Stale-write rejection |
+
+Consumers run with auto-commit disabled. A resumed consumer uses a brand new
+group id in tests specifically to prove that nothing but Gantry's own record
+determines where it starts.
+
+## Replication slots
+
+A replication slot is what makes CDC reliable and what can take a source
+database down. The slot holds WAL until the consumer confirms it, so a consumer
+that stops — crashed, paused, or merely slower than the write rate — makes the
+source accumulate WAL indefinitely until the disk fills and it stops accepting
+writes. The failure is silent right up until it is total.
+
+Two things that only running the real thing teaches, both now handled:
+
+**A connector reports `RUNNING` before its slot exists.** Kafka Connect's health
+says the task started, not that it connected to the source and created the
+slot. Treating those as the same thing lets Prepare complete while nothing is
+capturing, and the gap stays invisible until the snapshot finishes and CDC has
+nothing to catch up from. `wait_for_slot` closes it.
+
+**A slot is not free the instant its connector is deleted.** PostgreSQL refuses
+to drop an active slot, so dropping immediately after teardown fails and leaves
+the slot pinning WAL forever. `drop_slot` waits for the slot to go inactive.
+`drop_orphaned_slots` reclaims what a crashed run abandoned.
+
+Retention is checked against a limit and `check_wal_retention` **raises** rather
+than warning. Continuing to stream while the source fills its disk trades a
+stalled migration for a stopped database, which is much worse than the outcome
+being avoided.
+
 ## Not yet
 
-- CDC ordering and stale-write rejection (Days 13–15)
+- Stale-write rejection and ordering (Day 14)
 - Cutover gates and approvals (v1.1)
 - Analysis verification: row expansion, join coverage, temporal alignment (Day 18)
