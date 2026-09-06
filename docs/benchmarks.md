@@ -315,3 +315,35 @@ It also narrows the honest options for a Beam job that reads Postgres:
 
 Neither is free, and the choice is not obvious. Recorded here so Day 4's
 guarantee table and the cut-line decision rest on a measurement.
+
+### What a `beam` job costs to start
+
+Same machine, warm images, Direct runner inside a container — the same shape as
+Day 0's 0.22 s measurement for the `sql` kind. The pipeline is trivial
+(`Create([1,2,3]) | Map`), so this is overhead and nothing else.
+
+| | `sql` (`postgres:16-alpine`) | `beam` (`apache/beam_python3.12_sdk:2.76.0`) |
+|---|---|---|
+| Image | **411 MB** | **4.08 GB** |
+| Container start → work done | **0.21–0.25 s** | **3.73–4.30 s** |
+| …of which `import apache_beam` | — | 0.53–0.69 s |
+| …of which building and running a trivial pipeline | — | 1.75–2.08 s |
+| Java in the image | not needed | **absent** — so `JdbcIO` cannot run in it either |
+| `psycopg2` in the image | — | present |
+
+**A Beam job costs about 17× the `sql` job in pure startup**, before a row
+moves. Day 0's central affordability claim — 0.22 s of startup means sixty-one
+partitions costs thirteen seconds, so one job per partition holds — does not
+survive the substitution: the same sixty-one partitions cost **about four
+minutes** of overhead under `beam`, on the Direct runner, locally.
+
+The plan predicted grouping would be forced *on Dataflow*, for provisioning and
+quota reasons. It is forced on the local Direct runner too, for a different
+reason, and by enough that the partition-granular checkpoint guarantee cannot
+be offered under `beam` at all — which is what Day 4's guarantee table exists to
+say.
+
+**The image has no Java**, so the JdbcIO option is not "use the official image":
+it is "build and maintain a ~4.5 GB image with a JRE and pre-staged JARs". The
+alternative — a `psycopg` DoFn — works in the official image today, and reads
+rows through Python against a `COPY` baseline of ~180k rows/sec.
