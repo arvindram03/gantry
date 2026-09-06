@@ -244,3 +244,33 @@ runner and the guarantee table has to say so.
 
 **What these numbers are not.** No Kubernetes, no Dataflow, no cold image pull,
 no real network latency between source and target, and narrow rows only.
+
+## v1.2 Day 2 — the generated job, measured through the real path
+
+Same machine and shape as Day 0, but now through `compile_snapshot_job` and
+`DockerRunner` rather than a script written by hand: partition bounds from the
+planner, `--single-transaction`, the staging table, and the counting merge that
+reports what committed. Three runs, 1M narrow rows.
+
+| Path | 1M rows | rows/sec |
+|---|---|---|
+| Generated job, one partition | **5.52–5.65 s** | ~177–181k |
+| Generated job, 8 concurrent partitions | **5.18–5.29 s** | ~189–193k |
+| Day 0 hand-written script, one partition | 6.30 s | ~159k |
+| Day 0 hand-written script, 8 concurrent | 4.41 s | ~227k |
+
+The single-job case is slightly *faster* than the hand-written Day 0 script, so
+the counting merge and the staging table cost nothing measurable.
+
+**The 8-way speedup did not reproduce.** Day 0 measured a 30% gain from
+splitting; the real path gains about 6%. The cause is not established, and the
+candidates — Docker CLI submissions serialising at the daemon, contention on
+the single target, uneven partition bounds from the planner where Day 0 used
+hand-picked ranges — have not been separated. It is recorded here as an open
+question rather than explained away, because the partition count is a knob
+operators will reach for and this says it currently buys much less than Day 0
+implied.
+
+Each run cross-checks the reported counts against the target's own row count;
+they agreed exactly (1,000,000 both ways) on every run, which is the same
+attestation a checkpoint rests on.

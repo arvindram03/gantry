@@ -363,6 +363,34 @@ regression through.
 **Exit:** Postgres→Postgres with **no bytes through any Gantry process**, the
 chaos suite green against it, and the relay gone.
 
+**Done.** All of the above, in that order. 128 lines left `adapters/target/`.
+Three findings worth carrying forward:
+
+1. **Two of the new integration tests asserted nothing, and mutation testing is
+   what found it.** The injection test checked the *target* survived while the
+   partition bound lands in the *source*-side COPY, and its payload could not
+   close the `COPY (…)` it sat inside, so the worst it could produce was a parse
+   error. The atomicity test could not fail at all: the only write to the real
+   target is the final merge, so statement atomicity alone left nothing behind.
+   Both now fail when the thing they describe is broken. **Every guarantee test
+   from here gets a mutation check** — writing the test is not the same as
+   having it.
+
+2. **A finished container is not a cached answer.** `submit` adopted any
+   container with the job's content-derived name, including an exited one, so a
+   second run returned the first run's output as its own. The whole integration
+   suite reported success while moving zero rows. Adoption is for work still in
+   flight; whether finished work needs doing again is the engine's judgement,
+   held in its checkpoints. This is worth re-checking for **every** runner added
+   later — a Kubernetes Job or a Dataflow job has exactly the same shape of
+   trap, and the failure is silent success.
+
+3. **The unit test tested the half I remembered to write.** The merge guarded
+   against overwriting newer rows but never stamped them with the snapshot
+   position; the unit test asserted the guard's text appeared in the script, so
+   it passed. Only a handoff test on real databases caught it. Assertions on
+   generated SQL check what was written, never what was omitted.
+
 ---
 
 ## 4. Days 3–4 — the `beam` job kind
