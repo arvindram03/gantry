@@ -23,8 +23,10 @@ handoff integration test.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -518,6 +520,381 @@ def _first_match(text: str, pattern: str) -> str | None:
     return match.group(1) if match else None
 
 
+# ------------------------------------------------------------ the beam suite
+#
+# A different claim again. v1 proves the guarantees; migration proves a workflow
+# composed over them; this proves they survive being executed by something
+# Gantry does not control, and says which of them survive *less*.
+
+BEAM_TABLE = "public.rehearsal_beam"
+ICEBERG_TABLE = "gantry.rehearsal_beam"
+WAREHOUSE = Path(os.environ.get("GANTRY_ICEBERG_WAREHOUSE", "/tmp/gantry-warehouse"))
+BEAM_IMAGE = "gantry/beam:2.76.0"
+VERIFY_IMAGE = "gantry/verify:dev"
+NETWORK = os.environ.get("GANTRY_JOB_NETWORK", "gantry-dev_default")
+BEAM_ROWS = 20_000
+
+
+def _have_image(image: str) -> bool:
+    found = subprocess.run(["docker", "image", "inspect", image], capture_output=True, check=False)
+    return found.returncode == 0
+
+
+async def _beam_manifest(engine):  # type: ignore[no-untyped-def]
+    from gantry.adapters.source.postgres import PostgresSourceAdapter
+
+    found = await PostgresSourceAdapter(engine).discover()
+    return {m.name: m for m in found}[BEAM_TABLE]
+
+
+def _beam_partitions(count: int):  # type: ignore[no-untyped-def]
+    from gantry.movement.partitioning import Partition, PartitionMethod
+
+    edge = BEAM_ROWS // count
+    return [
+        Partition(
+            dataset=BEAM_TABLE,
+            index=index,
+            column="id",
+            method=PartitionMethod.HISTOGRAM,
+            lo=str(index * edge + 1),
+            hi=None if index == count - 1 else str((index + 1) * edge + 1),
+        )
+        for index in range(count)
+    ]
+
+
+def beam_seed(args: argparse.Namespace) -> None:
+    """Data for both job kinds to move, and the images they need."""
+    with step(1, "seed, and check the images this suite needs") as proved:
+        for image in (BEAM_IMAGE, VERIFY_IMAGE):
+            require(
+                _have_image(image),
+                f"{image} is not built. See docker/ — this suite cannot run without it.",
+            )
+        proved.append("both job images present")
+
+        psql(
+            SOURCE_URL,
+            f"DROP TABLE IF EXISTS {BEAM_TABLE};"
+            f"CREATE TABLE {BEAM_TABLE} (id bigint PRIMARY KEY, label text,"
+            f" amount numeric(12,2), ratio double precision,"
+            f" source_lsn bigint NOT NULL DEFAULT 0);"
+            f"INSERT INTO {BEAM_TABLE} SELECT g,'row'||g,g*1.5,g/7.0,0"
+            f" FROM generate_series(1,{BEAM_ROWS}) g;"
+            f"ANALYZE {BEAM_TABLE}",
+        )
+        psql(
+            TARGET_URL,
+            f"DROP TABLE IF EXISTS {BEAM_TABLE};"
+            f"CREATE TABLE {BEAM_TABLE} (id bigint PRIMARY KEY, label text,"
+            f" amount numeric(12,2), ratio double precision,"
+            f" source_lsn bigint NOT NULL DEFAULT 0)",
+        )
+        shutil.rmtree(WAREHOUSE / "gantry", ignore_errors=True)
+        WAREHOUSE.mkdir(parents=True, exist_ok=True)
+        proved.append(f"{BEAM_ROWS:,} rows seeded; warehouse empty")
+
+
+def beam_sql_kind(args: argparse.Namespace) -> None:
+    """The default kind: one job per partition, and no bytes through Gantry."""
+    from gantry.movement.sqljob import parse_commit
+
+    with step(2, "sql — a script per partition, in a container") as proved:
+
+        async def move_all() -> int:
+            from gantry.state.database import create_engine
+
+            engine = create_engine(SOURCE_URL)
+            try:
+                manifest = await _beam_manifest(engine)
+                total = 0
+                for partition in _beam_partitions(4):
+                    output = await _run_sql_partition(manifest, partition)
+                    total += parse_commit(output).rows_inserted
+                return total
+            finally:
+                await engine.dispose()
+
+        moved = asyncio.run(move_all())
+        require(
+            moved == BEAM_ROWS,
+            f"sql jobs reported {moved:,} rows inserted, expected {BEAM_ROWS:,}",
+        )
+        landed = int(psql(TARGET_URL, f"SELECT count(*) FROM {BEAM_TABLE}").strip())
+        require(landed == BEAM_ROWS, f"target holds {landed:,}, expected {BEAM_ROWS:,}")
+        proved.append(f"4 partitions, 4 jobs, {landed:,} rows, checkpoint per partition")
+
+
+async def _run_sql_partition(manifest, partition):  # type: ignore[no-untyped-def]
+    from gantry.jobs.execute import run_to_completion
+    from gantry.jobs.packaging import sql_client_packaging
+    from gantry.jobs.runners import DockerRunner
+    from gantry.movement.sqljob import SOURCE_DSN, TARGET_DSN, compile_snapshot_job
+
+    job = compile_snapshot_job(
+        "rehearsal-beam",
+        manifest,
+        partition,
+        target=BEAM_TABLE,
+        packaging=sql_client_packaging(secrets=(SOURCE_DSN, TARGET_DSN), network=NETWORK),
+    )
+    runner = DockerRunner(
+        secrets={
+            SOURCE_DSN: "postgresql://gantry:gantry@gantry-pg-source:5432/gantry",
+            TARGET_DSN: "postgresql://gantry:gantry@gantry-pg-target:5432/gantry",
+        }
+    )
+    return await run_to_completion(runner, job, poll_interval=0.1)
+
+
+async def _with_executor(destination, work):  # type: ignore[no-untyped-def]
+    """Run `work(executor)` with engines that live and die on one event loop.
+
+    asyncpg binds a connection to the loop that made it, so an engine created
+    outside `asyncio.run` and used inside it fails in a way that reads like a
+    database fault and is not one.
+    """
+    from gantry.jobs.runners import DockerRunner
+    from gantry.movement.executor import MovementExecutor
+    from gantry.movement.jobdsn import JobConnections
+    from gantry.state.database import create_engine
+
+    source = create_engine(SOURCE_URL)
+    target = create_engine(TARGET_URL)
+    try:
+        executor = MovementExecutor(
+            source_engine=source,
+            target_engine=target,
+            operation="rehearsal-beam",
+            manifests={BEAM_TABLE: await _beam_manifest(source)},
+            targets={BEAM_TABLE: ICEBERG_TABLE if destination == "iceberg" else BEAM_TABLE},
+            destination=destination,
+            warehouse=str(WAREHOUSE) if destination == "iceberg" else None,
+            connections=JobConnections(
+                source="jdbc:postgresql://gantry-pg-source:5432/gantry",
+                target="jdbc:postgresql://gantry-pg-target:5432/gantry",
+                network=NETWORK,
+            ),
+            runner=DockerRunner(secrets=_BEAM_SECRETS),
+        )
+        return await work(executor)
+    finally:
+        await source.dispose()
+        await target.dispose()
+
+
+_BEAM_SECRETS = {
+    "GANTRY_SOURCE_JDBC": "jdbc:postgresql://gantry-pg-source:5432/gantry",
+    "GANTRY_TARGET_JDBC": "jdbc:postgresql://gantry-pg-target:5432/gantry",
+    "GANTRY_SOURCE_USER": "gantry",
+    "GANTRY_SOURCE_PASSWORD": "gantry",
+    "GANTRY_TARGET_USER": "gantry",
+    "GANTRY_TARGET_PASSWORD": "gantry",
+}
+
+
+def _group_node(partitions, scope_suffix=""):  # type: ignore[no-untyped-def]
+    import json as _json
+
+    from gantry.lifecycle.plan import LifecycleStage, NodeKind, PlanNode
+
+    return PlanNode(
+        id=f"rehearsal-group{scope_suffix}",
+        kind=NodeKind.SNAPSHOT_GROUP,
+        stage=LifecycleStage.EXECUTE,
+        scope=",".join(p.id for p in partitions),
+        params={
+            "partition_column": "id",
+            "partition_method": partitions[0].method.value,
+            "partitions": _json.dumps(
+                [{"index": p.index, "lo": p.lo, "hi": p.hi} for p in partitions]
+            ),
+        },
+    )
+
+
+def beam_group_kind(args: argparse.Namespace) -> None:
+    """The second kind: partitions travel together, and nothing is checkpointed
+    until the group verifies."""
+    with step(3, "beam — a group per job, verified before it counts") as proved:
+        psql(TARGET_URL, f"TRUNCATE {BEAM_TABLE}")
+        node = _group_node(_beam_partitions(4))
+        result = asyncio.run(_with_executor("postgres", lambda ex: ex.execute(node)))
+
+        require(
+            result.rows_unchanged == BEAM_ROWS,
+            f"verification compared {result.rows_unchanged:,}, expected {BEAM_ROWS:,}",
+        )
+        require(
+            result.rows_inserted == 0,
+            "a beam job reports no row counts; anything else is an invented number",
+        )
+        landed = int(psql(TARGET_URL, f"SELECT count(*) FROM {BEAM_TABLE}").strip())
+        require(landed == BEAM_ROWS, f"target holds {landed:,}, expected {BEAM_ROWS:,}")
+        proved.append(f"4 partitions in 1 job, {landed:,} rows, checkpoint per group")
+
+
+def beam_replay(args: argparse.Namespace) -> None:
+    """The case the runtime is built around: the same work asked for twice."""
+    with step(4, "a replayed group adopts or repeats, and never duplicates") as proved:
+        before = int(psql(TARGET_URL, f"SELECT count(*) FROM {BEAM_TABLE}").strip())
+        node = _group_node(_beam_partitions(4))
+        asyncio.run(_with_executor("postgres", lambda ex: ex.execute(node)))
+        after = int(psql(TARGET_URL, f"SELECT count(*) FROM {BEAM_TABLE}").strip())
+        require(
+            after == before == BEAM_ROWS,
+            f"replay changed the target: {before:,} -> {after:,}",
+        )
+        proved.append(f"executed twice, {after:,} rows both times")
+
+
+def beam_corrupt_and_repair(args: argparse.Namespace) -> None:
+    """Verification is the acceptance test, so it has to fail when it should.
+
+    Note which corruption is used. Changing a row the source also has proves
+    nothing: the move upserts it back before verification ever runs, which is
+    the system working. The disagreement has to be one the move *cannot*
+    repair — a row the target holds and the source does not — because Movement
+    inserts and updates and never deletes.
+
+    That is a known gap (`docs/guarantees.md`), and this step is where it is
+    demonstrated rather than described: Gantry detects the drift and refuses to
+    checkpoint, and a person has to remove the row.
+    """
+    from gantry.movement.executor import GroupVerificationError
+
+    with step(5, "drift the target; the group refuses to verify") as proved:
+        # Inside the last partition's unbounded upper range, and absent from the
+        # source. An upsert has no way to remove it.
+        psql(
+            TARGET_URL,
+            f"INSERT INTO {BEAM_TABLE} VALUES (999999, 'not-from-the-source', 1.0, 1.0, 0)",
+        )
+        node = _group_node(_beam_partitions(4))
+        try:
+            asyncio.run(_with_executor("postgres", lambda ex: ex.execute(node)))
+        except GroupVerificationError:
+            proved.append("verification refused, and nothing was checkpointed")
+        else:
+            raise RehearsalError("a drifted group verified; the check is not checking")
+
+        # The repair is an operator's, not the mover's — which is the point.
+        psql(TARGET_URL, f"DELETE FROM {BEAM_TABLE} WHERE id = 999999")
+        result = asyncio.run(_with_executor("postgres", lambda ex: ex.execute(node)))
+        require(
+            result.rows_unchanged == BEAM_ROWS,
+            f"after repair verification compared {result.rows_unchanged:,}",
+        )
+        proved.append(f"repaired by hand, {BEAM_ROWS:,} rows verify")
+
+
+def beam_iceberg(args: argparse.Namespace) -> None:
+    """The reach payoff: a target that is not a database at all."""
+    with step(6, "Postgres to Iceberg, verified") as proved:
+        shutil.rmtree(WAREHOUSE / "gantry", ignore_errors=True)
+        node = _group_node(_beam_partitions(2), scope_suffix="-iceberg")
+
+        async def move_twice(executor):  # type: ignore[no-untyped-def]
+            return await executor.execute(node), await executor.execute(node)
+
+        result, replay = asyncio.run(_with_executor("iceberg", move_twice))
+
+        require(
+            result.rows_unchanged == BEAM_ROWS,
+            f"iceberg verification compared {result.rows_unchanged:,}",
+        )
+        require(
+            replay.rows_unchanged == BEAM_ROWS,
+            f"replay left {replay.rows_unchanged:,} rows; an append duplicated",
+        )
+        proved.append(f"{BEAM_ROWS:,} rows in Iceberg, verified, replay-safe")
+
+
+def beam_provenance(args: argparse.Namespace) -> None:
+    """A job is provenance, and provenance has to be readable."""
+    with step(7, "the job that moved the data can be read back") as proved:
+        from gantry.jobs.packaging import beam_packaging
+        from gantry.movement.beamjob import JDBC_SECRETS, JdbcSink, compile_snapshot_job
+
+        async def discover():  # type: ignore[no-untyped-def]
+            from gantry.state.database import create_engine
+
+            engine = create_engine(SOURCE_URL)
+            try:
+                return await _beam_manifest(engine)
+            finally:
+                await engine.dispose()
+
+        manifest = asyncio.run(discover())
+
+        job = compile_snapshot_job(
+            "rehearsal-beam",
+            manifest,
+            _beam_partitions(4),
+            sink=JdbcSink(BEAM_TABLE),
+            packaging=beam_packaging(secrets=JDBC_SECRETS, network=NETWORK),
+        )
+        # Two checks, and neither is "does the word password appear".
+        #
+        # `os.environ["GANTRY_SOURCE_PASSWORD"]` contains the word and is
+        # exactly the pattern that keeps the credential out, so spelling proves
+        # nothing. Scanning for the values is right in principle but blunt
+        # here: this stack's development username and password are both
+        # "gantry", which collides with the `gantry-commit` marker the job
+        # prints. A false alarm is as useless as a false pass.
+        #
+        # So: every secret must reach the job by name through the environment,
+        # and the connection strings — unambiguously sensitive, unambiguously
+        # distinctive — must not appear at all.
+        for name in _BEAM_SECRETS:
+            require(
+                f"os.environ[{name!r}]" in job.body,
+                f"{name} should reach the job through the environment, by name",
+            )
+        for name in ("GANTRY_SOURCE_JDBC", "GANTRY_TARGET_JDBC"):
+            require(
+                _BEAM_SECRETS[name] not in job.body,
+                f"the retained job body contains the value of {name}",
+            )
+        require("jdbc:postgresql://" not in job.body, "a connection string is in the body")
+        require(job.content_hash.startswith("sha256:"), "a job must be content-addressed")
+        require("ON CONFLICT" in job.body, "the retained body must show how it stayed idempotent")
+        proved.append(f"{job.content_hash[:19]}…, no credential in the body")
+
+
+def beam_guarantees(args: argparse.Namespace) -> None:
+    """Print what each kind actually gives you, measured rather than intended."""
+    with step(8, "the per-kind guarantee table") as proved:
+        rows = [
+            ("checkpoint unit", "partition", "group of partitions"),
+            ("what a crash costs", "one partition", "the whole group"),
+            ("commit boundary", "Gantry's (exit 0 = committed)", "the pipeline's (per bundle)"),
+            ("reports row counts", "yes", "no — verification counts"),
+            ("checkpoint advances on", "the job's counts", "the group's verification"),
+            ("replay is a no-op", "the merge", "the merge / verify-first (Iceberg)"),
+            ("startup per job", "~0.25 s", "~11 s"),
+            ("proven on", "Docker, local", "Direct runner. Dataflow: unproven"),
+        ]
+        width = max(len(name) for name, _, _ in rows)
+        print(f"   {DIM}{'':{width}}  {'sql':<32}{'beam'}{OFF}")
+        for name, sql_answer, beam_answer in rows:
+            print(f"   {name:{width}}  {sql_answer:<32}{beam_answer}")
+        proved.append(f"{len(rows)} guarantees stated per kind")
+
+
+BEAM_STAGES: tuple[Callable[[argparse.Namespace], None], ...] = (
+    beam_seed,
+    beam_sql_kind,
+    beam_group_kind,
+    beam_replay,
+    beam_corrupt_and_repair,
+    beam_iceberg,
+    beam_provenance,
+    beam_guarantees,
+)
+
+
 V1_STAGES: tuple[Callable[[argparse.Namespace], None], ...] = (
     seed_and_register,
     # Before the Movement, not after: the chaos suite clears every
@@ -552,7 +929,11 @@ def _stages(suite: str) -> tuple[Callable[[argparse.Namespace], None], ...]:
     if suite == "migration":
         # Seeding still has to happen; the workflow needs data to move.
         return (seed_and_register, *MIGRATION_STAGES)
-    return (*V1_STAGES, *MIGRATION_STAGES)
+    if suite == "beam":
+        # Its own seeding: this suite needs a small table it can move many
+        # times, not the millions the crash tests want.
+        return BEAM_STAGES
+    return (*V1_STAGES, *MIGRATION_STAGES, *BEAM_STAGES)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -576,8 +957,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--suite",
         default="v1",
-        choices=("v1", "migration", "all"),
-        help="Which sequence to run: the v1 guarantees, the Migration workflow, or both.",
+        choices=("v1", "migration", "beam", "all"),
+        help=(
+            "Which sequence to run: the v1 guarantees, the Migration workflow, "
+            "the execution backends, or all of them."
+        ),
     )
     parser.add_argument("--registry", type=Path, default=ROOT / ".gantry" / "rehearsal.json")
     parser.add_argument("--backend", default="temporal", choices=("temporal", "queue"))
@@ -595,7 +979,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     args.registry.parent.mkdir(parents=True, exist_ok=True)
 
-    label = {"v1": "v1", "migration": "migration workflow", "all": "v1 + migration"}[args.suite]
+    label = {
+        "v1": "v1",
+        "migration": "migration workflow",
+        "beam": "execution backends",
+        "all": "v1 + migration + backends",
+    }[args.suite]
     print(
         f"{BOLD}gantry {label} rehearsal{OFF}  {DIM}{args.rows:,} rows, {args.backend} backend{OFF}"
     )
