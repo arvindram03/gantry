@@ -332,10 +332,29 @@ Day 0's 0.22 s measurement for the `sql` kind. The pipeline is trivial
 | `psycopg2` in the image | — | present |
 
 **A Beam job costs about 17× the `sql` job in pure startup**, before a row
-moves. Day 0's central affordability claim — 0.22 s of startup means sixty-one
+moves. Day 0's affordability claim — 0.22 s of startup means sixty-one
 partitions costs thirteen seconds, so one job per partition holds — does not
 survive the substitution: the same sixty-one partitions cost **about four
 minutes** of overhead under `beam`, on the Direct runner, locally.
+
+**Read this as a selection rule, not as a verdict on Beam.** Postgres to
+Postgres at a million rows on one machine is the `sql` kind's workload, and
+measuring Beam against it measures the wrong thing — it is a distributed
+pipeline being timed on its startup. The two kinds exist for different shapes of
+work:
+
+| | `sql` | `beam` |
+|---|---|---|
+| For | ordinary databases, one source to one target | large volumes across heterogeneous sources and sinks |
+| Startup | ~0.25 s | ~11 s, which is noise at the volumes it is for |
+| Checkpoint unit | one partition | a group of partitions |
+| Reach | wherever `psql` can connect | wherever Beam has an I/O connector |
+
+The numbers below are therefore the price of using `beam` for `sql`-shaped work,
+which is a thing to avoid rather than a thing to fix. What they genuinely settle
+is the *checkpoint granularity*: at eleven seconds a job, one job per partition
+is not affordable, so `beam` checkpoints per group and the guarantee table has
+to say so.
 
 The plan predicted grouping would be forced *on Dataflow*, for provisioning and
 quota reasons. It is forced on the local Direct runner too, for a different
