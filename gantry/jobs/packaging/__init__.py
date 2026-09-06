@@ -11,9 +11,11 @@ from __future__ import annotations
 from gantry.jobs.packaging.container import (
     DEFAULT_BEAM_IMAGE,
     DEFAULT_SQL_IMAGE,
+    DEFAULT_VERIFY_IMAGE,
     ContainerPackaging,
     beam_packaging,
     sql_client_packaging,
+    verification_packaging,
 )
 from gantry.jobs.packaging.kind import PackagingKind
 
@@ -24,9 +26,11 @@ Packaging = ContainerPackaging
 __all__ = [
     "DEFAULT_BEAM_IMAGE",
     "DEFAULT_SQL_IMAGE",
+    "DEFAULT_VERIFY_IMAGE",
     "ContainerPackaging",
     "Packaging",
     "PackagingKind",
     "beam_packaging",
     "sql_client_packaging",
+    "verification_packaging",
 ]

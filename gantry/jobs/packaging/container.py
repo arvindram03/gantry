@@ -148,3 +148,24 @@ def beam_packaging(
         mounts=mounts,
         interpreter=("python", "-c"),
     )
+
+
+# The image a verification job runs in: Python, pyiceberg, and Gantry itself, so
+# the checksum is the same code the rest of the system uses. Built rather than
+# pulled; see docker/verify/Dockerfile.
+DEFAULT_VERIFY_IMAGE = "gantry/verify:dev"
+
+
+def verification_packaging(
+    *,
+    mounts: tuple[tuple[str, str], ...] = (),
+    image: str = DEFAULT_VERIFY_IMAGE,
+    secrets: tuple[str, ...] = (),
+) -> ContainerPackaging:
+    """Packaging for a job that reads a target and reports one checksum."""
+    return ContainerPackaging(
+        image=image,
+        secrets=secrets,
+        mounts=mounts,
+        interpreter=("python", "-c"),
+    )

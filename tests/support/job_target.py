@@ -31,7 +31,7 @@ from gantry.adapters.source.postgres import PostgresSourceAdapter
 from gantry.jobs import JobState
 from gantry.jobs.packaging import beam_packaging, sql_client_packaging
 from gantry.jobs.runners import DockerRunner
-from gantry.movement.beamjob import JDBC_SECRETS
+from gantry.movement.beamjob import JDBC_SECRETS, JdbcSink
 from gantry.movement.beamjob import compile_snapshot_job as beam_compile_snapshot_job
 from gantry.movement.partitioning import Partition, PartitionMethod
 from gantry.movement.sqljob import SOURCE_DSN, TARGET_DSN, compile_snapshot_job
@@ -183,7 +183,7 @@ class SqlJobTarget(JobBackedTarget):
             "chaos",
             manifest,
             partition,
-            target=TABLE,
+            sink=JdbcSink(TABLE),
             packaging=sql_client_packaging(secrets=(SOURCE_DSN, TARGET_DSN), network=network),
         )
 
@@ -212,6 +212,6 @@ class BeamJobTarget(JobBackedTarget):
             "chaos",
             manifest,
             [partition],
-            target=TABLE,
+            sink=JdbcSink(TABLE),
             packaging=beam_packaging(secrets=JDBC_SECRETS, network=network),
         )

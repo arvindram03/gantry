@@ -17,6 +17,7 @@ from gantry.jobs.model import JobKind
 from gantry.jobs.packaging import beam_packaging
 from gantry.movement.beamjob import (
     JDBC_SECRETS,
+    JdbcSink,
     compile_snapshot_job,
     snapshot_pipeline,
     unit_of,
@@ -79,7 +80,8 @@ class TestThePipeline:
     def test_bounds_come_from_the_plan(self) -> None:
         """Never recomputed: recomputing lets a partition move under a replay."""
         query = constant(
-            snapshot_pipeline(manifest(), [partition()], target="public.orders_copy"), "QUERY"
+            snapshot_pipeline(manifest(), [partition()], sink=JdbcSink("public.orders_copy")),
+            "QUERY",
         )
         assert "CAST('1000' AS bigint)" in query
         assert "CAST('2000' AS bigint)" in query
@@ -90,7 +92,7 @@ class TestThePipeline:
         body = snapshot_pipeline(
             manifest(),
             [partition(0, "1", "100"), partition(1, "500", "600")],
-            target="public.orders_copy",
+            sink=JdbcSink("public.orders_copy"),
         )
         assert body.count('order_id" >=') == 2
         assert " OR " in body
@@ -98,7 +100,7 @@ class TestThePipeline:
     def test_the_write_is_an_upsert_not_an_insert(self) -> None:
         """Beam's own JDBC write is a plain INSERT, which a replay duplicates.
         Idempotence is Gantry's guarantee and is passed explicitly."""
-        body = snapshot_pipeline(manifest(), [partition()], target="public.orders_copy")
+        body = snapshot_pipeline(manifest(), [partition()], sink=JdbcSink("public.orders_copy"))
         upsert = constant(body, "UPSERT")
         assert "ON CONFLICT" in upsert
         assert "DO UPDATE SET" in upsert
@@ -108,7 +110,8 @@ class TestThePipeline:
         """JdbcIO binds positionally, so a missing placeholder is a silent
         column shift rather than an error."""
         upsert = constant(
-            snapshot_pipeline(manifest(), [partition()], target="public.orders_copy"), "UPSERT"
+            snapshot_pipeline(manifest(), [partition()], sink=JdbcSink("public.orders_copy")),
+            "UPSERT",
         )
         assert upsert.count("?") == 3
 
@@ -117,7 +120,7 @@ class TestThePipeline:
         later point that still knows what the position was."""
         query = constant(
             snapshot_pipeline(
-                manifest(), [partition()], target="public.orders_copy", snapshot_lsn=99
+                manifest(), [partition()], sink=JdbcSink("public.orders_copy"), snapshot_lsn=99
             ),
             "QUERY",
         )
@@ -125,7 +128,7 @@ class TestThePipeline:
 
     def test_no_credential_appears_in_the_body(self) -> None:
         """The body is retained as provenance and is meant to be read."""
-        body = snapshot_pipeline(manifest(), [partition()], target="public.orders_copy")
+        body = snapshot_pipeline(manifest(), [partition()], sink=JdbcSink("public.orders_copy"))
         for secret in JDBC_SECRETS:
             assert f"os.environ[{secret!r}]" in body
         assert "password='" not in body
@@ -133,7 +136,7 @@ class TestThePipeline:
 
     def test_a_job_with_no_partitions_is_refused(self) -> None:
         with pytest.raises(ValueError, match="at least one partition"):
-            snapshot_pipeline(manifest(), [], target="public.orders_copy")
+            snapshot_pipeline(manifest(), [], sink=JdbcSink("public.orders_copy"))
 
 
 class TestTheJob:
@@ -148,14 +151,14 @@ class TestTheJob:
             "orders-replication",
             manifest(),
             [partition()],
-            target="public.orders_copy",
+            sink=JdbcSink("public.orders_copy"),
             packaging=packaging(),  # type: ignore[arg-type]
         )
         second = compile_snapshot_job(
             "orders-replication",
             manifest(),
             [partition()],
-            target="public.orders_copy",
+            sink=JdbcSink("public.orders_copy"),
             packaging=packaging(),  # type: ignore[arg-type]
         )
         assert first.kind is JobKind.BEAM
@@ -166,14 +169,14 @@ class TestTheJob:
             "orders-replication",
             manifest(),
             [partition(0)],
-            target="public.orders_copy",
+            sink=JdbcSink("public.orders_copy"),
             packaging=packaging(),  # type: ignore[arg-type]
         )
         two = compile_snapshot_job(
             "orders-replication",
             manifest(),
             [partition(0), partition(1, "9000", "9999")],
-            target="public.orders_copy",
+            sink=JdbcSink("public.orders_copy"),
             packaging=packaging(),  # type: ignore[arg-type]
         )
         assert one.content_hash != two.content_hash
@@ -185,7 +188,7 @@ class TestTheJob:
             "orders-replication",
             manifest(),
             [partition()],
-            target="public.orders_copy",
+            sink=JdbcSink("public.orders_copy"),
             packaging=packaging(),  # type: ignore[arg-type]
         )
         assert job.packaging.interpreter == ("python", "-c")

@@ -13,6 +13,7 @@ with a local filesystem it has to be arranged.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -27,7 +28,11 @@ from gantry.core import DatasetManifest
 from gantry.jobs.model import Job, JobKind
 from gantry.jobs.packaging import ContainerPackaging
 from gantry.jobs.runners import DockerRunner
+from gantry.lifecycle.plan import LifecycleStage, NodeKind, PlanNode
+from gantry.movement.executor import MovementExecutor
 from gantry.movement.iceberg import GroupOutcome, ensure_group
+from gantry.movement.jobdsn import JobConnections
+from gantry.movement.partitioning import PartitionMethod
 from gantry.state.database import create_engine, transaction
 from gantry.verification.checksum import compute_checksum
 from gantry.verification.iceberg import checksum_script, parse_checksum
@@ -240,3 +245,65 @@ async def test_a_replayed_group_does_not_duplicate_rows(source: AsyncEngine) -> 
     assert not second.moved, "the replay must skip the move entirely"
     assert second.checksum == expected
     assert second.checksum.rows == ROWS, "the rows were appended twice"
+
+
+def _group_node(bounds: list[tuple[int, str | None, str | None]]) -> PlanNode:
+    return PlanNode(
+        id="iceberg-group",
+        kind=NodeKind.SNAPSHOT_GROUP,
+        stage=LifecycleStage.EXECUTE,
+        scope=",".join(f"{TABLE}/{index:05d}" for index, _, _ in bounds),
+        params={
+            "partition_column": "id",
+            "partition_method": PartitionMethod.HISTOGRAM.value,
+            "partitions": json.dumps([{"index": i, "lo": lo, "hi": hi} for i, lo, hi in bounds]),
+        },
+    )
+
+
+def _executor(source: AsyncEngine, manifest: DatasetManifest) -> MovementExecutor:
+    return MovementExecutor(
+        source_engine=source,
+        target_engine=source,  # unused for an iceberg destination
+        operation="iceberg-movement",
+        manifests={TABLE: manifest},
+        targets={TABLE: ICEBERG_TABLE},
+        destination="iceberg",
+        warehouse=str(WAREHOUSE),
+        connections=JobConnections(
+            source="jdbc:postgresql://gantry-pg-source:5432/gantry",
+            target="unused",
+            network=NETWORK,
+        ),
+        runner=DockerRunner(
+            secrets={
+                "GANTRY_SOURCE_JDBC": "jdbc:postgresql://gantry-pg-source:5432/gantry",
+                "GANTRY_TARGET_JDBC": "unused",
+                "GANTRY_SOURCE_USER": "gantry",
+                "GANTRY_SOURCE_PASSWORD": "gantry",
+                "GANTRY_TARGET_USER": "gantry",
+                "GANTRY_TARGET_PASSWORD": "gantry",
+            }
+        ),
+    )
+
+
+async def test_a_movement_group_lands_in_iceberg_through_the_executor(
+    source: AsyncEngine,
+) -> None:
+    """The whole path, not the pieces.
+
+    A plan node goes in; a verified Iceberg table comes out, and the
+    CommitResult that permits a checkpoint is produced by the verification
+    rather than by the job saying it finished.
+    """
+    manifest = await manifest_of(source)
+    executor = _executor(source, manifest)
+    node = _group_node([(0, "1", "501"), (1, "501", "1001")])
+
+    result = await executor.execute(node)
+    assert result.rows_unchanged == ROWS, "verification counts what it compared"
+
+    # And again: the replay must not append a second copy.
+    replay = await executor.execute(node)
+    assert replay.rows_unchanged == ROWS

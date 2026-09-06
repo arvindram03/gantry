@@ -180,9 +180,11 @@ Stated here rather than discovered later:
   Verification *detects* the disagreement — a group will fail to reconcile —
   but nothing repairs it, so the group will retry indefinitely. Movement is
   insert-and-update only today.
-- **Iceberg targets are not wired into `MovementExecutor`.** The pieces are
-  proven end to end in the integration suite; declaring an Iceberg target in a
-  Movement spec is not yet possible.
+- **An Iceberg destination is configured on the executor, not in the spec.** A
+  Movement group lands in Iceberg through `MovementExecutor` and is verified,
+  but the warehouse location is passed to the executor rather than read from the
+  Movement's `destination` endpoint. Wiring `adapter: iceberg` through the spec
+  is a small piece of work that has not been done.
 - **Finished job containers are kept** as a record of what ran, and are removed
   only when `DockerRunner.reap()` is called. Nothing calls it on a schedule yet.
 

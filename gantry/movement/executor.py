@@ -20,16 +20,18 @@ from gantry.adapters.target.postgres import PostgresTargetAdapter
 from gantry.core.commit import CommitResult
 from gantry.core.dataset import DatasetManifest
 from gantry.jobs import Runner, run_to_completion
-from gantry.jobs.packaging import beam_packaging, sql_client_packaging
+from gantry.jobs.packaging import beam_packaging, sql_client_packaging, verification_packaging
 from gantry.jobs.runners import DockerRunner
 from gantry.lifecycle.plan import NodeKind, PlanNode
-from gantry.movement.beamjob import JDBC_SECRETS, unit_of
+from gantry.movement.beamjob import JDBC_SECRETS, IcebergSink, JdbcSink, unit_of
 from gantry.movement.beamjob import compile_snapshot_job as beam_compile_snapshot_job
+from gantry.movement.iceberg import ensure_group
 from gantry.movement.jobdsn import JobConnections
 from gantry.movement.partitioning import Partition, PartitionMethod
 from gantry.movement.predicate import bounds
 from gantry.movement.sqljob import SOURCE_DSN, TARGET_DSN, compile_snapshot_job, parse_commit
 from gantry.verification.checksum import compute_checksum
+from gantry.verification.iceberg import compile_checksum_job
 
 
 class MovementExecutor:
@@ -50,12 +52,19 @@ class MovementExecutor:
         targets: dict[str, str],
         connections: JobConnections | None = None,
         runner: Runner | None = None,
+        destination: str = "postgres",
+        warehouse: str | None = None,
     ) -> None:
         self._source_engine = source_engine
         self._target_engine = target_engine
         self._source = PostgresSourceAdapter(source_engine)
         self._target = PostgresTargetAdapter(target_engine)
         self._operation = operation
+        # Which kind of thing the data is being written into. `postgres` writes
+        # through JDBC with an upsert; `iceberg` appends, and therefore needs the
+        # verify-first dance in `gantry.movement.iceberg` to survive a replay.
+        self._destination = destination
+        self._warehouse = warehouse
         self._manifests = manifests
         self._targets = targets
         # How a job reaches the databases, which is not how this process
@@ -130,16 +139,18 @@ class MovementExecutor:
         partitions = _partitions_from_group(node, dataset)
         target = self._target_for(dataset)
 
-        job = beam_compile_snapshot_job(
-            self._operation,
-            manifest,
-            partitions,
-            target=target,
-            packaging=beam_packaging(secrets=JDBC_SECRETS, network=self._connections.network),
-        )
-        await run_to_completion(self._runner, job)
-
-        agreed = await self._verify_group(manifest, partitions, target=target)
+        if self._destination == "iceberg":
+            agreed = await self._move_into_iceberg(manifest, partitions, target=target)
+        else:
+            job = beam_compile_snapshot_job(
+                self._operation,
+                manifest,
+                partitions,
+                sink=JdbcSink(table=target),
+                packaging=beam_packaging(secrets=JDBC_SECRETS, network=self._connections.network),
+            )
+            await run_to_completion(self._runner, job)
+            agreed = await self._verify_group(manifest, partitions, target=target)
         return CommitResult(
             # Deliberately zero. Beam reports no counts, and inventing them from
             # the verification would be a different number wearing the same
@@ -151,6 +162,49 @@ class MovementExecutor:
             committed_at=datetime.now(UTC),
         )
 
+    async def _move_into_iceberg(
+        self, manifest: DatasetManifest, partitions: Sequence[Partition], *, target: str
+    ) -> int:
+        """Move a group into Iceberg, and survive being asked to do it twice.
+
+        Iceberg's write appends, so the move is guarded by a check of what the
+        target already holds. The source's checksum is computed in its own
+        engine; the target's by a job, because an Iceberg table has no engine to
+        ask and streaming its rows here to add them up is the one thing this
+        design forbids.
+        """
+        if self._warehouse is None:
+            raise ValueError(
+                "an iceberg destination needs a warehouse location; "
+                "none was configured for this executor"
+            )
+
+        predicate = _group_predicate(manifest, partitions)
+        expected = await compute_checksum(
+            self._source_engine, manifest, manifest.name, predicate=predicate, params={}
+        )
+        mounts = ((self._warehouse, self._warehouse),)
+
+        move = beam_compile_snapshot_job(
+            self._operation,
+            manifest,
+            partitions,
+            sink=IcebergSink(table=target, warehouse=self._warehouse),
+            packaging=beam_packaging(
+                secrets=JDBC_SECRETS, network=self._connections.network, mounts=mounts
+            ),
+        )
+        verify = compile_checksum_job(
+            self._operation,
+            manifest,
+            warehouse=self._warehouse,
+            table=target,
+            unit=unit_of(partitions),
+            packaging=verification_packaging(mounts=mounts),
+        )
+        outcome = await ensure_group(self._runner, verify=verify, move=move, expected=expected)
+        return outcome.checksum.rows
+
     async def _verify_group(
         self, manifest: DatasetManifest, partitions: Sequence[Partition], *, target: str
     ) -> int:
@@ -159,7 +213,7 @@ class MovementExecutor:
         Computed inside each engine, so what crosses the wire is one checksum
         and one count per side rather than any rows.
         """
-        predicate = " OR ".join(f"({bounds(manifest, part)})" for part in partitions)
+        predicate = _group_predicate(manifest, partitions)
         source_side = await compute_checksum(
             self._source_engine, manifest, manifest.name, predicate=predicate, params={}
         )
@@ -189,6 +243,11 @@ class MovementExecutor:
 def _dataset_of(scope: str) -> str:
     """A partition scope is `dataset/index`; a dataset scope is just the name."""
     return scope.rsplit("/", 1)[0] if "/" in scope else scope
+
+
+def _group_predicate(manifest: DatasetManifest, partitions: Sequence[Partition]) -> str:
+    """The group's key range, as one SQL predicate."""
+    return " OR ".join(f"({bounds(manifest, part)})" for part in partitions)
 
 
 class GroupVerificationError(Exception):

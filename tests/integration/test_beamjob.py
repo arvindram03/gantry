@@ -22,7 +22,12 @@ from gantry.jobs.execute import JobFailedError, run_to_completion
 from gantry.jobs.packaging import DEFAULT_BEAM_IMAGE, beam_packaging
 from gantry.jobs.runners import DockerRunner
 from gantry.lifecycle.plan import LifecycleStage, NodeKind, PlanNode
-from gantry.movement.beamjob import COMMIT_MARKER, JDBC_SECRETS, compile_snapshot_job
+from gantry.movement.beamjob import (
+    COMMIT_MARKER,
+    JDBC_SECRETS,
+    JdbcSink,
+    compile_snapshot_job,
+)
 from gantry.movement.executor import GroupVerificationError, MovementExecutor
 from gantry.movement.jobdsn import JobConnections
 from gantry.movement.partitioning import Partition, PartitionMethod
@@ -132,7 +137,7 @@ async def run_beam(
         "beamjob-probe",
         await manifest_of(source),
         partitions,
-        target=TABLE,
+        sink=JdbcSink(TABLE),
         snapshot_lsn=snapshot_lsn,
         packaging=beam_packaging(secrets=JDBC_SECRETS, network=NETWORK),
     )
