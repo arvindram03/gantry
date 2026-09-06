@@ -21,6 +21,8 @@ from gantry.state.database import create_engine, transaction
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from tests.support.jobs import move_partition
+
 pytestmark = pytest.mark.integration
 
 SOURCE_URL = os.environ.get(
@@ -211,46 +213,33 @@ async def test_writing_no_rows_is_a_noop(source: AsyncEngine, target: AsyncEngin
 # --- the bulk path ---------------------------------------------------------
 
 
-async def test_copy_partition_moves_rows_without_materialising_them(
+async def test_the_bulk_path_moves_rows_without_materialising_them(
     source: AsyncEngine, target: AsyncEngine
 ) -> None:
+    """The rows never become Python objects: they go source COPY to target COPY
+    inside a container this process only starts and watches."""
     manifest = await fixture_manifest(source)
-    source_adapter = PostgresSourceAdapter(source)
     adapter = PostgresTargetAdapter(target)
     await adapter.prepare(manifest, target=TARGET_TABLE)
 
     partition = await one_partition(source, manifest)
-    query, params = source_adapter.copy_query(manifest, partition)
-
-    async with source.connect() as connection:
-        result = await adapter.copy_partition(
-            manifest, target=TARGET_TABLE, source=connection, query=query, query_params=params
-        )
+    result = await move_partition(manifest, partition, target=TARGET_TABLE)
 
     assert result.rows_inserted > 0
     assert await count(target) == result.rows_inserted
 
 
-async def test_copy_partition_is_idempotent(source: AsyncEngine, target: AsyncEngine) -> None:
+async def test_the_bulk_path_is_idempotent(source: AsyncEngine, target: AsyncEngine) -> None:
     manifest = await fixture_manifest(source)
-    source_adapter = PostgresSourceAdapter(source)
     adapter = PostgresTargetAdapter(target)
     await adapter.prepare(manifest, target=TARGET_TABLE)
 
     partition = await one_partition(source, manifest)
-    query, params = source_adapter.copy_query(manifest, partition)
+    first = await move_partition(manifest, partition, target=TARGET_TABLE)
+    replay = await move_partition(manifest, partition, target=TARGET_TABLE)
 
-    async with source.connect() as connection:
-        first = await adapter.copy_partition(
-            manifest, target=TARGET_TABLE, source=connection, query=query, query_params=params
-        )
-    async with source.connect() as connection:
-        replay = await adapter.copy_partition(
-            manifest, target=TARGET_TABLE, source=connection, query=query, query_params=params
-        )
-
-    assert replay.is_noop
-    assert replay.rows_unchanged == first.rows_inserted
+    assert replay.rows_inserted == 0, "a replay must not report new rows"
+    assert replay.rows_updated == first.rows_inserted
     assert await count(target) == first.rows_inserted
 
 
@@ -262,11 +251,7 @@ async def test_both_write_paths_agree(source: AsyncEngine, target: AsyncEngine) 
     await adapter.prepare(manifest, target=TARGET_TABLE)
 
     partition = await one_partition(source, manifest)
-    query, params = source_adapter.copy_query(manifest, partition)
-    async with source.connect() as connection:
-        await adapter.copy_partition(
-            manifest, target=TARGET_TABLE, source=connection, query=query, query_params=params
-        )
+    await move_partition(manifest, partition, target=TARGET_TABLE)
 
     rows = [
         row async for batch in source_adapter.read_partition(manifest, partition) for row in batch

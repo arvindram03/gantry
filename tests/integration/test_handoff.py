@@ -32,6 +32,8 @@ from gantry.verification.checksum import compute_checksum
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from tests.support.jobs import move_partition
+
 pytestmark = pytest.mark.integration
 
 SOURCE_URL = os.environ.get(
@@ -192,7 +194,7 @@ async def test_snapshot_and_stream_converge_under_continuous_writes(
     """Writes never stop; the target still ends up matching the source."""
     manifest = await manifest_of(source)
     target_adapter = PostgresTargetAdapter(target)
-    source_adapter = PostgresSourceAdapter(source)
+    PostgresSourceAdapter(source)
     await target_adapter.prepare(manifest, target=TABLE)
 
     consumer = KafkaCDCAdapter(
@@ -210,16 +212,9 @@ async def test_snapshot_and_stream_converge_under_continuous_writes(
         # Snapshot while the writer is running, stamping every row with the
         # position the snapshot represents.
         for partition in plan_partitions(manifest, target_partitions=4).partitions:
-            query, params = source_adapter.copy_query(manifest, partition)
-            async with source.connect() as connection:
-                await target_adapter.copy_partition(
-                    manifest,
-                    target=TABLE,
-                    source=connection,
-                    query=query,
-                    query_params=params,
-                    snapshot_lsn=handoff.snapshot_lsn,
-                )
+            await move_partition(
+                manifest, partition, target=TABLE, snapshot_lsn=handoff.snapshot_lsn
+            )
 
         assert updated, "the writer should have changed rows during the snapshot"
 
@@ -299,7 +294,7 @@ async def test_a_snapshot_does_not_overwrite_newer_changes(
     """
     manifest = await manifest_of(source)
     target_adapter = PostgresTargetAdapter(target)
-    source_adapter = PostgresSourceAdapter(source)
+    PostgresSourceAdapter(source)
     await target_adapter.prepare(manifest, target=TABLE)
 
     # A change from after the snapshot position lands first.
@@ -310,16 +305,7 @@ async def test_a_snapshot_does_not_overwrite_newer_changes(
         )
 
     partition = plan_partitions(manifest, target_partitions=1).partitions[0]
-    query, params = source_adapter.copy_query(manifest, partition)
-    async with source.connect() as connection:
-        await target_adapter.copy_partition(
-            manifest,
-            target=TABLE,
-            source=connection,
-            query=query,
-            query_params=params,
-            snapshot_lsn=handoff.snapshot_lsn,
-        )
+    await move_partition(manifest, partition, target=TABLE, snapshot_lsn=handoff.snapshot_lsn)
 
     async with transaction(target) as connection:
         label = (
@@ -369,19 +355,10 @@ async def _snapshot_once(
     source: AsyncEngine, target: AsyncEngine, manifest: DatasetManifest, handoff: Handoff
 ) -> None:
     target_adapter = PostgresTargetAdapter(target)
-    source_adapter = PostgresSourceAdapter(source)
+    PostgresSourceAdapter(source)
     await target_adapter.prepare(manifest, target=TABLE)
     partition = plan_partitions(manifest, target_partitions=1).partitions[0]
-    query, params = source_adapter.copy_query(manifest, partition)
-    async with source.connect() as connection:
-        await target_adapter.copy_partition(
-            manifest,
-            target=TABLE,
-            source=connection,
-            query=query,
-            query_params=params,
-            snapshot_lsn=handoff.snapshot_lsn,
-        )
+    await move_partition(manifest, partition, target=TABLE, snapshot_lsn=handoff.snapshot_lsn)
 
 
 async def _applier(target: AsyncEngine, manifest: DatasetManifest) -> CDCApplier:

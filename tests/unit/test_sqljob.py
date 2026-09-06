@@ -146,9 +146,21 @@ class TestTheScript:
         assert '"order_id" = EXCLUDED' not in text, "the key is not updated"
 
     def test_a_snapshot_position_refuses_to_overwrite_anything_newer(self) -> None:
-        """What makes a snapshot and a change stream safe to run at once."""
+        """What makes a snapshot and a change stream safe to run at once.
+
+        Two halves, and checking only the guard is how the missing half got
+        shipped: rows must also be *stamped* with the position, or the target
+        understates how current it is and the stream redoes work the snapshot
+        already holds.
+        """
         text = script(snapshot_lsn=4242)
-        assert "source_lsn <= 4242" in text
+        assert "CAST(4242 AS bigint) AS " in text, "the snapshot position is not stamped"
+        assert "source_lsn" in text and "EXCLUDED." in text, "no guard against a newer row"
+
+    def test_no_snapshot_position_means_no_stamp(self) -> None:
+        """Without a position there is nothing to stamp, and the source's own
+        value must survive untouched."""
+        assert "AS bigint) AS " not in script()
 
     def test_an_all_key_table_does_nothing_on_conflict(self) -> None:
         keys_only = manifest(dataset_schema=DatasetSchema(keys=("order_id",), fields=(FIELDS[0],)))

@@ -29,6 +29,7 @@ import re
 from collections.abc import Sequence
 from datetime import UTC, datetime
 
+from gantry.adapters.target.postgres import SNAPSHOT_LSN_COLUMN
 from gantry.core.commit import CommitResult
 from gantry.core.dataset import DatasetManifest
 from gantry.core.names import ResourceName
@@ -171,31 +172,50 @@ def _merge(
 ) -> str:
     """Upsert staged rows into the target.
 
-    When a snapshot position is given the merge refuses to overwrite anything
-    newer, which is what makes a snapshot and a change stream safe to run at the
-    same time: a partition copied slowly enough would otherwise silently undo
-    changes the stream had already applied, and the row would look consistent
-    afterwards.
+    When a snapshot position is given, every row is stamped with it and the
+    merge refuses to overwrite anything newer. Both halves matter, and the stamp
+    is the half that is easy to miss: a snapshot represents the source as of one
+    position, so the rows it writes are as of that position and not as of
+    whatever the source row last happened to carry. Without the stamp the target
+    understates how current it is, and the change stream re-applies work the
+    snapshot already contains.
+
+    The guard is what keeps a slowly-copied partition from silently undoing
+    changes the stream already applied — after which the row would still look
+    consistent.
     """
     columns = ", ".join(quote(name) for name in names)
     key_columns = ", ".join(quote(key) for key in keys)
     updatable = [name for name in names if name not in set(keys)]
+    if snapshot_lsn is None:
+        projection = columns
+    else:
+        projection = ", ".join(
+            f"CAST({int(snapshot_lsn)} AS bigint) AS {quote(name)}"
+            if name == SNAPSHOT_LSN_COLUMN
+            else quote(name)
+            for name in names
+        )
+
     if not updatable:
         # A table that is all key has nothing to update; a conflict means the
         # row is already exactly right.
         return _counted(
-            f"INSERT INTO {target} ({columns}) SELECT {columns} FROM gantry_staging "
+            f"INSERT INTO {target} ({columns}) SELECT {projection} FROM gantry_staging "
             f"ON CONFLICT ({key_columns}) DO NOTHING"
         )
 
     assignments = ", ".join(f"{quote(name)} = EXCLUDED.{quote(name)}" for name in updatable)
     statement = (
-        f"INSERT INTO {target} ({columns}) SELECT {columns} FROM gantry_staging "
+        f"INSERT INTO {target} ({columns}) SELECT {projection} FROM gantry_staging "
         f"ON CONFLICT ({key_columns}) DO UPDATE SET {assignments}"
     )
     if snapshot_lsn is None:
         return _counted(statement)
-    return _counted(f"{statement} WHERE {target}.source_lsn <= {int(snapshot_lsn)}")
+    # Compared against the stamped value rather than a literal, so the guard and
+    # the stamp cannot drift apart.
+    lsn = quote(SNAPSHOT_LSN_COLUMN)
+    return _counted(f"{statement} WHERE {target}.{lsn} < EXCLUDED.{lsn}")
 
 
 COMMIT_MARKER = "gantry-commit"

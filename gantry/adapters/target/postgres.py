@@ -1,29 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
 """PostgreSQL target adapter.
 
-Two write paths, for two different jobs.
+One write path, and it is not the bulk one.
 
 `write_batch` is the correctness path: one `INSERT ... ON CONFLICT DO UPDATE`
 with a `WHERE` clause that skips rows already identical, so a replayed batch
-reports every row unchanged and touches nothing.
+reports every row unchanged and touches nothing. It is used where the rows are
+already in hand — repair, verification evidence, small corrections.
 
-`copy_partition` is the throughput path. Rows move source-to-target as COPY
-byte streams into a staging table, then a single `INSERT ... SELECT` merges
-them. Python moves buffers; the engines move rows. Materialising five million
-rows as Python objects to write them back out would put the orchestration layer
-on the data path, which is the one thing the design forbids.
+Bulk movement is not here and is deliberately not reachable from here. It is a
+generated SQL script run as a job (`gantry.movement.sqljob`), which connects to
+both databases itself. This process starts that job and reads what it reports;
+the bytes never pass through it. An earlier version relayed COPY streams
+through Python buffers, which kept the orchestration layer topologically on the
+data path — technically streaming, but still the thing the design forbids.
 """
 
 from __future__ import annotations
 
-import asyncio
 import re
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import Sequence
 from datetime import UTC, datetime
-from typing import Protocol, cast
 
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from gantry.core.commit import CommitResult
 from gantry.core.dataset import DatasetManifest
@@ -125,62 +125,6 @@ class PostgresTargetAdapter:
             committed_at=datetime.now(UTC),
         )
 
-    async def copy_partition(
-        self,
-        manifest: DatasetManifest,
-        *,
-        target: str,
-        source: AsyncConnection,
-        query: str,
-        query_params: Sequence[object] = (),
-        snapshot_lsn: int | None = None,
-    ) -> CommitResult:
-        """Stream a partition source-to-target without materialising rows.
-
-        The data never becomes Python objects. COPY produces a byte stream on
-        the source connection, a bounded queue hands those bytes to a COPY on
-        the target connection, and the merge from staging happens entirely
-        inside the target. Python moves buffers; the engines move rows.
-        """
-        schema = manifest.dataset_schema
-        names = [field.name for field in schema.fields]
-        staging = _staging_name(target)
-
-        source_raw = _copy_connection(await source.get_raw_connection())
-
-        async with transaction(self._engine) as connection:
-            target_raw = _copy_connection(await connection.get_raw_connection())
-            await connection.execute(
-                text(f"CREATE TEMP TABLE {staging} (LIKE {_qualified(target)}) ON COMMIT DROP")
-            )
-
-            await _pipe_copy(
-                source_raw,
-                target_raw,
-                query=query,
-                params=query_params,
-                staging=staging,
-                columns=names,
-            )
-
-            merged = await connection.execute(
-                text(
-                    _merge_sql(target, staging, names, list(schema.keys), snapshot_lsn=snapshot_lsn)
-                )
-            )
-            outcomes = [row[0] for row in merged.all()]
-            staged = (
-                await connection.execute(text(f"SELECT count(*) FROM {staging}"))
-            ).scalar_one()
-
-        inserted = sum(1 for outcome in outcomes if outcome)
-        return CommitResult(
-            rows_inserted=inserted,
-            rows_updated=len(outcomes) - inserted,
-            rows_unchanged=staged - len(outcomes),
-            committed_at=datetime.now(UTC),
-        )
-
 
 def _upsert_sql(
     target: str, names: Sequence[str], types: Sequence[str], keys: Sequence[str]
@@ -261,77 +205,6 @@ def _merge_sql(
         f"{_conflict_action(target, names, keys, extra_guard=guard)} "
         f"RETURNING (xmax = 0) AS inserted"
     )
-
-
-class CopyCapableConnection(Protocol):
-    """The COPY surface of the underlying driver connection.
-
-    asyncpg owns the COPY protocol; SQLAlchemy does not expose it. Declaring
-    the shape here keeps that dependency explicit and type-checked rather than
-    reaching into an untyped attribute.
-    """
-
-    async def copy_from_query(
-        self,
-        query: str,
-        /,
-        *args: object,
-        output: Callable[[bytes], Awaitable[None]],
-        format: str,  # noqa: A002 - the driver's parameter name
-    ) -> str: ...
-
-    async def copy_to_table(
-        self,
-        table_name: str,
-        /,
-        *,
-        source: AsyncIterator[bytes],
-        columns: Sequence[str],
-        format: str,  # noqa: A002 - the driver's parameter name
-    ) -> str: ...
-
-
-def _copy_connection(raw: object) -> CopyCapableConnection:
-    driver = getattr(raw, "driver_connection", None)
-    if driver is None or not hasattr(driver, "copy_from_query"):
-        raise TypeError("target adapter requires an asyncpg connection for COPY")
-    return cast(CopyCapableConnection, driver)
-
-
-async def _pipe_copy(
-    source: CopyCapableConnection,
-    target: CopyCapableConnection,
-    *,
-    query: str,
-    params: Sequence[object],
-    staging: str,
-    columns: Sequence[str],
-) -> None:
-    """Pipe one COPY stream into another with bounded memory.
-
-    The queue is what keeps this a pipe rather than a buffer: collecting the
-    whole stream first would hold a five-million-row partition in memory, which
-    is the failure mode this path exists to avoid.
-    """
-    queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=64)
-
-    async def produce() -> None:
-        try:
-            await source.copy_from_query(query, *params, output=queue.put, format="binary")
-        finally:
-            await queue.put(None)
-
-    async def consume() -> AsyncIterator[bytes]:
-        while (chunk := await queue.get()) is not None:
-            yield chunk
-
-    producer = asyncio.create_task(produce())
-    try:
-        await target.copy_to_table(
-            staging, source=consume(), columns=list(columns), format="binary"
-        )
-    finally:
-        await producer
 
 
 def _quote(identifier: str) -> str:

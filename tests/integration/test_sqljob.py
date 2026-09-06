@@ -286,3 +286,25 @@ async def test_a_snapshot_behind_the_stream_reports_rows_it_declined(
     result = parse_commit(output)
     assert result.rows_unchanged == 100, "the 100 newer rows must be declined, not overwritten"
     assert result.rows_inserted == 900
+
+
+async def test_the_snapshot_stamps_rows_with_its_own_position(
+    sides: tuple[AsyncEngine, AsyncEngine],
+) -> None:
+    """A snapshot's rows are as of the snapshot's position.
+
+    Not as of whatever the source row happened to carry. Without the stamp the
+    target understates how current it is, and every change between the slot and
+    the snapshot gets re-applied by the stream - which the handoff tests catch
+    only indirectly, as a change that should have been refused being accepted.
+    """
+    source, target = sides
+    await run_job(source, partition(0, "1", "101"), snapshot_lsn=7777)
+
+    async with transaction(target) as connection:
+        positions = (
+            (await connection.execute(text(f"SELECT DISTINCT source_lsn FROM {TABLE}")))
+            .scalars()
+            .all()
+        )
+    assert list(positions) == [7777], "rows must carry the snapshot's position, not the source's"
