@@ -9,8 +9,12 @@ The load-bearing claims:
 
 from __future__ import annotations
 
+import os
+import shutil
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 from gantry.adapters.fake import FakeTarget, FaultSpec, SimulatedCrashError
@@ -25,10 +29,54 @@ from gantry.scheduler.worker import Worker
 from gantry.simulator.runner import Simulator, duplicate_free
 from gantry.spec import load_analysis_spec, load_movement_spec
 
+from tests.support.sql_target import SqlJobTarget
+
 EXAMPLES = Path(__file__).resolve().parents[2] / "spec" / "examples"
 AT = datetime(2026, 9, 11, tzinfo=UTC)
 
 pytestmark = pytest.mark.chaos
+
+NETWORK = os.environ.get("GANTRY_DOCKER_NETWORK", "gantry-dev_default")
+SOURCE_URL = os.environ.get(
+    "GANTRY_SOURCE_URL", "postgresql+asyncpg://gantry:gantry@localhost:15432/gantry"
+)
+TARGET_URL = os.environ.get(
+    "GANTRY_TARGET_URL", "postgresql+asyncpg://gantry:gantry@localhost:15433/gantry"
+)
+
+
+@pytest.fixture(
+    params=[
+        "fake",
+        pytest.param("sql", marks=pytest.mark.integration),
+    ]
+)
+def make_target(request: pytest.FixtureRequest) -> Iterator[Callable[[], Any]]:
+    """A target factory, so every chaos scenario below runs twice.
+
+    Once against the in-memory fake, which is fast and proves the runtime's
+    ordering; once against the real SQL executor, where idempotence is the
+    generated script's merge. The assertions are identical either way - if they
+    were not, the second run would be testing something else.
+    """
+    built: list[Any] = []
+
+    def factory() -> Any:
+        if request.param == "fake":
+            target = FakeTarget()
+        else:
+            if shutil.which("docker") is None:
+                pytest.skip("docker is not on PATH")
+            target = SqlJobTarget(source_url=SOURCE_URL, target_url=TARGET_URL, network=NETWORK)
+        built.append(target)
+        return target
+
+    try:
+        yield factory
+    finally:
+        for target in built:
+            if hasattr(target, "close"):
+                target.close()
 
 
 def movement_plan() -> PlanVersion:
@@ -45,25 +93,31 @@ def analysis_plan() -> PlanVersion:
 
 
 @pytest.mark.parametrize("plan", [movement_plan(), analysis_plan()], ids=["movement", "analysis"])
-async def test_both_operation_types_complete_through_one_engine(plan: PlanVersion) -> None:
-    report = await Simulator(plan, start=AT, verification=duplicate_free).run()
+async def test_both_operation_types_complete_through_one_engine(
+    plan: PlanVersion, make_target: Callable[[], Any]
+) -> None:
+    report = await Simulator(
+        plan, target=make_target(), start=AT, verification=duplicate_free
+    ).run()
     assert report.completed
     assert len(report.completed_nodes) == len(plan.nodes)
     assert not report.crashes
 
 
 @pytest.mark.parametrize("plan", [movement_plan(), analysis_plan()], ids=["movement", "analysis"])
-async def test_every_node_is_checkpointed(plan: PlanVersion) -> None:
-    simulator = Simulator(plan, start=AT)
+async def test_every_node_is_checkpointed(
+    plan: PlanVersion, make_target: Callable[[], Any]
+) -> None:
+    simulator = Simulator(plan, target=make_target(), start=AT)
     await simulator.run()
     checkpoints = await simulator.checkpoints.all(plan.operation)
     assert len(checkpoints) == len(plan.nodes)
 
 
-async def test_dependencies_are_respected_under_leasing() -> None:
+async def test_dependencies_are_respected_under_leasing(make_target: Callable[[], Any]) -> None:
     """A node must not run before the nodes it depends on are done."""
     plan = movement_plan()
-    simulator = Simulator(plan, start=AT)
+    simulator = Simulator(plan, target=make_target(), start=AT)
     report = await simulator.run()
 
     order = report.completed_nodes
@@ -75,7 +129,9 @@ async def test_dependencies_are_respected_under_leasing() -> None:
 # --- the hardest case: crash after commit, before checkpoint ---------------
 
 
-async def test_crash_after_commit_replays_without_duplicating() -> None:
+async def test_crash_after_commit_replays_without_duplicating(
+    make_target: Callable[[], Any],
+) -> None:
     """Section 8.7's worst case, made routine.
 
     The effect commits, the process dies before the checkpoint advances, the
@@ -84,7 +140,7 @@ async def test_crash_after_commit_replays_without_duplicating() -> None:
     """
     plan = movement_plan()
     victim = node_id("orders-replication", NodeKind.SNAPSHOT_PARTITION, "customers")
-    target = FakeTarget()
+    target = make_target()
 
     report = await Simulator(
         plan,
@@ -102,10 +158,10 @@ async def test_crash_after_commit_replays_without_duplicating() -> None:
     assert "duplicates suppressed" in report.verification_evidence
 
 
-async def test_crash_before_commit_loses_no_work() -> None:
+async def test_crash_before_commit_loses_no_work(make_target: Callable[[], Any]) -> None:
     plan = movement_plan()
     victim = node_id("orders-replication", NodeKind.CREATE_SCHEMA, "orders")
-    target = FakeTarget()
+    target = make_target()
 
     report = await Simulator(
         plan, faults=FaultSpec(crash_before_commit={victim}), target=target, start=AT
@@ -116,11 +172,15 @@ async def test_crash_before_commit_loses_no_work() -> None:
     assert target.suppressed_duplicates == 0
 
 
-async def test_checkpoint_is_not_recorded_when_the_worker_dies_after_commit() -> None:
+async def test_checkpoint_is_not_recorded_when_the_worker_dies_after_commit(
+    make_target: Callable[[], Any],
+) -> None:
     """Progress metadata must never run ahead of durable state."""
     plan = movement_plan()
     victim = node_id("orders-replication", NodeKind.SNAPSHOT_PARTITION, "customers")
-    simulator = Simulator(plan, faults=FaultSpec(crash_after_commit={victim}), start=AT)
+    simulator = Simulator(
+        plan, faults=FaultSpec(crash_after_commit={victim}), target=make_target(), start=AT
+    )
     await simulator.backend.submit(plan)
 
     worker = Worker(
@@ -144,10 +204,10 @@ async def test_checkpoint_is_not_recorded_when_the_worker_dies_after_commit() ->
 # --- duplicate delivery ----------------------------------------------------
 
 
-async def test_duplicate_delivery_is_a_no_op() -> None:
+async def test_duplicate_delivery_is_a_no_op(make_target: Callable[[], Any]) -> None:
     plan = analysis_plan()
     everything = {node.id for node in plan.nodes}
-    target = FakeTarget()
+    target = make_target()
 
     report = await Simulator(
         plan,
@@ -166,22 +226,28 @@ async def test_duplicate_delivery_is_a_no_op() -> None:
 # --- transient failures and quarantine -------------------------------------
 
 
-async def test_transient_failures_are_retried() -> None:
+async def test_transient_failures_are_retried(make_target: Callable[[], Any]) -> None:
     plan = analysis_plan()
     flaky = node_id("checkout-latency-regression", NodeKind.EXECUTE_ARTIFACT)
 
-    report = await Simulator(plan, faults=FaultSpec(transient_failures={flaky: 3}), start=AT).run()
+    report = await Simulator(
+        plan, faults=FaultSpec(transient_failures={flaky: 3}), target=make_target(), start=AT
+    ).run()
 
     assert report.completed
     assert not report.quarantined_nodes
 
 
-async def test_a_poison_task_is_quarantined_not_retried_forever() -> None:
+async def test_a_poison_task_is_quarantined_not_retried_forever(
+    make_target: Callable[[], Any],
+) -> None:
     """One bad task must not consume the worker pool indefinitely."""
     plan = analysis_plan()
     poison = node_id("checkout-latency-regression", NodeKind.EXECUTE_ARTIFACT)
 
-    simulator = Simulator(plan, faults=FaultSpec(transient_failures={poison: 999}), start=AT)
+    simulator = Simulator(
+        plan, faults=FaultSpec(transient_failures={poison: 999}), target=make_target(), start=AT
+    )
     report = await simulator.run()
 
     assert not report.completed
@@ -194,7 +260,9 @@ async def test_a_poison_task_is_quarantined_not_retried_forever() -> None:
 # --- verification decides --------------------------------------------------
 
 
-async def test_verification_failure_is_reported_with_evidence_not_a_crash() -> None:
+async def test_verification_failure_is_reported_with_evidence_not_a_crash(
+    make_target: Callable[[], Any],
+) -> None:
     """An engine can finish every node and still not produce a usable result."""
 
     def reject(target: FakeTarget) -> StageResult:
@@ -203,20 +271,25 @@ async def test_verification_failure_is_reported_with_evidence_not_a_crash() -> N
             detail=f"rowExpansion 20.2x exceeds max 1.1 across {target.effect_count} effects",
         )
 
-    report = await Simulator(analysis_plan(), verification=reject, start=AT).run()
+    report = await Simulator(
+        analysis_plan(), verification=reject, target=make_target(), start=AT
+    ).run()
 
     assert report.final_state is OperationState.VERIFICATION_FAILED
     assert not report.completed
     assert "rowExpansion" in report.verification_evidence
 
 
-async def test_incomplete_execution_does_not_reach_verification() -> None:
+async def test_incomplete_execution_does_not_reach_verification(
+    make_target: Callable[[], Any],
+) -> None:
     plan = analysis_plan()
     poison = node_id("checkout-latency-regression", NodeKind.GENERATE_ARTIFACT)
     report = await Simulator(
         plan,
         faults=FaultSpec(transient_failures={poison: 999}),
         verification=duplicate_free,
+        target=make_target(),
         start=AT,
     ).run()
 
