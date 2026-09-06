@@ -24,6 +24,7 @@ from gantry.jobs import (
     Packaging,
     UnsupportedPackagingError,
 )
+from gantry.jobs.execute import run_to_completion
 from gantry.jobs.runner import RunnerError
 from gantry.jobs.runners import DockerRunner
 
@@ -189,3 +190,35 @@ def test_a_runner_refuses_packaging_it_cannot_run() -> None:
 
     with pytest.raises(UnsupportedPackagingError, match="container"):
         asyncio.run(Elsewhere().submit(job("exit 0")))
+
+
+async def test_a_finished_container_is_replaced_rather_than_adopted(
+    runner: DockerRunner,
+) -> None:
+    """A finished attempt is not a cached answer.
+
+    Container names are content-derived, so the same job submitted after an
+    earlier attempt finished would otherwise adopt that attempt's corpse and
+    report its output as this run's. A caller reading a commit attestation out
+    of those logs would advance a checkpoint over work that never happened this
+    time round. Whether the work still needs doing is the engine's judgement,
+    not the runner's.
+    """
+    work = job("echo attempt", unit="probe/00009")
+
+    first = await runner.submit(work)
+    # Adopts the container just started and waits for it to finish.
+    await run_to_completion(runner, work, poll_interval=0.05)
+    started_at = await runner._run(
+        ["docker", "inspect", first.id, "--format", "{{.State.StartedAt}}"]
+    )
+
+    second = await runner.submit(work)
+    assert second == first, "the name is still the job's name"
+
+    restarted_at = await runner._run(
+        ["docker", "inspect", second.id, "--format", "{{.State.StartedAt}}"]
+    )
+    assert restarted_at[1] != started_at[1], (
+        "the finished container was adopted instead of being replaced"
+    )

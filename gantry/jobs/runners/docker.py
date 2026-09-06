@@ -67,10 +67,19 @@ class DockerRunner:
             raise UnsupportedPackagingError(self._name, job.packaging)
 
         container = _container_name(job)
-        if await self._exists(container):
-            # Adopted, not restarted. Whether it is still running or already
-            # finished, its outcome is the outcome of this job.
+        state = await self._state(container)
+        if state in _LIVE:
+            # Adopted, not restarted. Adoption exists to stop two copies of the
+            # same work running at once, so it applies to work still in flight.
             return JobHandle(runner=self._name, id=container)
+        if state is not None:
+            # A finished container with this name is a corpse from an earlier
+            # attempt. Adopting it would return that attempt's output as this
+            # one's, which is how a job that must run again reports a commit it
+            # never made - and the caller would advance a checkpoint over it.
+            # Whether the work still needs doing is the engine's judgement,
+            # recorded in its checkpoints; the runner does not second-guess it.
+            await self._run([self._binary, "rm", "-f", container])
 
         packaging = job.packaging
         argv = [self._binary, "run", "--detach", "--name", container]
@@ -146,9 +155,13 @@ class DockerRunner:
         _, out, err = await self._run([self._binary, "logs", "--tail", str(lines), container])
         return (out + err).strip()[:2000]
 
-    async def _exists(self, container: str) -> bool:
-        code, _, _ = await self._run([self._binary, "inspect", container, "--format", "{{.Id}}"])
-        return code == 0
+    async def _state(self, container: str) -> str | None:
+        """Docker's own word for what the container is doing, or None if there
+        is no such container."""
+        code, out, _ = await self._run(
+            [self._binary, "inspect", container, "--format", "{{.State.Status}}"]
+        )
+        return out.strip() if code == 0 else None
 
     async def _run(self, argv: list[str]) -> tuple[int, str, str]:
         if shutil.which(argv[0]) is None:
@@ -158,6 +171,11 @@ class DockerRunner:
         )
         out, err = await process.communicate()
         return process.returncode or 0, out.decode(errors="replace"), err.decode(errors="replace")
+
+
+# States in which a container is still work in flight. Anything else - exited,
+# dead - is a finished attempt, and finished is not the same as adoptable.
+_LIVE = frozenset({"created", "running", "restarting", "paused"})
 
 
 def _container_name(job: Job) -> str:

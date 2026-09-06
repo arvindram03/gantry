@@ -80,6 +80,7 @@ class MovementActivities:
         executor = MovementExecutor(
             source_engine=self.source_engine,
             target_engine=self.target_engine,
+            operation=operation,
             manifests=manifests,
             targets=targets,
         )

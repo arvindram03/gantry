@@ -206,6 +206,7 @@ class MovementService:
         executor = MovementExecutor(
             source_engine=self._source_engine,
             target_engine=self._target_engine,
+            operation=plan.operation,
             manifests=dict(self._manifests),
             targets=dict(targets),
         )
@@ -524,6 +525,7 @@ class MovementService:
         executor = MovementExecutor(
             source_engine=self._source_engine,
             target_engine=self._target_engine,
+            operation=plan.operation,
             manifests=dict(self._manifests),
             targets=dict(targets),
         )

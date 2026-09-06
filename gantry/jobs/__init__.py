@@ -13,6 +13,7 @@ what a container is. Everything else names a packaging kind and nothing more.
 
 from __future__ import annotations
 
+from gantry.jobs.execute import JobFailedError, run_to_completion
 from gantry.jobs.model import Job, JobKind
 from gantry.jobs.packaging import ContainerPackaging, Packaging, PackagingKind
 from gantry.jobs.runner import (
@@ -27,6 +28,7 @@ from gantry.jobs.runner import (
 __all__ = [
     "ContainerPackaging",
     "Job",
+    "JobFailedError",
     "JobHandle",
     "JobKind",
     "JobState",
@@ -36,4 +38,5 @@ __all__ = [
     "Runner",
     "RunnerError",
     "UnsupportedPackagingError",
+    "run_to_completion",
 ]

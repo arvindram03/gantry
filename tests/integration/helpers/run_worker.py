@@ -41,6 +41,7 @@ async def main(name: str, source_url: str, target_url: str, meta_url: str) -> No
         executor = MovementExecutor(
             source_engine=source_engine,
             target_engine=target_engine,
+            operation=plan.operation,
             manifests=manifests,
             targets={SOURCE_TABLE: TARGET_TABLE},
         )

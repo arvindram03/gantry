@@ -17,8 +17,13 @@ from gantry.adapters.source.postgres import PostgresSourceAdapter
 from gantry.adapters.target.postgres import PostgresTargetAdapter
 from gantry.core.commit import CommitResult
 from gantry.core.dataset import DatasetManifest
+from gantry.jobs import Runner, run_to_completion
+from gantry.jobs.packaging import sql_client_packaging
+from gantry.jobs.runners import DockerRunner
 from gantry.lifecycle.plan import NodeKind, PlanNode
+from gantry.movement.jobdsn import JobConnections
 from gantry.movement.partitioning import Partition, PartitionMethod
+from gantry.movement.sqljob import SOURCE_DSN, TARGET_DSN, compile_snapshot_job, parse_commit
 
 
 class MovementExecutor:
@@ -34,15 +39,33 @@ class MovementExecutor:
         *,
         source_engine: AsyncEngine,
         target_engine: AsyncEngine,
+        operation: str,
         manifests: dict[str, DatasetManifest],
         targets: dict[str, str],
+        connections: JobConnections | None = None,
+        runner: Runner | None = None,
     ) -> None:
         self._source_engine = source_engine
         self._target_engine = target_engine
         self._source = PostgresSourceAdapter(source_engine)
         self._target = PostgresTargetAdapter(target_engine)
+        self._operation = operation
         self._manifests = manifests
         self._targets = targets
+        # How a job reaches the databases, which is not how this process
+        # reaches them: the job runs somewhere else. Derived from the engines
+        # when unset, which is right whenever the job shares this process's
+        # view of the network and loudly wrong when it does not - the job fails
+        # to connect, so no commit is attested and no checkpoint advances.
+        self._connections = connections or JobConnections.from_env(
+            source_engine=source_engine, target_engine=target_engine
+        )
+        self._runner = runner or DockerRunner(
+            secrets={
+                SOURCE_DSN: self._connections.source,
+                TARGET_DSN: self._connections.target,
+            }
+        )
 
     async def execute(self, node: PlanNode) -> CommitResult:
         """Perform one node's work and attest that it committed."""
@@ -68,15 +91,16 @@ class MovementExecutor:
         manifest = self._manifest_for(dataset)
         partition = _partition_from(node, dataset)
 
-        query, params = self._source.copy_query(manifest, partition)
-        async with self._source_engine.connect() as connection:
-            return await self._target.copy_partition(
-                manifest,
-                target=self._target_for(dataset),
-                source=connection,
-                query=query,
-                query_params=params,
-            )
+        job = compile_snapshot_job(
+            self._operation,
+            manifest,
+            partition,
+            target=self._target_for(dataset),
+            packaging=sql_client_packaging(
+                secrets=(SOURCE_DSN, TARGET_DSN), network=self._connections.network
+            ),
+        )
+        return parse_commit(await run_to_completion(self._runner, job))
 
     def _manifest_for(self, dataset: str) -> DatasetManifest:
         manifest = self._manifests.get(dataset)

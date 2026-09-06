@@ -116,3 +116,12 @@ class Runner(Protocol):
     async def poll(self, handle: JobHandle) -> JobStatus:
         """What the job is doing now. Never blocks for the job to finish."""
         ...
+
+    async def logs(self, handle: JobHandle) -> str:
+        """Everything the job wrote.
+
+        Part of the protocol rather than one runner's convenience: a job that
+        cannot report what it did cannot attest a commit, and a checkpoint may
+        not advance without that attestation.
+        """
+        ...
