@@ -8,11 +8,21 @@ job model, the runner protocol, or anything that submits work.
 
 from __future__ import annotations
 
-from gantry.jobs.packaging.container import ContainerPackaging
+from gantry.jobs.packaging.container import (
+    DEFAULT_SQL_IMAGE,
+    ContainerPackaging,
+    sql_client_packaging,
+)
 from gantry.jobs.packaging.kind import PackagingKind
 
 # A union of one. Written as a union rather than as the concrete type so that
 # `Packaging = ContainerPackaging | WasmPackaging` is the whole diff later.
 Packaging = ContainerPackaging
 
-__all__ = ["ContainerPackaging", "Packaging", "PackagingKind"]
+__all__ = [
+    "DEFAULT_SQL_IMAGE",
+    "ContainerPackaging",
+    "Packaging",
+    "PackagingKind",
+    "sql_client_packaging",
+]

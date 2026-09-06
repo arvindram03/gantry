@@ -84,3 +84,24 @@ _SECRET_HINTS = ("password", "passwd", "secret", "token", "apikey", "api_key", "
 def _looks_secret(name: str) -> bool:
     lowered = name.lower()
     return any(hint in lowered for hint in _SECRET_HINTS)
+
+
+# The image a generated SQL script runs in. It needs a `psql` and nothing else,
+# so the client image is the whole dependency. Pinned by tag here and by digest
+# in anything that cares about reproducing a run exactly.
+DEFAULT_SQL_IMAGE = "postgres:16-alpine"
+
+
+def sql_client_packaging(
+    *,
+    secrets: tuple[str, ...],
+    image: str = DEFAULT_SQL_IMAGE,
+    network: str | None = None,
+) -> ContainerPackaging:
+    """Packaging for a generated SQL script.
+
+    This exists so that the code *generating* a script does not have to know
+    what a container is. When a second packaging mechanism arrives, callers
+    swap this factory for another one and the generators do not change.
+    """
+    return ContainerPackaging(image=image, network=network, secrets=secrets)
