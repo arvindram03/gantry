@@ -94,6 +94,8 @@ class DockerRunner:
                     f"runner was not given"
                 )
             argv += ["--env", f"{secret}={resolved}"]
+        for outside, inside in packaging.mounts:
+            argv += ["--volume", f"{outside}:{inside}"]
         if packaging.network:
             argv += ["--network", packaging.network]
         argv.append(packaging.reference)
@@ -141,6 +143,38 @@ class DockerRunner:
             failure=None if exit_code == 0 else _classify(exit_code, oom_killed=oom_killed),
             finished_at=_parse_time(finished_text),
         )
+
+    async def reap(self, *, keep: int = 50) -> int:
+        """Remove finished job containers, newest `keep` retained.
+
+        Containers are left behind on purpose — a finished job is a record of
+        what ran, and its logs are the commit attestation. But nothing removed
+        them, so they accumulated without bound, which is an operational
+        problem masquerading as a design decision.
+
+        Only exited containers are touched, and only ones this runner named. A
+        job still in flight is never disturbed, because adoption depends on it
+        being there.
+        """
+        code, out, _ = await self._run(
+            [
+                self._binary,
+                "ps",
+                "--all",
+                "--quiet",
+                "--filter",
+                f"name=^{_NAME_PREFIX}",
+                "--filter",
+                "status=exited",
+            ]
+        )
+        if code != 0:
+            return 0
+        # `docker ps` lists newest first, so the tail is the oldest.
+        stale = out.split()[keep:]
+        for container in stale:
+            await self._run([self._binary, "rm", "-f", container])
+        return len(stale)
 
     async def logs(self, handle: JobHandle) -> str:
         _, out, err = await self._run([self._binary, "logs", handle.id])

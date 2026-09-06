@@ -154,6 +154,38 @@ not at row forty million inside a Java writer:
 Every problem in a schema is reported at once, because fixing a schema one round
 trip per column is a bad way to spend an afternoon.
 
+## Idempotence on an appending target
+
+The PostgreSQL path is idempotent because the write is: an upsert applied twice
+is the upsert applied once. **Iceberg's write is an append**, so the same trick
+is unavailable — running the move twice adds the rows twice, measured.
+
+Idempotence there is arranged rather than inherited: **verify first, move only
+if the target does not already hold the group.** That is sound only because one
+job commits one atomic snapshot and a killed job leaves nothing at all, so the
+target is never in a partial state for the verification to misread. Both facts
+are measured and recorded in `docs/benchmarks.md`, and if either stops being
+true this guarantee goes with it.
+
+| | PostgreSQL target | Iceberg target |
+|---|---|---|
+| Replay is a no-op | yes, by the write itself | yes, by verifying before moving |
+| Rests on | nothing external | one atomic snapshot per job; no partial state on kill |
+
+## Known gaps
+
+Stated here rather than discovered later:
+
+- **Deletes do not propagate.** A row removed at the source stays in the target.
+  Verification *detects* the disagreement — a group will fail to reconcile —
+  but nothing repairs it, so the group will retry indefinitely. Movement is
+  insert-and-update only today.
+- **Iceberg targets are not wired into `MovementExecutor`.** The pieces are
+  proven end to end in the integration suite; declaring an Iceberg target in a
+  Movement spec is not yet possible.
+- **Finished job containers are kept** as a record of what ran, and are removed
+  only when `DockerRunner.reap()` is called. Nothing calls it on a schedule yet.
+
 ## Choosing
 
 | | `sql` | `beam` |

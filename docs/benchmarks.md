@@ -366,3 +366,29 @@ say.
 it is "build and maintain a ~4.5 GB image with a JRE and pre-staged JARs". The
 alternative — a `psycopg` DoFn — works in the official image today, and reads
 rows through Python against a `COPY` baseline of ~180k rows/sec.
+
+## v1.2 Day 6 — what an Iceberg sink does on a replay
+
+Three facts, measured, because a guarantee rests on each of them.
+
+| Question | Answer |
+|---|---|
+| Does running the same move twice duplicate? | **Yes.** 200 rows became 400 |
+| How many Iceberg snapshots does one job commit? | **One**, atomically — still one at 300,000 rows |
+| What does a job killed mid-flight leave? | **Nothing** — no snapshot, no orphan data files, not even the table |
+
+The first is why `gantry.movement.iceberg` exists: the write is an append, and
+Gantry replays whenever a worker dies between committing and checkpointing, so
+an appending target turns the recovery path into the corruption path.
+
+The second and third are what make the fix sound. Because a job either commits
+its whole snapshot or leaves nothing at all, the target is only ever *without*
+the group or *with exactly* the group. There is no partial state, so "does the
+target already hold this?" has a trustworthy answer — and verifying before
+moving is therefore enough to make a replay a no-op.
+
+**If either stops being true, the strategy is unsound.** A sink that committed
+per bundle, or a runner that left half a snapshot behind, would put the target
+in a state where verification says "no" and the move then appends on top of
+partial data. They are recorded here rather than left as background knowledge
+for that reason.

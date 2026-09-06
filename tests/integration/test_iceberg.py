@@ -17,12 +17,17 @@ import os
 import shutil
 import subprocess
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 from gantry.adapters.source.postgres import PostgresSourceAdapter
 from gantry.adapters.target.iceberg import UnsupportedTypeError, iceberg_schema
 from gantry.core import DatasetManifest
+from gantry.jobs.model import Job, JobKind
+from gantry.jobs.packaging import ContainerPackaging
+from gantry.jobs.runners import DockerRunner
+from gantry.movement.iceberg import GroupOutcome, ensure_group
 from gantry.state.database import create_engine, transaction
 from gantry.verification.checksum import compute_checksum
 from gantry.verification.iceberg import checksum_script, parse_checksum
@@ -178,3 +183,60 @@ async def test_a_schema_iceberg_cannot_hold_fails_before_anything_moves(
     manifest = await manifest_of(source)
     with pytest.raises(UnsupportedTypeError, match="payload"):
         iceberg_schema(manifest)
+
+
+def _job(name: str, body: str, image: str, *, network: str | None = None) -> Job:
+    """A job shaped as the generators produce them, mounting the warehouse.
+
+    The warehouse is mounted at the same path inside as out, because Iceberg
+    metadata records absolute locations.
+    """
+    return Job(
+        operation="iceberg-probe",
+        kind=JobKind.SQL,
+        unit=name,
+        body=body,
+        packaging=ContainerPackaging(
+            image=image,
+            network=network,
+            secrets=("SRC",) if network else (),
+            mounts=((str(WAREHOUSE), str(WAREHOUSE)),),
+            interpreter=("python", "-c"),
+        ),
+        generated_at=datetime.now(UTC),
+    )
+
+
+async def test_a_replayed_group_does_not_duplicate_rows(source: AsyncEngine) -> None:
+    """The Day 5 fallout, fixed.
+
+    Iceberg's write is an append, so running the move twice adds the rows twice
+    — measured at 200 rows becoming 400. Gantry replays whenever a worker dies
+    between committing and checkpointing, so an appending target would turn the
+    recovery path into the corruption path.
+
+    `ensure_group` verifies first and moves only when the target does not
+    already hold the group. This runs the whole thing twice and asserts the
+    second pass did no work and changed nothing.
+    """
+    manifest = await manifest_of(source)
+    expected = await compute_checksum(source, manifest, TABLE, predicate="TRUE", params={})
+    runner = DockerRunner(secrets={"SRC": "jdbc:postgresql://gantry-pg-source:5432/gantry"})
+    verify_body = checksum_script(manifest, warehouse=str(WAREHOUSE), table=ICEBERG_TABLE)
+
+    async def once() -> GroupOutcome:
+        return await ensure_group(
+            runner,
+            verify=_job("verify", verify_body, VERIFY_IMAGE),
+            move=_job("move", BEAM_JOB, BEAM_IMAGE, network=NETWORK),
+            expected=expected,
+        )
+
+    first = await once()
+    assert first.moved, "the first pass must actually move the data"
+    assert first.checksum == expected
+
+    second = await once()
+    assert not second.moved, "the replay must skip the move entirely"
+    assert second.checksum == expected
+    assert second.checksum.rows == ROWS, "the rows were appended twice"

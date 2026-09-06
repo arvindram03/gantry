@@ -311,3 +311,22 @@ async def test_run_to_completion_keeps_an_interrupted_job_retryable(
     assert not isinstance(raised.value, JobFailedError), (
         "an interrupted job must stay retryable, not become the job's own failure"
     )
+
+
+async def test_reaping_removes_finished_containers_but_not_running_ones(
+    runner: DockerRunner,
+) -> None:
+    """Containers are kept as a record of what ran, but nothing removed them,
+    so they accumulated without bound. Reaping keeps the newest and drops the
+    rest — and must never touch work still in flight, because adoption depends
+    on it being there."""
+    for index in range(3):
+        await run_to_completion(runner, job("true", unit=f"probe/reap{index}"), poll_interval=0.05)
+    live = await runner.submit(job("sleep 30", unit="probe/reap-live"))
+    await _until_running(runner, live)
+
+    removed = await runner.reap(keep=1)
+    assert removed >= 2, "the older finished containers should have gone"
+
+    still_there = await runner.poll(live)
+    assert still_there.state is JobState.RUNNING, "a running job must never be reaped"

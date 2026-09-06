@@ -44,6 +44,11 @@ class ContainerPackaging(BaseModel):
     # job, which is provenance.
     secrets: tuple[str, ...] = ()
     network: str | None = None
+    # Host paths made visible to the job, as (outside, inside) pairs. Needed by
+    # a job whose target *is* a filesystem — an Iceberg warehouse, say. Part of
+    # the packaging's identity, because a job pointed at a different warehouse
+    # is a different job rather than the same one behaving differently.
+    mounts: tuple[tuple[str, str], ...] = ()
 
     @model_validator(mode="after")
     def _check_packaging(self) -> ContainerPackaging:
@@ -80,6 +85,9 @@ class ContainerPackaging(BaseModel):
                 " ".join(self.command),
                 environment,
                 ",".join(sorted(self.secrets)),
+                # A job pointed at a different warehouse is a different job.
+                ",".join(f"{outside}:{inside}" for outside, inside in self.mounts),
+                " ".join(self.interpreter),
             )
         )
 
@@ -103,6 +111,7 @@ def sql_client_packaging(
     secrets: tuple[str, ...],
     image: str = DEFAULT_SQL_IMAGE,
     network: str | None = None,
+    mounts: tuple[tuple[str, str], ...] = (),
 ) -> ContainerPackaging:
     """Packaging for a generated SQL script.
 
@@ -110,7 +119,7 @@ def sql_client_packaging(
     what a container is. When a second packaging mechanism arrives, callers
     swap this factory for another one and the generators do not change.
     """
-    return ContainerPackaging(image=image, network=network, secrets=secrets)
+    return ContainerPackaging(image=image, network=network, secrets=secrets, mounts=mounts)
 
 
 # The image a generated Beam pipeline runs in. Unlike the SQL client image this
@@ -124,6 +133,7 @@ def beam_packaging(
     secrets: tuple[str, ...],
     image: str = DEFAULT_BEAM_IMAGE,
     network: str | None = None,
+    mounts: tuple[tuple[str, str], ...] = (),
 ) -> ContainerPackaging:
     """Packaging for a generated Beam pipeline.
 
@@ -135,5 +145,6 @@ def beam_packaging(
         image=image,
         network=network,
         secrets=secrets,
+        mounts=mounts,
         interpreter=("python", "-c"),
     )
