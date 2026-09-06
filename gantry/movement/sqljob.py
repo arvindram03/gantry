@@ -29,6 +29,7 @@ import re
 from collections.abc import Sequence
 from datetime import UTC, datetime
 
+from gantry.core.commit import CommitResult
 from gantry.core.dataset import DatasetManifest
 from gantry.core.names import ResourceName
 from gantry.jobs.model import Job, JobKind
@@ -114,7 +115,7 @@ def snapshot_script(
             "",
             f'psql "${SOURCE_DSN}" -v ON_ERROR_STOP=1 \\',
             f"  -c {shell_literal(read)} \\",
-            f'| psql "${TARGET_DSN}" -v ON_ERROR_STOP=1 --single-transaction \\',
+            f'| psql "${TARGET_DSN}" -v ON_ERROR_STOP=1 --single-transaction -tA \\',
             f"  -c {shell_literal(stage)} \\",
             f"  -c {shell_literal(load)} \\",
             f"  -c {shell_literal(merge)}",
@@ -182,7 +183,7 @@ def _merge(
     if not updatable:
         # A table that is all key has nothing to update; a conflict means the
         # row is already exactly right.
-        return (
+        return _counted(
             f"INSERT INTO {target} ({columns}) SELECT {columns} FROM gantry_staging "
             f"ON CONFLICT ({key_columns}) DO NOTHING"
         )
@@ -193,5 +194,52 @@ def _merge(
         f"ON CONFLICT ({key_columns}) DO UPDATE SET {assignments}"
     )
     if snapshot_lsn is None:
-        return statement
-    return f"{statement} WHERE {target}.source_lsn <= {int(snapshot_lsn)}"
+        return _counted(statement)
+    return _counted(f"{statement} WHERE {target}.source_lsn <= {int(snapshot_lsn)}")
+
+
+COMMIT_MARKER = "gantry-commit"
+
+
+def _counted(statement: str) -> str:
+    """Wrap a merge so it reports what it did.
+
+    The executor needs a `CommitResult` before a checkpoint may advance, and a
+    container only reports an exit code. So the script says so itself, on one
+    line, in the same terms the in-process relay derived: `xmax = 0`
+    distinguishes an insert from an update, and rows the statement declined to
+    touch never come back from RETURNING, so staged-minus-affected is the
+    unchanged count.
+    """
+    return (
+        f"WITH merged AS ({statement} RETURNING (xmax = 0) AS inserted) "
+        f"SELECT '{COMMIT_MARKER} ' "
+        f"|| count(*) FILTER (WHERE inserted) || ' ' "
+        f"|| count(*) FILTER (WHERE NOT inserted) || ' ' "
+        f"|| ((SELECT count(*) FROM gantry_staging) - count(*)) FROM merged"
+    )
+
+
+def parse_commit(output: str, *, committed_at: datetime | None = None) -> CommitResult:
+    """Read a job's output into the attestation a checkpoint requires.
+
+    A missing marker is an error rather than a zero result. The script prints
+    it as its last act inside the committing transaction, so its absence means
+    the merge did not run to completion — and a silent zero there would let a
+    checkpoint advance over work that never happened.
+    """
+    for line in reversed(output.splitlines()):
+        line = line.strip()
+        if not line.startswith(COMMIT_MARKER):
+            continue
+        parts = line.split()
+        if len(parts) != 4:
+            raise ValueError(f"malformed commit line: {line!r}")
+        inserted, updated, unchanged = (int(part) for part in parts[1:])
+        return CommitResult(
+            rows_inserted=inserted,
+            rows_updated=updated,
+            rows_unchanged=unchanged,
+            committed_at=committed_at or datetime.now(UTC),
+        )
+    raise ValueError(f"no {COMMIT_MARKER!r} line in the job's output; the merge did not complete")

@@ -27,7 +27,12 @@ from gantry.jobs import JobState
 from gantry.jobs.packaging import sql_client_packaging
 from gantry.jobs.runners import DockerRunner
 from gantry.movement.partitioning import Partition, PartitionMethod
-from gantry.movement.sqljob import SOURCE_DSN, TARGET_DSN, compile_snapshot_job
+from gantry.movement.sqljob import (
+    SOURCE_DSN,
+    TARGET_DSN,
+    compile_snapshot_job,
+    parse_commit,
+)
 from gantry.state.database import create_engine, transaction
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -114,7 +119,9 @@ def partition(index: int, lo: str | None, hi: str | None) -> Partition:
     )
 
 
-async def run_job(source: AsyncEngine, part: Partition, **overrides: object) -> JobState:
+async def run_job_with_output(
+    source: AsyncEngine, part: Partition, **overrides: object
+) -> tuple[JobState, str]:
     job = compile_snapshot_job(
         "sqljob-probe",
         await manifest_of(source),
@@ -132,11 +139,16 @@ async def run_job(source: AsyncEngine, part: Partition, **overrides: object) -> 
             if status.state.terminal:
                 if status.state is JobState.FAILED:
                     print(status.detail)
-                return status.state
+                return status.state, await engine.logs(handle)
             await asyncio.sleep(0.1)
         raise AssertionError("the job never finished")
     finally:
         await engine._run(["docker", "rm", "-f", handle.id])
+
+
+async def run_job(source: AsyncEngine, part: Partition, **overrides: object) -> JobState:
+    state, _ = await run_job_with_output(source, part, **overrides)
+    return state
 
 
 async def target_rows(target: AsyncEngine) -> int:
@@ -226,3 +238,51 @@ async def test_a_failed_partition_does_not_undo_a_committed_one(
     assert await target_rows(target) == 1000, (
         "a failed partition must neither commit its own rows nor disturb a committed one"
     )
+
+
+async def test_the_job_reports_what_it_committed(
+    sides: tuple[AsyncEngine, AsyncEngine],
+) -> None:
+    """The counts a checkpoint rests on.
+
+    The executor may not advance a checkpoint without a CommitResult, and a
+    container reports only an exit code. These are the same three numbers the
+    in-process relay derived, so a replay must show up as unchanged rather than
+    as work done again.
+    """
+    source, _ = sides
+    part = partition(0, "1", "1001")
+
+    state, output = await run_job_with_output(source, part)
+    assert state is JobState.SUCCEEDED
+    first = parse_commit(output)
+    assert (first.rows_inserted, first.rows_updated, first.rows_unchanged) == (1000, 0, 0)
+
+    state, output = await run_job_with_output(source, part)
+    assert state is JobState.SUCCEEDED
+    replay = parse_commit(output)
+    assert replay.rows_inserted == 0, "a replay must not report new rows"
+    assert replay.rows_updated == 1000
+
+
+async def test_a_snapshot_behind_the_stream_reports_rows_it_declined(
+    sides: tuple[AsyncEngine, AsyncEngine],
+) -> None:
+    """Rows the merge refuses to overwrite are unchanged, not lost.
+
+    This is the count that keeps a slow snapshot from silently undoing the
+    change stream: the rows it declined must be visible as declined.
+    """
+    source, target = sides
+    async with transaction(target) as connection:
+        await connection.execute(
+            text(
+                f"INSERT INTO {TABLE} SELECT g, 'newer' || g, g * 1.5, 500 "
+                f"FROM generate_series(1, 100) g"
+            )
+        )
+
+    _, output = await run_job_with_output(source, partition(0, "1", "1001"), snapshot_lsn=1)
+    result = parse_commit(output)
+    assert result.rows_unchanged == 100, "the 100 newer rows must be declined, not overwritten"
+    assert result.rows_inserted == 900
