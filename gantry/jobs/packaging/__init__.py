@@ -9,8 +9,10 @@ job model, the runner protocol, or anything that submits work.
 from __future__ import annotations
 
 from gantry.jobs.packaging.container import (
+    DEFAULT_BEAM_IMAGE,
     DEFAULT_SQL_IMAGE,
     ContainerPackaging,
+    beam_packaging,
     sql_client_packaging,
 )
 from gantry.jobs.packaging.kind import PackagingKind
@@ -20,9 +22,11 @@ from gantry.jobs.packaging.kind import PackagingKind
 Packaging = ContainerPackaging
 
 __all__ = [
+    "DEFAULT_BEAM_IMAGE",
     "DEFAULT_SQL_IMAGE",
     "ContainerPackaging",
     "Packaging",
     "PackagingKind",
+    "beam_packaging",
     "sql_client_packaging",
 ]

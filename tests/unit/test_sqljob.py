@@ -18,13 +18,13 @@ import pytest
 from gantry.core import DatasetManifest, DatasetSchema, FieldSchema, PhysicalRef
 from gantry.jobs import JobKind
 from gantry.movement.partitioning import Partition, PartitionMethod
+from gantry.movement.predicate import sql_literal
 from gantry.movement.sqljob import (
     SOURCE_DSN,
     TARGET_DSN,
     compile_snapshot_job,
     shell_literal,
     snapshot_script,
-    sql_literal,
 )
 
 AT = datetime(2026, 9, 5, tzinfo=UTC)

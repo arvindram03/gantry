@@ -17,6 +17,7 @@ from gantry.jobs.execute import JobFailedError, run_to_completion
 from gantry.jobs.model import Job, JobKind
 from gantry.jobs.packaging import ContainerPackaging, Packaging, PackagingKind
 from gantry.jobs.runner import (
+    FailureKind,
     JobHandle,
     JobState,
     JobStatus,
@@ -27,6 +28,7 @@ from gantry.jobs.runner import (
 
 __all__ = [
     "ContainerPackaging",
+    "FailureKind",
     "Job",
     "JobFailedError",
     "JobHandle",

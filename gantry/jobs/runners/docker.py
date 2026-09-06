@@ -25,6 +25,7 @@ from datetime import UTC, datetime
 from gantry.jobs.model import Job
 from gantry.jobs.packaging import Packaging, PackagingKind
 from gantry.jobs.runner import (
+    FailureKind,
     JobHandle,
     JobState,
     JobStatus,
@@ -96,7 +97,7 @@ class DockerRunner:
         if packaging.network:
             argv += ["--network", packaging.network]
         argv.append(packaging.reference)
-        argv += list(packaging.command) if packaging.command else ["sh", "-c", job.body]
+        argv += list(packaging.command) if packaging.command else [*packaging.interpreter, job.body]
 
         code, out, err = await self._run(argv)
         if code != 0:
@@ -114,15 +115,17 @@ class DockerRunner:
                 "inspect",
                 handle.id,
                 "--format",
-                "{{.State.Status}} {{.State.ExitCode}} {{.State.FinishedAt}}",
+                "{{.State.Status}} {{.State.ExitCode}} {{.State.OOMKilled}} {{.State.FinishedAt}}",
             ]
         )
         if code != 0:
             raise RunnerError(f"cannot inspect {handle.describe()}: {err.strip() or out.strip()}")
 
         status, _, rest = out.strip().partition(" ")
-        exit_text, _, finished_text = rest.partition(" ")
+        exit_text, _, rest = rest.partition(" ")
+        oom_text, _, finished_text = rest.partition(" ")
         exit_code = int(exit_text) if exit_text.lstrip("-").isdigit() else None
+        oom_killed = oom_text.strip().lower() == "true"
 
         if status in ("created", "restarting", "paused"):
             return JobStatus(state=JobState.PENDING, detail=status)
@@ -135,6 +138,7 @@ class DockerRunner:
             state=JobState.SUCCEEDED if exit_code == 0 else JobState.FAILED,
             exit_code=exit_code,
             detail=None if exit_code == 0 else await self._tail(handle.id),
+            failure=None if exit_code == 0 else _classify(exit_code, oom_killed=oom_killed),
             finished_at=_parse_time(finished_text),
         )
 
@@ -175,6 +179,25 @@ class DockerRunner:
 
 # States in which a container is still work in flight. Anything else - exited,
 # dead - is a finished attempt, and finished is not the same as adoptable.
+def _classify(exit_code: int | None, *, oom_killed: bool) -> FailureKind:
+    """Whether the work failed, or whether it was never allowed to finish.
+
+    The codes are Docker's own, confirmed against the daemon rather than read
+    from documentation: 125 is the daemon refusing, 126 and 127 are a command
+    that could not be run, and 137 or 143 are a container killed by a signal —
+    an OOM kill or an operator, in both cases work interrupted rather than work
+    refused. Everything else is the job's own exit status, which is the whole
+    commit signal for a SQL job and must not be mistaken for a platform fault.
+
+    A job could of course exit 137 by itself. Calling that retryable is the
+    right way to be wrong: a retried infrastructure fault costs one more
+    attempt, and a quarantined node costs an operator.
+    """
+    if oom_killed or exit_code in (125, 126, 127, 137, 143):
+        return FailureKind.RUNNER
+    return FailureKind.JOB
+
+
 _LIVE = frozenset({"created", "running", "restarting", "paused"})
 
 

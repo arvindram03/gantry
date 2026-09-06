@@ -31,6 +31,12 @@ class ContainerPackaging(BaseModel):
     # rather than the same one behaving differently.
     digest: str | None = None
     command: tuple[str, ...] = ()
+    # How the body is handed to the image: the body becomes the final argument.
+    # A generated SQL script is a shell script and a generated Beam pipeline is
+    # a Python program, and which one an image can run is a fact about the
+    # image — so it lives with the packaging rather than being assumed by every
+    # runner.
+    interpreter: tuple[str, ...] = ("sh", "-c")
     # Non-secret configuration only. Anything here is retained with the job and
     # is meant to be read.
     environment: dict[str, str] = {}
@@ -105,3 +111,29 @@ def sql_client_packaging(
     swap this factory for another one and the generators do not change.
     """
     return ContainerPackaging(image=image, network=network, secrets=secrets)
+
+
+# The image a generated Beam pipeline runs in. Unlike the SQL client image this
+# one is built rather than pulled: it needs a JRE and pre-staged JARs that the
+# official Beam SDK image does not carry. See `docker/beam/Dockerfile`.
+DEFAULT_BEAM_IMAGE = "gantry/beam:2.76.0"
+
+
+def beam_packaging(
+    *,
+    secrets: tuple[str, ...],
+    image: str = DEFAULT_BEAM_IMAGE,
+    network: str | None = None,
+) -> ContainerPackaging:
+    """Packaging for a generated Beam pipeline.
+
+    The body is a Python program, so it is handed to `python -c` rather than to
+    a shell. Same reason `sql_client_packaging` exists: the code generating a
+    pipeline should not have to know what a container is.
+    """
+    return ContainerPackaging(
+        image=image,
+        network=network,
+        secrets=secrets,
+        interpreter=("python", "-c"),
+    )

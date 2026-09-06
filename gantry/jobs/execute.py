@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 
 from gantry.jobs.model import Job
-from gantry.jobs.runner import JobHandle, JobState, Runner, RunnerError
+from gantry.jobs.runner import FailureKind, JobHandle, JobState, Runner, RunnerError
 
 
 class JobFailedError(RunnerError):
@@ -49,6 +49,14 @@ async def run_to_completion(
         status = await runner.poll(handle)
         if status.state.terminal:
             if status.state is JobState.FAILED:
+                if status.failure is FailureKind.RUNNER:
+                    # The work was not attempted or was interrupted. Raising the
+                    # runner's own error keeps it retryable, rather than
+                    # quarantining a node for an infrastructure fault.
+                    raise RunnerError(
+                        f"job {handle.id} was interrupted by the runner "
+                        f"(exit {status.exit_code}): {status.detail or 'no detail reported'}"
+                    )
                 raise JobFailedError(handle, status.detail)
             return await runner.logs(handle)
         await asyncio.sleep(poll_interval)

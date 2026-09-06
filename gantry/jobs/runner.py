@@ -50,6 +50,24 @@ class JobHandle:
         return f"{self.runner}:{self.id}"
 
 
+class FailureKind(StrEnum):
+    """Why a job is not going to succeed, at the only granularity that changes
+    what the caller should do.
+
+    A runner failure and a bad row are different, and conflating them is how a
+    node gets quarantined for an infrastructure hiccup — or, worse, how a row
+    the target will never accept is retried until something gives up.
+    """
+
+    # The work was not attempted, or was interrupted by the platform: the image
+    # would not start, the container was killed, the daemon refused. Retrying is
+    # safe and is usually right.
+    RUNNER = "runner"
+    # The work ran and failed on its own terms — a constraint violation, a type
+    # error, a row the target refused. Retrying reproduces it.
+    JOB = "job"
+
+
 @dataclass(frozen=True)
 class JobStatus:
     """What a runner reports about a submitted job."""
@@ -58,6 +76,8 @@ class JobStatus:
     exit_code: int | None = None
     detail: str | None = None
     finished_at: datetime | None = None
+    # Set only when the state is FAILED.
+    failure: FailureKind | None = None
 
     @property
     def succeeded(self) -> bool:

@@ -11,6 +11,7 @@ Requires Docker, and the `postgres:16-alpine` image the dev stack already uses.
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
@@ -18,13 +19,16 @@ from datetime import UTC, datetime
 import pytest
 from gantry.jobs import (
     ContainerPackaging,
+    FailureKind,
     Job,
+    JobHandle,
     JobKind,
     JobState,
+    JobStatus,
     Packaging,
     UnsupportedPackagingError,
 )
-from gantry.jobs.execute import run_to_completion
+from gantry.jobs.execute import JobFailedError, run_to_completion
 from gantry.jobs.runner import RunnerError
 from gantry.jobs.runners import DockerRunner
 
@@ -221,4 +225,89 @@ async def test_a_finished_container_is_replaced_rather_than_adopted(
     )
     assert restarted_at[1] != started_at[1], (
         "the finished container was adopted instead of being replaced"
+    )
+
+
+async def _until_terminal(runner: DockerRunner, handle: JobHandle) -> JobStatus:
+    # Polling is the protocol: `poll` never blocks, so something has to wait.
+    while not (status := await runner.poll(handle)).state.terminal:  # noqa: ASYNC110
+        await asyncio.sleep(0.05)
+    return status
+
+
+async def _until_running(runner: DockerRunner, handle: JobHandle) -> None:
+    while (await runner.poll(handle)).state is not JobState.RUNNING:  # noqa: ASYNC110
+        await asyncio.sleep(0.05)
+
+
+async def test_a_jobs_own_failure_is_classified_as_the_jobs(
+    runner: DockerRunner,
+) -> None:
+    """A non-zero exit the job chose is the job's answer, and the whole commit
+    signal for a SQL job. Retrying reproduces it."""
+    handle = await runner.submit(job("exit 3", unit="probe/00010"))
+    status = await _until_terminal(runner, handle)
+
+    assert status.state is JobState.FAILED
+    assert status.exit_code == 3
+    assert status.failure is FailureKind.JOB
+
+
+async def test_a_container_killed_by_the_platform_is_a_runner_failure(
+    runner: DockerRunner,
+) -> None:
+    """Work interrupted, not work refused.
+
+    Calling this a job failure is how a node gets quarantined for an
+    infrastructure fault — an OOM kill, an evicted pod, an operator with a
+    reason. The work was never allowed to finish, so retrying is right.
+    """
+    handle = await runner.submit(job("sleep 30", unit="probe/00011"))
+    await _until_running(runner, handle)
+    await runner._run(["docker", "kill", handle.id])
+    status = await _until_terminal(runner, handle)
+
+    assert status.state is JobState.FAILED
+    assert status.exit_code == 137
+    assert status.failure is FailureKind.RUNNER, (
+        "a killed container is interrupted work, not a bad row"
+    )
+
+
+async def test_an_unrunnable_command_is_a_runner_failure(
+    runner: DockerRunner,
+) -> None:
+    """127 is the shell saying it could not run the thing at all, so the work
+    was never attempted."""
+    handle = await runner.submit(job("/nonexistent-binary", unit="probe/00012"))
+    status = await _until_terminal(runner, handle)
+
+    assert status.exit_code == 127
+    assert status.failure is FailureKind.RUNNER
+
+
+async def test_run_to_completion_keeps_an_interrupted_job_retryable(
+    runner: DockerRunner,
+) -> None:
+    """The classification has to reach the caller, or it changes nothing.
+
+    A RunnerError is retryable to everything upstream; a JobFailedError is the
+    job's own answer and is not.
+    """
+    with pytest.raises(JobFailedError):
+        await run_to_completion(runner, job("exit 4", unit="probe/00013"), poll_interval=0.05)
+
+    # A child killed by SIGKILL and waited on, so the 137 is the job's real exit
+    # status and arrives deterministically. Killing the container from outside
+    # instead races run_to_completion's own submit, which would find the
+    # container gone and correctly start a fresh one — right behaviour, useless
+    # test. The genuine platform kill is covered by the test above.
+    with pytest.raises(RunnerError) as raised:
+        await run_to_completion(
+            runner,
+            job("sleep 5 & kill -9 $!; wait $!", unit="probe/00014"),
+            poll_interval=0.05,
+        )
+    assert not isinstance(raised.value, JobFailedError), (
+        "an interrupted job must stay retryable, not become the job's own failure"
     )
