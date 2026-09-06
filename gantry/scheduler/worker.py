@@ -52,6 +52,8 @@ class WorkerReport:
     fatal: list[str] = field(default_factory=list)
     needs_replan: list[str] = field(default_factory=list)
     rows_written: int = 0
+    # Content hashes of the jobs that did the work, in the order first seen.
+    jobs: list[str] = field(default_factory=list)
     crashed_on: str | None = None
 
     @property
@@ -112,6 +114,8 @@ class Worker:
 
             report.completed.append(task.node_id)
             report.rows_written += result.rows_changed
+            if result.job is not None and result.job not in report.jobs:
+                report.jobs.append(result.job)
 
         return report
 

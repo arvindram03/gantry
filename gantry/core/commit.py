@@ -31,6 +31,11 @@ class CommitResult(BaseModel):
     # Rows the target refused because they were older than what it holds.
     # Always zero until stale-write rejection arrives with CDC.
     rows_rejected_stale: int = Field(default=0, ge=0)
+    # The content hash of the job that did this work, when a job did it.
+    # Opaque here on purpose: the runtime records which job ran without
+    # learning what kind it was, which is what keeps the worker from knowing
+    # anything about executors.
+    job: str | None = None
     committed_at: datetime
 
     @model_validator(mode="after")

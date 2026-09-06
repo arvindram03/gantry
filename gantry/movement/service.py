@@ -241,6 +241,7 @@ class MovementService:
             ),
             created_at=finished,
             rows_inserted=report.rows_written,
+            jobs=tuple(report.jobs),
             partitions_total=_partition_count(plan),
             # Completed *partitions*, not completed tasks: a plan also carries
             # discovery and schema nodes, and counting those made a Movement

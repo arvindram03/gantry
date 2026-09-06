@@ -117,7 +117,8 @@ class MovementExecutor:
                 secrets=(SOURCE_DSN, TARGET_DSN), network=self._connections.network
             ),
         )
-        return parse_commit(await run_to_completion(self._runner, job))
+        committed = parse_commit(await run_to_completion(self._runner, job))
+        return committed.model_copy(update={"job": job.content_hash})
 
     async def _snapshot_group(self, node: PlanNode) -> CommitResult:
         """Several partitions in one job, checkpointed only once verified.
@@ -139,8 +140,9 @@ class MovementExecutor:
         partitions = _partitions_from_group(node, dataset)
         target = self._target_for(dataset)
 
+        moved_by: str | None = None
         if self._destination == "iceberg":
-            agreed = await self._move_into_iceberg(manifest, partitions, target=target)
+            agreed, moved_by = await self._move_into_iceberg(manifest, partitions, target=target)
         else:
             job = beam_compile_snapshot_job(
                 self._operation,
@@ -150,6 +152,7 @@ class MovementExecutor:
                 packaging=beam_packaging(secrets=JDBC_SECRETS, network=self._connections.network),
             )
             await run_to_completion(self._runner, job)
+            moved_by = job.content_hash
             agreed = await self._verify_group(manifest, partitions, target=target)
         return CommitResult(
             # Deliberately zero. Beam reports no counts, and inventing them from
@@ -159,12 +162,13 @@ class MovementExecutor:
             rows_inserted=0,
             rows_updated=0,
             rows_unchanged=agreed,
+            job=moved_by,
             committed_at=datetime.now(UTC),
         )
 
     async def _move_into_iceberg(
         self, manifest: DatasetManifest, partitions: Sequence[Partition], *, target: str
-    ) -> int:
+    ) -> tuple[int, str]:
         """Move a group into Iceberg, and survive being asked to do it twice.
 
         Iceberg's write appends, so the move is guarded by a check of what the
@@ -203,7 +207,7 @@ class MovementExecutor:
             packaging=verification_packaging(mounts=mounts),
         )
         outcome = await ensure_group(self._runner, verify=verify, move=move, expected=expected)
-        return outcome.checksum.rows
+        return outcome.checksum.rows, move.content_hash
 
     async def _verify_group(
         self, manifest: DatasetManifest, partitions: Sequence[Partition], *, target: str

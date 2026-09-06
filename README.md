@@ -39,6 +39,7 @@ be a different tool.
 | **A CDC tool** | Debezium, Kafka | Gantry drives real Debezium over real Kafka. What it adds is owning the applied position itself, so correctness does not depend on connector bookkeeping. |
 | **A BI or visualisation layer** | Looker, Metabase, Superset | Gantry produces a `Result` — structured, verified, with provenance. Rendering it is someone else's job. |
 | **A traffic router or proxy** | your load balancer, your deploy system | Gantry decides whether you *may* cut a migration over and records why. **It never moves your traffic.** Holding a connection string would make it a proxy. |
+| **A Beam wrapper** | Apache Beam, Dataflow, Flink | Gantry decides *what* runs and *what may be believed*. Beam is one of the things that can run it — a job kind, chosen per Movement, alongside a plain SQL script. Swapping it changes throughput and reach, never who owns the guarantee. |
 | **An AI agent** | Claude, an in-house planner, a human | Gantry is what an agent *calls*. There is no model inside it. It decides plenty — what verifies, what is permitted — but deterministically, in code, the same way every time. |
 
 **And two things it explicitly does not claim:**
@@ -52,11 +53,11 @@ it calls, not instructions it reads.
 stated — measured, statistical, or a model's opinion, labelled as such. "The deploy caused
 the regression" is a claim it will not make for you.
 
-**And one limit of v1 specifically:** the source and target adapters are **PostgreSQL only**.
-Engines are PostgreSQL and DuckDB, CDC is Debezium over Kafka, and the scheduler is Temporal
-or a built-in Postgres queue. The adapter interfaces are small and documented in
-[docs/adapters.md](docs/adapters.md), but if your data is in Oracle or MySQL today, v1 does
-not move it yet.
+**And one limit to be plain about:** the **source** is **PostgreSQL only**. Targets are
+PostgreSQL, or Iceberg through the `beam` job kind. Engines are PostgreSQL and DuckDB, CDC is
+Debezium over Kafka, and the scheduler is Temporal or a built-in Postgres queue. The
+interfaces are small and documented in [docs/adapters.md](docs/adapters.md), but if your data
+is in Oracle or MySQL today, Gantry does not read it yet.
 
 Everything else v1 does *not* guarantee is written down in
 [docs/guarantees.md](docs/guarantees.md) — including the gaps its own rehearsal found, and
@@ -268,6 +269,42 @@ Verify is where Gantry asks whether the numbers mean what the spec said they wou
 the only stage that can say no on grounds the engine has no opinion about.
 
 Every guarantee in this project lives in that gap.
+
+### Where the work actually runs
+
+Notice what the Execute box does *not* say: it does not say "Gantry". Gantry decides what
+should run and whether the result may be believed. Something else runs it.
+
+```text
+   Gantry                                    somewhere else
+   ──────                                    ──────────────
+   plan ─► generate a Job ─► submit ────────► ┌──────────────────┐
+                                              │  a container     │
+   ◄──── poll, read what it reported ──────── │  connects to the │
+                                              │  databases and   │
+   verify ─► checkpoint                       │  moves the rows  │
+                                              └──────────────────┘
+        no customer data ever crosses back
+```
+
+Three names, because three things change on different schedules:
+
+| | | Ships |
+|---|---|---|
+| **Job** | *what* to run — generated from the plan, content-addressed | `sql`, `beam` |
+| **Packaging** | *how* it is made runnable | a container |
+| **Runner** | *where* it runs | local Docker |
+
+A **`sql`** job is a shell script running `psql`; it starts in a quarter of a second and
+checkpoints every partition. A **`beam`** job is an Apache Beam pipeline; it reaches sinks
+`psql` cannot, costs eleven seconds to start, and therefore checkpoints a *group* of
+partitions instead. That difference is a guarantee changing, so it is written down per
+backend in [docs/guarantees.md](docs/guarantees.md) and the trade is explained in
+[docs/beam.md](docs/beam.md).
+
+Earlier versions streamed the rows through Gantry's own process. That was still "streaming",
+and it still put the orchestration layer on the data path — so it was deleted rather than
+described more carefully.
 
 ## How do you use it?
 
@@ -544,6 +581,10 @@ traces provenance and exercises the access ladder — about a minute, timed step
 - **Agent access** — a ladder enforced in code, not in a prompt
 - **Gated cutover** — a migration cuts over only when every declared gate passes and a
   named person approves; an unmeasured gate blocks
+- **No customer data through Gantry** — movement is a container that connects to the
+  databases itself; Gantry reads catalogs, statistics and one checksum per chunk
+- **No credential in a retained job** — the job body is provenance and meant to be read;
+  secrets reach it by name through the packaging, asserted by a test
 
 And what it does not — including the gaps found by its own rehearsal — is in
 [docs/guarantees.md](docs/guarantees.md). That document is meant to be read before the
@@ -556,18 +597,27 @@ feature list, not after.
 | [architecture.md](docs/architecture.md) | the four resources, the shared lifecycle, the components |
 | [guarantees.md](docs/guarantees.md) | what v1 guarantees, and what it does not |
 | [migration.md](docs/migration.md) | the Migration workflow, its gates, and what it refuses to decide for you |
-| [adapters.md](docs/adapters.md) | the adapter interfaces and what each one owns |
+| [adapters.md](docs/adapters.md) | the adapter interfaces, and the Job / Packaging / Runner seam |
+| [beam.md](docs/beam.md) | choosing an execution backend, and what each one costs |
 | [benchmarks.md](docs/benchmarks.md) | measured numbers, with the conditions they were measured under |
 | [rfcs/0000-gantry.md](docs/rfcs/0000-gantry.md) | the design document and its revisions |
 | [execution-plan-v1.md](docs/execution-plan-v1.md) | how v1 was built, day by day, with what each day found |
 | [execution-plan-migration.md](docs/execution-plan-migration.md) | how v1.1 was built: Migration as a workflow over Movements |
-| [execution-plan-external-execution.md](docs/execution-plan-external-execution.md) | what v1.2 would do: jobs, packaging and runners — Gantry stops running work in its own process |
+| [execution-plan-external-execution.md](docs/execution-plan-external-execution.md) | how v1.2 was built: jobs, packaging and runners — Gantry stopped running work in its own process |
 
 ## Status
 
-`v0.2.0` — Migration as a workflow over Movements. Every guarantee above is exercised by tests against real databases, real Kafka and
-real Debezium — not simulations — and by a rehearsal that runs the whole sequence through the
-CLI. It has not been run in production by anyone, including its authors.
+`v0.3.0` — **Gantry is out of the data path.** Data movement is a job: a script, generated
+from the plan, packaged as a container, run by something else. The relay that streamed bytes
+through Gantry's own process is deleted. Two job kinds ship — `sql`, a `psql` script per
+partition, and `beam`, an Apache Beam pipeline per group — and
+[docs/guarantees.md](docs/guarantees.md) states per backend what each one gives you,
+including where `beam` gives you less.
+
+Every guarantee above is exercised by tests against real databases, real Kafka, real Debezium
+and real containers — not simulations — and by three rehearsals that run the whole sequence
+through the CLI. The chaos suite runs against both job kinds with identical assertions. It has
+not been run in production by anyone, including its authors.
 
 ## Development
 

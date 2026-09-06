@@ -32,6 +32,11 @@ class MovementResult(Result):
     partitions_complete: int = Field(default=0, ge=0)
     partitions_verified: int = Field(default=0, ge=0)
 
+    # The jobs that moved the data, by content hash. Provenance rather than
+    # bookkeeping: a job is a readable artifact, and this is what ties the rows
+    # that arrived to the exact thing that moved them.
+    jobs: tuple[str, ...] = ()
+
     started_at: datetime
     finished_at: datetime
 

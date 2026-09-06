@@ -26,6 +26,9 @@ from gantry.core.dataset import DatasetManifest
 from gantry.jobs import JobState
 from gantry.jobs.packaging import sql_client_packaging
 from gantry.jobs.runners import DockerRunner
+from gantry.lifecycle.plan import LifecycleStage, NodeKind, PlanNode
+from gantry.movement.executor import MovementExecutor
+from gantry.movement.jobdsn import JobConnections
 from gantry.movement.partitioning import Partition, PartitionMethod
 from gantry.movement.sqljob import (
     SOURCE_DSN,
@@ -308,3 +311,42 @@ async def test_the_snapshot_stamps_rows_with_its_own_position(
             .all()
         )
     assert list(positions) == [7777], "rows must carry the snapshot's position, not the source's"
+
+
+async def test_the_commit_names_the_job_that_produced_it(
+    sides: tuple[AsyncEngine, AsyncEngine],
+) -> None:
+    """Provenance, not bookkeeping.
+
+    A job body is a readable artifact retained on purpose; this is what ties
+    the rows that arrived to the exact thing that moved them. The hash is
+    opaque to everything above, which is what lets the worker record which job
+    ran without learning what kind it was.
+    """
+    source, _ = sides
+    executor = MovementExecutor(
+        source_engine=source,
+        target_engine=create_engine(TARGET_URL),
+        operation="sqljob-provenance",
+        manifests={TABLE: await manifest_of(source)},
+        targets={TABLE: TABLE},
+        connections=JobConnections(source=INSIDE_SOURCE, target=INSIDE_TARGET, network=NETWORK),
+    )
+    node = PlanNode(
+        id="probe-partition",
+        kind=NodeKind.SNAPSHOT_PARTITION,
+        stage=LifecycleStage.EXECUTE,
+        scope=f"{TABLE}/00000",
+        params={
+            "partition_column": "id",
+            "partition_method": PartitionMethod.HISTOGRAM.value,
+            "partition_index": "0",
+            "lo": "1",
+            "hi": "1001",
+        },
+    )
+    result = await executor.execute(node)
+    assert result.rows_inserted == 1000
+    assert result.job is not None and result.job.startswith("sha256:"), (
+        "a commit must name the job that produced it"
+    )

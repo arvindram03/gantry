@@ -1,4 +1,4 @@
-# Adapters
+# Adapters and execution backends
 
 Four adapter kinds, each a `Protocol` with a small surface. The surfaces are
 small on purpose: an adapter that can do everything ends up owning decisions
@@ -10,6 +10,9 @@ the runtime has to be able to make identically across every backend.
 | Target | preparing a destination, writing a batch idempotently | PostgreSQL |
 | CDC | a change stream with positions and lag | Debezium over Kafka |
 | Engine | planning and running a compiled artifact | PostgreSQL, DuckDB |
+
+Alongside them, a separate seam decides *where work runs* rather than *how a
+store is spoken to* — see [Execution backends](#execution-backends) at the end.
 
 ## Source
 
@@ -114,6 +117,63 @@ The real differences between them are recorded in
 aggregates agree only to the input column's scale, the two disagree about
 Python types in both directions, and DuckDB reports no row estimate rather than
 parsing a number out of its plan text.
+
+## Execution backends
+
+An adapter says how to speak to a store. An execution backend says where the
+work runs, and it is deliberately a different question with different types.
+
+Three of them, because three things change on different schedules:
+
+| | Answers | Ships |
+|---|---|---|
+| `Job` | **what** to run — generated from the plan, content-addressed | `sql`, `beam` |
+| `Packaging` | **how** it is made runnable | container |
+| `Runner` | **where** it runs | local Docker |
+
+```python
+class Runner(Protocol):
+    @property
+    def name(self) -> str: ...
+    def supports(self, packaging: Packaging) -> bool: ...
+    async def submit(self, job: Job) -> JobHandle: ...
+    async def poll(self, handle: JobHandle) -> JobStatus: ...
+    async def logs(self, handle: JobHandle) -> str: ...
+```
+
+`submit` is **idempotent by contract**: a worker that dies between submitting
+and recording the submission must not start a second copy of the work, so
+submitting a job already in flight returns the existing handle. Note the
+boundary of that promise — adoption applies to work *still running*. A finished
+container is not a cached answer, and returning one would hand back a commit
+attestation for work this attempt did not do. Whether finished work needs doing
+again is the engine's judgement, held in its checkpoints.
+
+`logs` is on the protocol rather than being one runner's convenience: a job that
+cannot report what it did cannot attest a commit, and a checkpoint may not
+advance without that attestation.
+
+`JobStatus` classifies a failure as `RUNNER` or `JOB`. A runner failure and a
+bad row are different things — conflating them either quarantines a node for an
+infrastructure hiccup or retries a row the target will never accept.
+
+### What a backend must not do
+
+The same shape as the adapter rules above, and for the same reason:
+
+- **Decide the partition bounds.** They come from the plan. Recomputing them
+  lets a partition move under a replay.
+- **Decide what "committed" means.** A `sql` job's exit code is a commit signal
+  because Gantry generated the transaction around it. A backend that reports
+  only `DONE` gets its checkpoint from verification instead.
+- **Checkpoint.** Same rule as adapters. The runtime decides when progress is
+  earned.
+- **Name a container anywhere outside the container packaging module.** Enforced
+  by a test over the AST, not by review — `image: str` appearing in a signature
+  decides that packaging is containers forever.
+
+Choosing between the backends is [beam.md](beam.md); what each guarantees is
+[guarantees.md](guarantees.md).
 
 ## Writing one
 

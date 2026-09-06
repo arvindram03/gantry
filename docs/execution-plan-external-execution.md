@@ -538,29 +538,53 @@ however long the replacement takes.
 
 ## 9. Definition of done
 
-- [ ] A Movement runs on Beam through the same worker interface as the Postgres path
-- [ ] Job submission is idempotent — a crash between submit and checkpoint adopts, never duplicates
-- [ ] The chaos suite runs against Beam, and every guarantee is either proven or written down as lost
-- [ ] Data lands in one non-Postgres target, verified or explicitly unverifiable
-- [ ] **`docs/guarantees.md` states what holds per backend**, and a reader can choose from it
-- [ ] The checkpoint-unit sentence is written *before* the adapter, and the adapter matches it
-- [ ] Nothing is checkpointed on `DONE` alone; every checkpoint has a verification behind it
-- [ ] Two consecutive clean rehearsal runs
-- [ ] Nothing in `gantry/movement/worker` or the scheduler knows which executor ran
-- [ ] **No byte of customer data passes through a Gantry process, on any path** —
-      and what Gantry does read (catalog, statistics, one checksum per chunk) is
-      bounded by construction rather than by the size of the data
-- [ ] No credential appears in a retained job body
-- [ ] Nothing outside the container packaging module names an image, a registry
-      or a container at all
-- [ ] The interfaces are `Job`, `Packaging` and `Runner` — not `MovementJob`,
-      and not `ContainerRunner`
-- [ ] `_pipe_copy` and the relay are deleted, and the chaos suite passed against
-      the `sql` executor first
-- [ ] Every Movement retains the job that moved its data, and the
-      `MovementResult` names it
+Checked at `v0.3.0`. Two items are **not** met and say so.
 
----
+- [x] A Movement runs on Beam through the same worker interface as the Postgres path
+- [x] Job submission is idempotent — a crash between submit and checkpoint adopts, never
+      duplicates. Refined while building it: adoption applies to work *still running*. A
+      finished container is not a cached answer, and returning one hands back a commit
+      attestation for work this attempt did not do
+- [x] The chaos suite runs against Beam, and every guarantee is either proven or written
+      down as lost — 13 passed in 17 minutes, identical assertions to the `sql` run
+- [x] Data lands in one non-Postgres target, verified — Iceberg, checksummed against the
+      source by a job
+- [x] **`docs/guarantees.md` states what holds per backend**, and a reader can choose from it
+- [x] The checkpoint-unit sentence is written *before* the adapter, and the adapter matches it
+- [x] Nothing is checkpointed on `DONE` alone; every checkpoint has a verification behind it.
+      Precisely: under `beam` the verification *is* the attestation; under `sql` it is the
+      merge's own committed counts inside the transaction Gantry generated, which is a
+      stronger signal than `DONE` and not a verification
+- [x] Two consecutive clean rehearsal runs — `--suite beam`, ~72 s each
+- [x] Nothing in `gantry/movement/worker` or the scheduler knows which executor ran. A job's
+      content hash reaches the worker; its *kind* does not
+- [x] **No byte of customer data passes through a Gantry process, on any path.** The relay is
+      deleted. Verification reads one checksum per chunk — computed in the engine for
+      PostgreSQL, by a job for Iceberg. `write_batch` remains for rows already in hand
+      (repair, verification evidence) and is bounded by the batch, not by the dataset
+- [x] No credential appears in a retained job body — asserted by a test and by the rehearsal
+- [x] Nothing outside the container packaging module names an image, a registry or a
+      container at all — enforced by a test over the AST, which caught one real leak
+- [x] The interfaces are `Job`, `Packaging` and `Runner`
+- [x] `_pipe_copy` and the relay are deleted, and the chaos suite passed against the `sql`
+      executor first — in that order, which was in the never-cut list
+- [x] Every Movement retains the job that moved its data, and the `MovementResult` names it.
+      Done last, and only because checking the list honestly found it missing
+
+**Not met:**
+
+- [ ] **Dataflow and Flink are unproven.** Everything here was measured on the Direct runner
+      in a container on one machine. Dataflow's submission cost and quota ceilings are
+      unmeasured, and they are the numbers that would decide group size there. Every claim
+      in `docs/guarantees.md` names the runner it was proven on for this reason
+- [ ] **An Iceberg destination is configured on the executor, not read from the spec.** A
+      Movement group lands in Iceberg and is verified, but `adapter: iceberg` in a Movement
+      YAML does not yet reach it
+
+Two gaps found along the way are recorded in `docs/guarantees.md` rather than fixed:
+**deletes do not propagate** — verification detects the drift and nothing repairs it — and
+the **8-way concurrency gain measured on Day 0 never reproduced** through the real path,
+cause unestablished.
 
 ## 10. What this does not settle
 

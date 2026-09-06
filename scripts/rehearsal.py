@@ -859,6 +859,15 @@ def beam_provenance(args: argparse.Namespace) -> None:
             )
         require("jdbc:postgresql://" not in job.body, "a connection string is in the body")
         require(job.content_hash.startswith("sha256:"), "a job must be content-addressed")
+
+        # And the same hash comes back off a real execution, which is what makes
+        # it provenance rather than a property of a freshly compiled object.
+        node = _group_node(_beam_partitions(4))
+        committed = asyncio.run(_with_executor("postgres", lambda ex: ex.execute(node)))
+        require(
+            committed.job == job.content_hash,
+            f"the executed job was {committed.job}, the compiled one {job.content_hash}",
+        )
         require("ON CONFLICT" in job.body, "the retained body must show how it stayed idempotent")
         proved.append(f"{job.content_hash[:19]}…, no credential in the body")
 
