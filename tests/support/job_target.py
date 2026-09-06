@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The chaos suite's target, backed by the real SQL executor.
+"""The chaos suite's target, backed by a real job executor.
 
 `FakeTarget` proves the *runtime's* guarantees — that a crash between commit and
 checkpoint replays without duplicating — using a dict for idempotence. That is
@@ -7,10 +7,13 @@ the right shape for a fast unit run, but it means the guarantees are only ever
 demonstrated against a fake.
 
 This presents exactly the same surface, and implements it by compiling a
-partition to a script, running it in a container, and letting PostgreSQL's merge
+partition to a job, running it in a container, and letting PostgreSQL's merge
 decide whether the effect was new. Same assertions, real executor. If the
-generated script's idempotence is wrong, the existing chaos assertions fail —
-which is the point of not writing new ones.
+generated job's idempotence is wrong, the existing chaos assertions fail — which
+is the point of not writing new ones.
+
+The job kind is a parameter, so the same scenarios run against `sql` and against
+`beam` without either backend getting its own assertions.
 
 The work runs on a private event loop in a background thread because
 `FakeWorkload.execute` calls `apply` synchronously from inside the simulator's
@@ -22,12 +25,14 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import Coroutine
-from typing import Any, TypeVar
+from typing import Any, ClassVar, TypeVar
 
 from gantry.adapters.source.postgres import PostgresSourceAdapter
 from gantry.jobs import JobState
-from gantry.jobs.packaging import sql_client_packaging
+from gantry.jobs.packaging import beam_packaging, sql_client_packaging
 from gantry.jobs.runners import DockerRunner
+from gantry.movement.beamjob import JDBC_SECRETS
+from gantry.movement.beamjob import compile_snapshot_job as beam_compile_snapshot_job
 from gantry.movement.partitioning import Partition, PartitionMethod
 from gantry.movement.sqljob import SOURCE_DSN, TARGET_DSN, compile_snapshot_job
 from gantry.state.database import create_engine, transaction
@@ -41,8 +46,14 @@ TABLE = "public.chaos_effects"
 ROWS = 64
 
 
-class SqlJobTarget:
+class JobBackedTarget:
     """An idempotent target whose idempotence is PostgreSQL's, not a dict's."""
+
+    #: Filled in by the subclasses below.
+    secrets: ClassVar[dict[str, str]] = {}
+
+    def compile(self, manifest: Any, partition: Partition, *, network: str) -> Any:
+        raise NotImplementedError
 
     def __init__(self, *, source_url: str, target_url: str, network: str) -> None:
         self.apply_calls = 0
@@ -96,29 +107,19 @@ class SqlJobTarget:
             )
 
     async def _move(self, row_id: int) -> None:
-        job = compile_snapshot_job(
-            "chaos",
-            self._manifest,
-            Partition(
-                dataset=TABLE,
-                index=row_id,
-                column="id",
-                method=PartitionMethod.HISTOGRAM,
-                lo=str(row_id),
-                hi=str(row_id + 1),
-            ),
-            target=TABLE,
-            packaging=sql_client_packaging(secrets=(SOURCE_DSN, TARGET_DSN), network=self._network),
+        partition = Partition(
+            dataset=TABLE,
+            index=row_id,
+            column="id",
+            method=PartitionMethod.HISTOGRAM,
+            lo=str(row_id),
+            hi=str(row_id + 1),
         )
-        runner = DockerRunner(
-            secrets={
-                SOURCE_DSN: "postgresql://gantry:gantry@gantry-pg-source:5432/gantry",
-                TARGET_DSN: "postgresql://gantry:gantry@gantry-pg-target:5432/gantry",
-            }
-        )
+        job = self.compile(self._manifest, partition, network=self._network)
+        runner = DockerRunner(secrets=self.secrets)
         handle = await runner.submit(job)
         try:
-            deadline = asyncio.get_running_loop().time() + 120
+            deadline = asyncio.get_running_loop().time() + 300
             while asyncio.get_running_loop().time() < deadline:
                 status = await runner.poll(handle)
                 if status.state.terminal:
@@ -166,3 +167,51 @@ class SqlJobTarget:
         finally:
             self._loop.call_soon_threadsafe(self._loop.stop)
             self._thread.join(timeout=10)
+
+
+INSIDE_SOURCE = "postgresql://gantry:gantry@gantry-pg-source:5432/gantry"
+INSIDE_TARGET = "postgresql://gantry:gantry@gantry-pg-target:5432/gantry"
+
+
+class SqlJobTarget(JobBackedTarget):
+    """The chaos scenarios against a generated SQL script."""
+
+    secrets: ClassVar[dict[str, str]] = {SOURCE_DSN: INSIDE_SOURCE, TARGET_DSN: INSIDE_TARGET}
+
+    def compile(self, manifest: Any, partition: Partition, *, network: str) -> Any:
+        return compile_snapshot_job(
+            "chaos",
+            manifest,
+            partition,
+            target=TABLE,
+            packaging=sql_client_packaging(secrets=(SOURCE_DSN, TARGET_DSN), network=network),
+        )
+
+
+class BeamJobTarget(JobBackedTarget):
+    """The same scenarios against a generated Beam pipeline.
+
+    One partition per job here, which is deliberately *not* how a real Beam
+    Movement is executed — grouping is what makes it affordable. The chaos suite
+    is asking whether a crash between commit and checkpoint duplicates an
+    effect, and that question needs one effect per job to be legible. The cost
+    of the answer is that this suite is slow; see docs/guarantees.md.
+    """
+
+    secrets: ClassVar[dict[str, str]] = {
+        "GANTRY_SOURCE_JDBC": "jdbc:postgresql://gantry-pg-source:5432/gantry",
+        "GANTRY_TARGET_JDBC": "jdbc:postgresql://gantry-pg-target:5432/gantry",
+        "GANTRY_SOURCE_USER": "gantry",
+        "GANTRY_SOURCE_PASSWORD": "gantry",
+        "GANTRY_TARGET_USER": "gantry",
+        "GANTRY_TARGET_PASSWORD": "gantry",
+    }
+
+    def compile(self, manifest: Any, partition: Partition, *, network: str) -> Any:
+        return beam_compile_snapshot_job(
+            "chaos",
+            manifest,
+            [partition],
+            target=TABLE,
+            packaging=beam_packaging(secrets=JDBC_SECRETS, network=network),
+        )

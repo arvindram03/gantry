@@ -96,5 +96,6 @@ asyncio_mode = "auto"
 markers = [
     "integration: requires the docker-compose stack (make dev-up)",
     "chaos: fault-injection tests (worker kill, duplicate delivery, target stall)",
+    "beam: needs the gantry/beam image and costs ~11s per job; run deliberately",
 ]
 addopts = "-m 'not integration' --strict-markers"

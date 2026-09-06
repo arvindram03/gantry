@@ -182,3 +182,34 @@ async def test_a_bad_row_is_a_job_failure_not_a_runner_failure(
 
     with pytest.raises(JobFailedError):
         await run_beam(source, [partition(0, "1", "1001")])
+
+
+async def test_a_beam_snapshot_refuses_to_overwrite_a_newer_row(
+    sides: tuple[AsyncEngine, AsyncEngine],
+) -> None:
+    """The guard that is load-bearing for Beam in a way it is not for a script.
+
+    A pipeline's bundles are unordered by design and may be retried, so "the
+    snapshot wrote it second" carries no information about which value is
+    current. Without the guard a partition copied slowly enough silently undoes
+    changes the stream already applied, and the row looks consistent afterwards.
+    """
+    source, target = sides
+    async with transaction(target) as connection:
+        await connection.execute(
+            text(
+                f"INSERT INTO {TABLE} SELECT g, 'from-cdc', g * 1.5, 5000 "
+                f"FROM generate_series(1, 100) g"
+            )
+        )
+
+    await run_beam(source, [partition(0, "1", "1001")], snapshot_lsn=1)
+
+    async with transaction(target) as connection:
+        survivors = (
+            await connection.execute(text(f"SELECT count(*) FROM {TABLE} WHERE label = 'from-cdc'"))
+        ).scalar_one()
+        moved = await target_rows(target)
+
+    assert survivors == 100, "the snapshot overwrote rows newer than its own position"
+    assert moved == 1000, "and the rows it was entitled to write are still there"

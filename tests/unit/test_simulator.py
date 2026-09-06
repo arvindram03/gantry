@@ -29,7 +29,7 @@ from gantry.scheduler.worker import Worker
 from gantry.simulator.runner import Simulator, duplicate_free
 from gantry.spec import load_analysis_spec, load_movement_spec
 
-from tests.support.sql_target import SqlJobTarget
+from tests.support.job_target import BeamJobTarget, JobBackedTarget, SqlJobTarget
 
 EXAMPLES = Path(__file__).resolve().parents[2] / "spec" / "examples"
 AT = datetime(2026, 9, 11, tzinfo=UTC)
@@ -49,25 +49,42 @@ TARGET_URL = os.environ.get(
     params=[
         "fake",
         pytest.param("sql", marks=pytest.mark.integration),
+        # `beam` carries its own marker as well as `integration`, because one
+        # Beam job costs about eleven seconds and the whole suite against it
+        # takes tens of minutes. It is run deliberately, not on the way past.
+        pytest.param("beam", marks=[pytest.mark.integration, pytest.mark.beam]),
     ]
 )
 def make_target(request: pytest.FixtureRequest) -> Iterator[Callable[[], Any]]:
-    """A target factory, so every chaos scenario below runs twice.
+    """A target factory, so every chaos scenario below runs against each backend.
 
-    Once against the in-memory fake, which is fast and proves the runtime's
-    ordering; once against the real SQL executor, where idempotence is the
-    generated script's merge. The assertions are identical either way - if they
-    were not, the second run would be testing something else.
+    Against the in-memory fake, which is fast and proves the runtime's ordering;
+    against the real SQL executor, where idempotence is the generated script's
+    merge; and against Beam, where it is the generated pipeline's upsert. The
+    assertions are identical for all three — if they were not, the later runs
+    would be testing something else.
     """
+    # A mapping rather than a branch: an `if` here was wrong once and the suite
+    # reported thirteen green Beam tests that had all run SQL jobs. Fast is the
+    # only symptom a mis-wired backend has.
+    backends: dict[str, type[JobBackedTarget]] = {
+        "sql": SqlJobTarget,
+        "beam": BeamJobTarget,
+    }
     built: list[Any] = []
 
     def factory() -> Any:
         if request.param == "fake":
-            target = FakeTarget()
+            target: Any = FakeTarget()
         else:
             if shutil.which("docker") is None:
                 pytest.skip("docker is not on PATH")
-            target = SqlJobTarget(source_url=SOURCE_URL, target_url=TARGET_URL, network=NETWORK)
+            target = backends[request.param](
+                source_url=SOURCE_URL, target_url=TARGET_URL, network=NETWORK
+            )
+            assert type(target) is backends[request.param], (
+                f"the {request.param!r} run built a {type(target).__name__}"
+            )
         built.append(target)
         return target
 
