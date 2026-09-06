@@ -7,6 +7,9 @@ that need one, so getting this wrong quietly coarsens what a crash costs.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from pathlib import Path
+
 import pytest
 from gantry.movement.grouping import (
     BEAM_COST,
@@ -14,7 +17,11 @@ from gantry.movement.grouping import (
     JobCost,
     group_partitions,
 )
+from gantry.movement.model import ExecutionConfig
 from gantry.movement.partitioning import Partition, PartitionMethod
+
+EXAMPLES = Path(__file__).resolve().parents[2] / "spec" / "examples"
+AT = datetime(2026, 9, 11, tzinfo=UTC)
 
 
 def partition(index: int, rows: int | None = 100_000) -> Partition:
@@ -92,3 +99,72 @@ class TestGrouping:
 
     def test_no_partitions_is_no_groups(self) -> None:
         assert group_partitions([]) == ()
+
+
+class TestThePlanShape:
+    """What the planner does with the grouping, which is where it becomes a
+    guarantee rather than an arithmetic exercise."""
+
+    def test_sql_gets_a_node_per_partition_and_beam_a_node_per_group(self) -> None:
+        from gantry.jobs.model import JobKind
+        from gantry.lifecycle.plan import NodeKind
+        from gantry.movement.planner import compile_movement
+        from gantry.spec import load_movement_spec
+
+        spec = load_movement_spec(EXAMPLES / "movement-orders-replication.yaml")
+        sql_plan = compile_movement(spec.to_movement(), created_at=AT)
+
+        beam = spec.to_movement().model_copy(
+            update={"execution": ExecutionConfig(kind=JobKind.BEAM)}
+        )
+        beam_plan = compile_movement(beam, created_at=AT)
+
+        assert any(n.kind is NodeKind.SNAPSHOT_PARTITION for n in sql_plan.nodes)
+        assert not any(n.kind is NodeKind.SNAPSHOT_GROUP for n in sql_plan.nodes)
+        assert any(n.kind is NodeKind.SNAPSHOT_GROUP for n in beam_plan.nodes)
+        assert not any(n.kind is NodeKind.SNAPSHOT_PARTITION for n in beam_plan.nodes)
+
+    def test_changing_the_job_kind_requires_a_replan(self) -> None:
+        """The kind decides the checkpoint unit, so it is a guarantee: a plan
+        compiled under one must not be resumed under the other."""
+        from gantry.jobs.model import JobKind
+        from gantry.spec import load_movement_spec
+
+        spec = load_movement_spec(EXAMPLES / "movement-orders-replication.yaml")
+        sql = spec.to_movement()
+        beam = sql.model_copy(update={"execution": ExecutionConfig(kind=JobKind.BEAM)})
+        assert sql.guarantee_fingerprint() != beam.guarantee_fingerprint()
+
+    def test_a_movement_written_before_the_field_existed_keeps_its_fingerprint(
+        self,
+    ) -> None:
+        """Adding the field must not invalidate every stored plan. Only a
+        non-default kind enters the payload."""
+        from gantry.spec import load_movement_spec
+
+        spec = load_movement_spec(EXAMPLES / "movement-orders-replication.yaml")
+        default = spec.to_movement()
+        explicit = default.model_copy(update={"execution": ExecutionConfig()})
+        assert default.guarantee_fingerprint() == explicit.guarantee_fingerprint()
+
+    def test_a_group_node_carries_the_bounds_the_plan_recorded(self) -> None:
+        """Read back at execution time, never recomputed — recomputing lets the
+        group's membership shift under a replay."""
+        import json
+
+        from gantry.jobs.model import JobKind
+        from gantry.lifecycle.plan import NodeKind
+        from gantry.movement.planner import compile_movement
+        from gantry.spec import load_movement_spec
+
+        spec = load_movement_spec(EXAMPLES / "movement-orders-replication.yaml")
+        beam = spec.to_movement().model_copy(
+            update={"execution": ExecutionConfig(kind=JobKind.BEAM)}
+        )
+        plan = compile_movement(beam, created_at=AT)
+        groups = [n for n in plan.nodes if n.kind is NodeKind.SNAPSHOT_GROUP]
+        assert groups
+        for node in groups:
+            recorded = json.loads(node.params["partitions"])
+            assert recorded, "a group node must name its partitions"
+            assert all("index" in entry for entry in recorded)

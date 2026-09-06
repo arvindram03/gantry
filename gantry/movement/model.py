@@ -21,6 +21,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from gantry.core.names import ContentHash, FieldName, ResourceName
 from gantry.core.verification import VerificationRequirement
+from gantry.jobs.model import JobKind
+from gantry.movement.grouping import DEFAULT_OVERHEAD_FRACTION
 
 
 class MovementMode(StrEnum):
@@ -105,6 +107,25 @@ class RuntimeLimits(BaseModel):
     source_cpu_max_percent: float | None = None
 
 
+class ExecutionConfig(BaseModel):
+    """Which job kind moves this Movement's data, and how coarsely.
+
+    Part of the guarantee fingerprint rather than a runtime tuning knob,
+    because the kind decides the checkpoint unit: `sql` checkpoints a
+    partition, `beam` a group of them. Switching is therefore "a different
+    migration wearing the same name" in exactly the sense that phrase is
+    already used here — a crash costs something different afterwards, and a
+    plan compiled under one answer must not be resumed under the other.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: JobKind = JobKind.SQL
+    # What fraction of a job may be spent starting it before partitions are
+    # grouped together. Only consulted by kinds that group.
+    overhead_fraction: float = Field(default=DEFAULT_OVERHEAD_FRACTION, gt=0.0, lt=1.0)
+
+
 class Movement(BaseModel):
     """A reliable transfer or synchronisation, as the runtime sees it."""
 
@@ -117,6 +138,7 @@ class Movement(BaseModel):
     datasets: tuple[MovementDataset, ...] = Field(min_length=1)
     cdc: CdcConfig | None = None
     limits: RuntimeLimits = RuntimeLimits()
+    execution: ExecutionConfig = ExecutionConfig()
 
     @model_validator(mode="after")
     def _check_datasets(self) -> Movement:
@@ -156,5 +178,17 @@ class Movement(BaseModel):
                 for dataset in self.datasets
             ],
         }
+        # The job kind decides the checkpoint unit, so it is a guarantee and not
+        # a tuning knob: a plan compiled under one kind must not be resumed
+        # under the other, because a crash would then cost something different
+        # than it was planned to.
+        #
+        # Added to the payload only when it is not the default, so that every
+        # Movement written before this field existed keeps the fingerprint it
+        # already has. Changing the kind still changes the fingerprint, which is
+        # the property that matters; breaking every stored plan to say the same
+        # thing would not have bought anything.
+        if self.execution.kind is not JobKind.SQL:
+            payload["execution_kind"] = self.execution.kind.value
         rendered = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return f"sha256:{hashlib.sha256(rendered.encode('utf-8')).hexdigest()}"

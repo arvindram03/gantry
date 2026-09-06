@@ -35,6 +35,7 @@ submitted and checked after it returns:
 | Refuses to overwrite a newer row | yes, `source_lsn` guard | yes, same guard — **load-bearing here**, see below |
 | Reports rows inserted / updated / unchanged | **yes** | **no** — see "What Beam cannot tell you" |
 | Startup cost per job | ~0.25 s | ~11 s |
+| Checkpoint advances on | the job's own committed row counts | **the group's verification**, never `DONE` |
 | Proven on | Docker, local | **Direct runner in a container. Dataflow and Flink: unproven.** |
 
 The chaos suite — worker killed between commit and checkpoint, duplicate
@@ -97,7 +98,12 @@ Beam reports no per-row counts a submitter can read. A pipeline that reaches
 `DONE` says only that it finished. So under `beam`:
 
 - a checkpoint may **not** advance on `DONE` alone;
-- the group is **verified** first, and the verification is the attestation;
+- the group is **verified** first, and the verification is the attestation. The
+  executor compares checksums over the group's key range on both sides, inside
+  each engine, and only then produces the `CommitResult` that lets a checkpoint
+  move. A group that does not verify raises: the task fails, the lease expires,
+  the group runs again — safe because the write is an upsert, and correct
+  because nothing recorded progress over rows that were never confirmed;
 - a `CommitResult` from a `beam` job carries no row counts, and anything reading
   them will see zeros. That is honest, not a bug — but it means volume
   reconciliation on a `beam` Movement comes from verification, never from the

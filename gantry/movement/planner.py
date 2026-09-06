@@ -14,12 +14,16 @@ partitions its checkpoints refer to.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from datetime import datetime, timedelta
 
 from gantry.core.dataset import DatasetManifest
 from gantry.core.operation import LifecycleStage, OperationType
+from gantry.jobs.model import JobKind
 from gantry.lifecycle.plan import NodeKind, PlanNode, PlanVersion, node_id
+from gantry.movement.beamjob import unit_of
+from gantry.movement.grouping import BEAM_COST, group_partitions
 from gantry.movement.model import Movement, MovementDataset, MovementMode, PartitionStrategy
 from gantry.movement.partitioning import Partition, plan_partitions, plan_time_partitions
 
@@ -175,33 +179,86 @@ def _snapshot_nodes(
     depends_on = (schema_id, *upstream)
 
     if not partitions:
+        # Bounds are not known yet, so there is one unit covering the whole
+        # dataset. It still has to be the *kind* of node this Movement's
+        # executor understands: a grouping kind that received a partition node
+        # would be executed by the wrong path entirely.
+        if movement.execution.kind is JobKind.SQL:
+            return (
+                PlanNode(
+                    id=node_id(movement.name, NodeKind.SNAPSHOT_PARTITION, dataset.name),
+                    kind=NodeKind.SNAPSHOT_PARTITION,
+                    stage=LifecycleStage.EXECUTE,
+                    scope=dataset.name,
+                    depends_on=depends_on,
+                    params=_snapshot_params(dataset),
+                ),
+            )
         return (
             PlanNode(
-                id=node_id(movement.name, NodeKind.SNAPSHOT_PARTITION, dataset.name),
-                kind=NodeKind.SNAPSHOT_PARTITION,
+                id=node_id(movement.name, NodeKind.SNAPSHOT_GROUP, dataset.name),
+                kind=NodeKind.SNAPSHOT_GROUP,
                 stage=LifecycleStage.EXECUTE,
                 scope=dataset.name,
                 depends_on=depends_on,
-                params=_snapshot_params(dataset),
+                params=_snapshot_params(dataset)
+                | {
+                    "partitions": json.dumps(
+                        [{"index": 0, "lo": None, "hi": None}], separators=(",", ":")
+                    )
+                },
             ),
         )
 
+    if movement.execution.kind is JobKind.SQL:
+        return tuple(
+            PlanNode(
+                id=node_id(movement.name, NodeKind.SNAPSHOT_PARTITION, partition.id),
+                kind=NodeKind.SNAPSHOT_PARTITION,
+                stage=LifecycleStage.EXECUTE,
+                scope=partition.id,
+                depends_on=depends_on,
+                params=_snapshot_params(dataset)
+                | {
+                    "partition_index": str(partition.index),
+                    "partition_method": partition.method.value,
+                    **({"lo": partition.lo} if partition.lo is not None else {}),
+                    **({"hi": partition.hi} if partition.hi is not None else {}),
+                },
+            )
+            for partition in partitions
+        )
+
+    # A kind whose jobs are expensive to start groups partitions together, and
+    # the group becomes the checkpoint unit. The grouping happens here, at plan
+    # time, and not in the executor: the checkpoint covers a node, so a group
+    # that is not a node cannot be checkpointed as one.
+    groups = group_partitions(
+        partitions,
+        cost=BEAM_COST,
+        overhead_fraction=movement.execution.overhead_fraction,
+    )
     return tuple(
         PlanNode(
-            id=node_id(movement.name, NodeKind.SNAPSHOT_PARTITION, partition.id),
-            kind=NodeKind.SNAPSHOT_PARTITION,
+            id=node_id(movement.name, NodeKind.SNAPSHOT_GROUP, unit_of(group)),
+            kind=NodeKind.SNAPSHOT_GROUP,
             stage=LifecycleStage.EXECUTE,
-            scope=partition.id,
+            scope=unit_of(group),
             depends_on=depends_on,
             params=_snapshot_params(dataset)
             | {
-                "partition_index": str(partition.index),
-                "partition_method": partition.method.value,
-                **({"lo": partition.lo} if partition.lo is not None else {}),
-                **({"hi": partition.hi} if partition.hi is not None else {}),
+                "partition_method": group[0].method.value,
+                # The bounds the plan recorded, verbatim. Read back rather than
+                # recomputed at execution time: recomputing would let a
+                # partition move under a replay, and its checkpoint would then
+                # refer to work that no longer exists.
+                "partitions": json.dumps(
+                    [{"index": part.index, "lo": part.lo, "hi": part.hi} for part in group],
+                    separators=(",", ":"),
+                ),
             },
         )
-        for partition in partitions
+        for group in groups
     )
 
 

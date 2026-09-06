@@ -9,6 +9,8 @@ was confirmed, and nothing else in the runtime can manufacture one.
 
 from __future__ import annotations
 
+import json
+from collections.abc import Sequence
 from datetime import UTC, datetime
 
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -18,12 +20,16 @@ from gantry.adapters.target.postgres import PostgresTargetAdapter
 from gantry.core.commit import CommitResult
 from gantry.core.dataset import DatasetManifest
 from gantry.jobs import Runner, run_to_completion
-from gantry.jobs.packaging import sql_client_packaging
+from gantry.jobs.packaging import beam_packaging, sql_client_packaging
 from gantry.jobs.runners import DockerRunner
 from gantry.lifecycle.plan import NodeKind, PlanNode
+from gantry.movement.beamjob import JDBC_SECRETS, unit_of
+from gantry.movement.beamjob import compile_snapshot_job as beam_compile_snapshot_job
 from gantry.movement.jobdsn import JobConnections
 from gantry.movement.partitioning import Partition, PartitionMethod
+from gantry.movement.predicate import bounds
 from gantry.movement.sqljob import SOURCE_DSN, TARGET_DSN, compile_snapshot_job, parse_commit
+from gantry.verification.checksum import compute_checksum
 
 
 class MovementExecutor:
@@ -74,6 +80,8 @@ class MovementExecutor:
                 return await self._create_schema(node)
             case NodeKind.SNAPSHOT_PARTITION:
                 return await self._snapshot_partition(node)
+            case NodeKind.SNAPSHOT_GROUP:
+                return await self._snapshot_group(node)
             case _:
                 # Discovery, CDC and verification nodes arrive on later days.
                 # Until then they are recorded as completing without effect,
@@ -102,6 +110,69 @@ class MovementExecutor:
         )
         return parse_commit(await run_to_completion(self._runner, job))
 
+    async def _snapshot_group(self, node: PlanNode) -> CommitResult:
+        """Several partitions in one job, checkpointed only once verified.
+
+        A Beam pipeline reports no per-row counts a submitter can read: reaching
+        `DONE` says it finished, not that the rows are right, and a checkpoint
+        may not advance on that alone. So the verification *is* the attestation
+        here — the group's checksums must agree on both sides before this
+        returns a `CommitResult`, and returning one is the only thing that lets
+        a checkpoint move.
+
+        A group that does not verify raises. The task fails, the lease expires,
+        and the group runs again — which is safe because the write is an upsert,
+        and correct because nothing recorded progress over rows that were never
+        confirmed.
+        """
+        dataset = _dataset_of_group(node)
+        manifest = self._manifest_for(dataset)
+        partitions = _partitions_from_group(node, dataset)
+        target = self._target_for(dataset)
+
+        job = beam_compile_snapshot_job(
+            self._operation,
+            manifest,
+            partitions,
+            target=target,
+            packaging=beam_packaging(secrets=JDBC_SECRETS, network=self._connections.network),
+        )
+        await run_to_completion(self._runner, job)
+
+        agreed = await self._verify_group(manifest, partitions, target=target)
+        return CommitResult(
+            # Deliberately zero. Beam reports no counts, and inventing them from
+            # the verification would be a different number wearing the same
+            # name: the checksum says the sides agree, not how many rows this
+            # job wrote.
+            rows_inserted=0,
+            rows_updated=0,
+            rows_unchanged=agreed,
+            committed_at=datetime.now(UTC),
+        )
+
+    async def _verify_group(
+        self, manifest: DatasetManifest, partitions: Sequence[Partition], *, target: str
+    ) -> int:
+        """Compare both sides over the group's key range. Returns the row count.
+
+        Computed inside each engine, so what crosses the wire is one checksum
+        and one count per side rather than any rows.
+        """
+        predicate = " OR ".join(f"({bounds(manifest, part)})" for part in partitions)
+        source_side = await compute_checksum(
+            self._source_engine, manifest, manifest.name, predicate=predicate, params={}
+        )
+        target_side = await compute_checksum(
+            self._target_engine, manifest, target, predicate=predicate, params={}
+        )
+        if source_side != target_side:
+            raise GroupVerificationError(
+                f"group {unit_of(partitions)} did not verify: "
+                f"source {source_side.describe()}, target {target_side.describe()}"
+            )
+        return source_side.rows
+
     def _manifest_for(self, dataset: str) -> DatasetManifest:
         manifest = self._manifests.get(dataset)
         if manifest is None:
@@ -118,6 +189,39 @@ class MovementExecutor:
 def _dataset_of(scope: str) -> str:
     """A partition scope is `dataset/index`; a dataset scope is just the name."""
     return scope.rsplit("/", 1)[0] if "/" in scope else scope
+
+
+class GroupVerificationError(Exception):
+    """A group's sides disagreed, so nothing may be checkpointed for it."""
+
+
+def _dataset_of_group(node: PlanNode) -> str:
+    """A group scope is a comma-separated list of `dataset/index` ids."""
+    first = (node.scope or "").split(",")[0]
+    return _dataset_of(first)
+
+
+def _partitions_from_group(node: PlanNode, dataset: str) -> tuple[Partition, ...]:
+    """Rebuild the partitions the plan recorded for this group.
+
+    Read back rather than recomputed, for the same reason a single partition is:
+    recomputing at execution time would let the group's membership shift under a
+    replay, and its checkpoint would then cover work that no longer exists.
+    """
+    recorded = json.loads(node.params["partitions"])
+    method = PartitionMethod(node.params.get("partition_method", "single"))
+    column = node.params["partition_column"]
+    return tuple(
+        Partition(
+            dataset=dataset,
+            index=int(entry["index"]),
+            column=column,
+            lo=entry.get("lo"),
+            hi=entry.get("hi"),
+            method=method,
+        )
+        for entry in recorded
+    )
 
 
 def _partition_from(node: PlanNode, dataset: str) -> Partition:

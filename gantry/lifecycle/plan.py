@@ -34,6 +34,7 @@ class NodeKind(StrEnum):
     PROFILE = "profile"
     CREATE_SCHEMA = "create_schema"
     SNAPSHOT_PARTITION = "snapshot_partition"
+    SNAPSHOT_GROUP = "snapshot_group"
     START_CDC = "start_cdc"
     APPLY_CDC = "apply_cdc"
     WAIT_FOR_LAG = "wait_for_lag"
@@ -234,7 +235,10 @@ def checkpoint_scope_for(kind: NodeKind) -> CheckpointScope:
     checkpoint is evidence, and evidence labelled with the wrong scope answers
     a question nobody asked.
     """
-    if kind is NodeKind.SNAPSHOT_PARTITION:
+    if kind in (NodeKind.SNAPSHOT_PARTITION, NodeKind.SNAPSHOT_GROUP):
+        # A group covers several partitions, and its checkpoint covers all of
+        # them at once. That is the whole cost of grouping and is why the scope
+        # is still `partition` — what changed is how many, not what kind.
         return CheckpointScope.PARTITION
     if kind in (NodeKind.START_CDC, NodeKind.APPLY_CDC, NodeKind.WAIT_FOR_LAG):
         return CheckpointScope.STREAM

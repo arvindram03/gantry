@@ -9,6 +9,7 @@ absent rather than pulling 4.65 GB behind someone's back.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -20,7 +21,10 @@ from gantry.core.dataset import DatasetManifest
 from gantry.jobs.execute import JobFailedError, run_to_completion
 from gantry.jobs.packaging import DEFAULT_BEAM_IMAGE, beam_packaging
 from gantry.jobs.runners import DockerRunner
+from gantry.lifecycle.plan import LifecycleStage, NodeKind, PlanNode
 from gantry.movement.beamjob import COMMIT_MARKER, JDBC_SECRETS, compile_snapshot_job
+from gantry.movement.executor import GroupVerificationError, MovementExecutor
+from gantry.movement.jobdsn import JobConnections
 from gantry.movement.partitioning import Partition, PartitionMethod
 from gantry.state.database import create_engine, transaction
 from sqlalchemy import text
@@ -89,6 +93,21 @@ async def sides() -> AsyncIterator[tuple[AsyncEngine, AsyncEngine]]:
             async with transaction(engine) as connection:
                 await connection.execute(text(f"DROP TABLE IF EXISTS {TABLE}"))
             await engine.dispose()
+
+
+def _group_node(bounds: list[tuple[int, str | None, str | None]]) -> PlanNode:
+    """A SNAPSHOT_GROUP node shaped exactly as the planner emits one."""
+    return PlanNode(
+        id="probe-group",
+        kind=NodeKind.SNAPSHOT_GROUP,
+        stage=LifecycleStage.EXECUTE,
+        scope=",".join(f"{TABLE}/{index:05d}" for index, _, _ in bounds),
+        params={
+            "partition_column": "id",
+            "partition_method": PartitionMethod.HISTOGRAM.value,
+            "partitions": json.dumps([{"index": i, "lo": lo, "hi": hi} for i, lo, hi in bounds]),
+        },
+    )
 
 
 async def manifest_of(source: AsyncEngine) -> DatasetManifest:
@@ -213,3 +232,72 @@ async def test_a_beam_snapshot_refuses_to_overwrite_a_newer_row(
 
     assert survivors == 100, "the snapshot overwrote rows newer than its own position"
     assert moved == 1000, "and the rows it was entitled to write are still there"
+
+
+async def test_a_group_is_checkpointed_only_after_it_verifies(
+    sides: tuple[AsyncEngine, AsyncEngine],
+) -> None:
+    """The rule that makes `DONE` safe to act on.
+
+    A Beam pipeline reports no counts a submitter can read, so reaching DONE
+    says it finished and nothing about whether the rows are right. The executor
+    therefore verifies the group itself, and the CommitResult - the only thing
+    that lets a checkpoint advance - is produced by that verification.
+    """
+    source, target = sides
+    executor = MovementExecutor(
+        source_engine=source,
+        target_engine=target,
+        operation="beam-group-probe",
+        manifests={TABLE: await manifest_of(source)},
+        targets={TABLE: TABLE},
+        connections=JobConnections(
+            source=SECRETS["GANTRY_SOURCE_JDBC"],
+            target=SECRETS["GANTRY_TARGET_JDBC"],
+            network=NETWORK,
+        ),
+        runner=DockerRunner(secrets=SECRETS),
+    )
+
+    result = await executor.execute(_group_node([(0, "1", "1001"), (1, "1001", "2001")]))
+    assert result.rows_unchanged == ROWS, "the verification counts what it compared"
+    assert await target_rows(target) == ROWS
+
+
+async def test_a_group_that_does_not_verify_is_not_checkpointed(
+    sides: tuple[AsyncEngine, AsyncEngine],
+) -> None:
+    """No CommitResult, so nothing can record progress over the group.
+
+    The disagreement is a row the target holds and the source does not, which
+    an upsert cannot repair — so the job keeps succeeding and the verification
+    keeps refusing, which is the behaviour that matters. A partially-committed
+    Beam group looks like this from the outside: bundles land independently, so
+    the target can hold rows that no longer reconcile with the source.
+    """
+    source, target = sides
+    executor = MovementExecutor(
+        source_engine=source,
+        target_engine=target,
+        operation="beam-group-probe",
+        manifests={TABLE: await manifest_of(source)},
+        targets={TABLE: TABLE},
+        connections=JobConnections(
+            source=SECRETS["GANTRY_SOURCE_JDBC"],
+            target=SECRETS["GANTRY_TARGET_JDBC"],
+            network=NETWORK,
+        ),
+        runner=DockerRunner(secrets=SECRETS),
+    )
+    node = _group_node([(0, "1", "1001")])
+    await executor.execute(node)
+
+    # Remove a row from the source. The target keeps it, and an upsert has no
+    # way to delete it, so the job goes on succeeding while the two sides go on
+    # disagreeing.
+    async with transaction(source) as connection:
+        await connection.execute(text(f"DELETE FROM {TABLE} WHERE id = 5"))
+
+    with pytest.raises(GroupVerificationError) as raised:
+        await executor.execute(node)
+    assert "did not verify" in str(raised.value)
