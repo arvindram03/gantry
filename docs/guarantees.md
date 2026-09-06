@@ -109,12 +109,57 @@ Beam reports no per-row counts a submitter can read. A pipeline that reaches
   reconciliation on a `beam` Movement comes from verification, never from the
   job.
 
+## Verifying a target with no engine
+
+A PostgreSQL target computes its own checksum: Gantry sends SQL and the engine
+answers with one number. An Iceberg table is a set of Parquet files and a
+metadata tree, and there is nothing to send SQL to.
+
+Streaming every row into the Gantry process to add them up would verify the data
+and break the thing this project is for. So the checksum is computed **by a
+job**, in a container, and what comes back is one checksum and one row count —
+bounded by construction rather than by the size of the data, exactly as it is
+for PostgreSQL.
+
+| | PostgreSQL target | Iceberg target |
+|---|---|---|
+| Who computes the checksum | the engine | a verification job (`docker/verify`) |
+| What crosses into Gantry | one number, one count | one number, one count |
+| Implementation | `verification/checksum.py` (SQL) | `verification/portable.py` (Python) |
+
+**Those two implementations must agree exactly, and that is a standing hazard.**
+They are checked against each other over deliberately awkward values — numerics
+with trailing zeroes, floats, microsecond timestamps with non-UTC offsets,
+nulls, byte strings, multi-byte text — against a real PostgreSQL rather than
+against anyone's reading of the manual. They disagreed on the first run, on
+every `double precision` value, because `round(x::numeric, 10)::text` keeps its
+ten decimal places and the Python side had trimmed them. A checksum wrong on one
+column type is the failure this pairing exists to catch.
+
+## What an Iceberg target refuses
+
+Iceberg's type system is smaller than PostgreSQL's, and the gaps are real. A
+column that cannot be held is refused **in Prepare, with the column named** —
+not at row forty million inside a Java writer:
+
+| Refused | Why |
+|---|---|
+| `json`, `jsonb`, `xml` | no equivalent type; store as text and say so |
+| `interval` | no interval type; a duration must become a number of units |
+| `money` | locale-dependent even within PostgreSQL |
+| `numeric` with no precision | unbounded in PostgreSQL; choosing a bound silently stores something else |
+| `numeric(p,s)` with p > 38 | Iceberg decimals stop at 38 digits |
+| anything unmapped | refused rather than guessed |
+
+Every problem in a schema is reported at once, because fixing a schema one round
+trip per column is a bad way to spend an afternoon.
+
 ## Choosing
 
 | | `sql` | `beam` |
 |---|---|---|
 | For | ordinary databases, one source to one target | large volumes across heterogeneous sources and sinks |
-| Reach | wherever `psql` can connect | wherever Beam has an I/O connector |
+| Reach | wherever `psql` can connect | wherever Beam has an I/O connector — **Iceberg proven**, on a local filesystem catalog |
 | Image | 411 MB (`postgres:16-alpine`) | 4.65 GB (a JRE and pre-staged JARs; see `docker/beam/Dockerfile`) |
 | Guarantee | stronger — partition-granular | weaker — group-granular |
 

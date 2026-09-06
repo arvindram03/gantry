@@ -10,6 +10,9 @@
 #      no Java, so JdbcIO cannot run in it at all.
 #   2. The expansion service JAR, staged at build time.
 #   3. The PostgreSQL JDBC driver, likewise.
+#   4. The io expansion service, which is what the managed Iceberg sink runs on.
+#      A different jar from the schemaio one: JdbcIO and IcebergIO do not share
+#      an expansion service.
 #
 # Staging the JARs is not hardening. Left to itself Beam downloads both from
 # Maven Central *at execution time*, in the process holding the database
@@ -36,7 +39,9 @@ RUN mkdir -p /root/.apache_beam/cache/jars \
  && curl -fsSL -o "/root/.apache_beam/cache/jars/beam-sdks-java-extensions-schemaio-expansion-service-${BEAM_VERSION}.jar" \
       "${MAVEN}/org/apache/beam/beam-sdks-java-extensions-schemaio-expansion-service/${BEAM_VERSION}/beam-sdks-java-extensions-schemaio-expansion-service-${BEAM_VERSION}.jar" \
  && curl -fsSL -o "/root/.apache_beam/cache/jars/postgresql-${PG_JDBC_VERSION}.jar" \
-      "${MAVEN}/org/postgresql/postgresql/${PG_JDBC_VERSION}/postgresql-${PG_JDBC_VERSION}.jar"
+      "${MAVEN}/org/postgresql/postgresql/${PG_JDBC_VERSION}/postgresql-${PG_JDBC_VERSION}.jar" \
+ && curl -fsSL -o "/root/.apache_beam/cache/jars/beam-sdks-java-io-expansion-service-${BEAM_VERSION}.jar" \
+      "${MAVEN}/org/apache/beam/beam-sdks-java-io-expansion-service/${BEAM_VERSION}/beam-sdks-java-io-expansion-service-${BEAM_VERSION}.jar"
 
 # The SDK image's entrypoint is the worker boot binary, which expects to be
 # handed an id by a runner. A Gantry job supplies its own argv, so the
