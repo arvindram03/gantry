@@ -274,3 +274,44 @@ implied.
 Each run cross-checks the reported counts against the target's own row count;
 they agreed exactly (1,000,000 both ways) on every run, which is the same
 attestation a checkpoint rests on.
+
+## v1.2 Day 3 — does the Python JDBC path need Java?
+
+Day 0 left this as an open `[A]`, because it decides whether Beam is affordable
+rather than merely possible. Measured with apache-beam 2.76.0 on Python 3.12,
+Direct runner, against the dev stack's Postgres.
+
+| Step | Result |
+|---|---|
+| `from apache_beam.io.jdbc import ReadFromJdbc` | **OK** — the Python side is a stub |
+| Running the pipeline | **Fails without a JRE**: `Service failed to start up with error 1`, after 3 attempts, 5.8 s |
+| What it does first | **Downloads two JARs from Maven Central at runtime** |
+
+The JARs are `beam-sdks-java-extensions-schemaio-expansion-service-2.76.0.jar`
+and `postgresql-42.2.16.jar`, fetched to `~/.apache_beam/cache/jars/`. Beam
+prints its own warning about this: *"Apache Beam is downloading dependencies
+from a public repository at runtime. This may pose security risks."*
+
+**The answer is yes.** `apache_beam.io.jdbc` is a cross-language transform; the
+Python API is a facade over a Java expansion service, and using it means a JRE,
+a JAR cache, and — unless the JARs are pre-staged — a Maven Central fetch at
+execution time, in the process that holds the database credentials.
+
+**What this does and does not settle.** It does not block the `beam` job kind:
+under the v1.2 model a job is a container, so the JRE and the pre-staged JARs
+are the image's problem, not Gantry's, and Gantry gains no Beam dependency
+either way. What it settles is the *cost*: the `beam` image carries a Java
+runtime and a JDBC driver next to production credentials, against 411 MB of
+`postgres:16-alpine` for the `sql` kind, and pre-staging is not optional
+hardening but a requirement for a job that must not reach the public internet
+while running.
+
+It also narrows the honest options for a Beam job that reads Postgres:
+
+| Option | Java | Cost |
+|---|---|---|
+| `JdbcIO` via the expansion service | **required** | large image, pre-staged JARs, a second runtime to operate |
+| A plain Python `DoFn` using `psycopg` | not required | loses `JdbcIO`, and a per-row Python read against a `COPY` baseline of ~180k rows/sec |
+
+Neither is free, and the choice is not obvious. Recorded here so Day 4's
+guarantee table and the cut-line decision rest on a measurement.
