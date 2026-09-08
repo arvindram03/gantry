@@ -1,52 +1,33 @@
 [project]
 name = "gantry"
-version = "0.3.0"
-description = "Open-source reliability and execution layer for data movement and analysis"
+version = "0.5.0"
+description = "A common execution control plane for agent-generated data work"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "Apache-2.0" }
-
-# Core stays deliberately small. Adapter ecosystems live in extras so database
-# and agent SDK dependencies cannot conflict (spec section 17).
-dependencies = [
-    "pydantic>=2.9",
-    "pydantic-settings>=2.5",
-    "typer>=0.12",
-    "rich>=13.8",
-    "sqlalchemy[asyncio]>=2.0",
-    "alembic>=1.13",
-    "structlog>=24.4",
-    "pyyaml>=6.0",
-]
+dependencies = []
 
 [project.optional-dependencies]
-postgres = ["asyncpg>=0.29", "psycopg[binary]>=3.2"]
-# httpx drives the Kafka Connect REST API, which is how a Debezium
-# connector is provisioned and torn down.
-kafka = ["aiokafka>=0.11", "httpx>=0.27"]
-# pytz is not optional in practice: DuckDB needs it to handle timestamptz.
-duckdb = ["duckdb>=1.1", "pytz>=2024.1"]
-temporal = ["temporalio>=1.8"]
-telemetry = [
-    "opentelemetry-api>=1.27",
-    "opentelemetry-sdk>=1.27",
-    "opentelemetry-exporter-otlp>=1.27",
-    "prometheus-client>=0.21",
+postgres = ["asyncpg>=0.30"]
+duckdb = ["duckdb>=1.1"]
+bigquery = ["google-cloud-bigquery>=3.25"]
+snowflake = ["snowflake-connector-python>=3.12"]
+all-sql = [
+    "asyncpg>=0.30",
+    "duckdb>=1.1",
+    "google-cloud-bigquery>=3.25",
+    "snowflake-connector-python>=3.12",
 ]
-all = ["gantry[postgres,kafka,duckdb,telemetry,temporal]"]
-
-[project.scripts]
-gantry = "gantry.cli.main:app"
 
 [dependency-groups]
 dev = [
-    "ruff>=0.6",
+    "build>=1.2",
+    "duckdb>=1.1",
     "mypy>=1.11",
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
     "pytest-cov>=5.0",
-    "pre-commit>=3.8",
-    "types-pyyaml>=6.0",
+    "ruff>=0.6",
 ]
 
 [build-system]
@@ -63,39 +44,13 @@ src = ["gantry", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "SIM", "TID", "RUF", "ASYNC"]
-ignore = ["A003"]
 
-[tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101"]
-
-# Strict typing is a v1 definition-of-done item: no Any in public interfaces.
-# `disallow_any_explicit` is deliberately NOT set - pydantic's mypy plugin
-# synthesises `**data: Any` into every model's __init__, so the flag fires on
-# generated code rather than on our annotations. strict = true still gives
-# disallow_any_generics, disallow_untyped_defs and warn_return_any, which catch
-# the cases that actually matter.
 [tool.mypy]
 python_version = "3.12"
 strict = true
 warn_unreachable = true
-plugins = ["pydantic.mypy"]
-
-# Subprocess helper for the crash-replay test; imported by path at runtime.
-[[tool.mypy.overrides]]
-module = ["build_plan"]
-ignore_missing_imports = true
-
-# aiokafka ships no type information.
-[[tool.mypy.overrides]]
-module = ["aiokafka", "aiokafka.*"]
-ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-markers = [
-    "integration: requires the docker-compose stack (make dev-up)",
-    "chaos: fault-injection tests (worker kill, duplicate delivery, target stall)",
-    "beam: needs the gantry/beam image and costs ~11s per job; run deliberately",
-]
-addopts = "-m 'not integration' --strict-markers"
+addopts = "--strict-markers"

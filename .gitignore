@@ -14,6 +14,3 @@ htmlcov/
 .idea/
 .vscode/
 .gantry/
-
-# Rehearsal working files
-.gantry/
