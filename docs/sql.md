@@ -47,7 +47,19 @@ result = await tool.invoke(sql="SELECT COUNT(*) FROM analytics.payments")
 `db.describe()` and `db.explain(sql)` remain direct application operations. Query policy never
 appears in the agent tool schema.
 
-## A worked example
+## Worked examples
+
+`examples/` holds a runnable file per scenario, with an index in
+[examples/README.md](../examples/README.md) that starts from what you are trying
+to do:
+
+| I want to… | Example |
+|---|---|
+| Let an agent answer questions about a database | `agent_sql.py` |
+| Try this with nothing to set up | `local_duckdb.py` |
+| Let an agent build a table, and check it before trusting it | `materialize_and_verify.py` |
+| Run something expensive without holding a request open | `long_running_query.py` |
+| Run a continuous job, and know whether it is healthy | `streaming_flink.py` |
 
 `examples/agent_sql.py` is a runnable version of the above against local
 PostgreSQL, Neon, or Supabase — the same code, a different provider name and

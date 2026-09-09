@@ -1,6 +1,42 @@
 # Examples
 
-## `agent_sql.py` — a governed SQL tool for an agent
+Each file is runnable and does one thing. Start with the row that matches what
+you are trying to do.
+
+| I want to… | Example | Needs |
+|---|---|---|
+| Let an agent answer questions about a database | [`agent_sql.py`](agent_sql.py) | PostgreSQL (local, Neon, or Supabase) |
+| Try all of this with nothing to set up | [`local_duckdb.py`](local_duckdb.py) | a file on disk |
+| Let an agent **build** a table, and check it before trusting it | [`materialize_and_verify.py`](materialize_and_verify.py) | a file on disk |
+| Run something expensive without holding a request open | [`long_running_query.py`](long_running_query.py) | PostgreSQL |
+| Run a continuous job, and know whether it is healthy | [`streaming_flink.py`](streaming_flink.py) | a Flink cluster |
+
+If you are only reading one, read `local_duckdb.py`. It needs nothing, and the
+boundary it demonstrates is the same one every other example relies on.
+
+## What they have in common
+
+Every example splits the same way, and it is the reason the library exists:
+
+- **You** configure the connection and the policy. That is application code, it
+  holds the credential, and it decides what is allowed.
+- **The agent** gets `.tool()` — one input, `sql`. It cannot widen the policy,
+  reach another schema, or see the connection string, because none of those are
+  arguments it can pass.
+
+The other recurring idea is that *the engine succeeding* and *the answer being
+usable* are different questions. A `CREATE TABLE AS` that matched no rows
+succeeds. A streaming job that has restarted forty times is `RUNNING`. Gantry's
+job is the second question — see `materialize_and_verify.py` for the clearest
+case of the two disagreeing.
+
+## Which provider?
+
+`agent_sql.py` runs unchanged against local PostgreSQL, Neon, and Supabase. The
+connection details differ in ways that fail confusingly, so they are written out
+below.
+
+## `agent_sql.py`## `agent_sql.py` — a governed SQL tool for an agent
 
 The same code against local PostgreSQL, Neon, or Supabase. Only the provider
 name and the URL change.
