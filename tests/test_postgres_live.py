@@ -102,3 +102,38 @@ async def test_a_write_is_refused_before_it_reaches_the_database(
 async def test_explain_runs_against_the_engine(db: gantry.sql.SQLConnection) -> None:
     plan = await db.explain("SELECT 1")
     assert plan is not None
+
+
+def test_the_transaction_pooler_rule_needs_no_database() -> None:
+    """The statement-cache rule, checked without connecting to anything.
+
+    It has to be unit-tested precisely because it cannot be trusted to a live
+    check: whether the bug appears depends on which backend the pooler hands
+    you, so a passing connection proves nothing about the rule being right.
+    """
+    from gantry.sql.adapters.postgres import _apply_transaction_pooling
+
+    pooled: dict[str, object] = {}
+    _apply_transaction_pooling(
+        "supabase", "postgresql://u:p@aws-0-us-west-2.pooler.supabase.com:6543/postgres", pooled
+    )
+    assert pooled == {"statement_cache_size": 0}
+
+    for provider, url in (
+        # Session pooler and direct: a backend per client connection.
+        ("supabase", "postgresql://u:p@aws-0-us-west-2.pooler.supabase.com:5432/postgres"),
+        ("supabase", "postgresql://u:p@db.ref.supabase.co:5432/postgres"),
+        # Neon's pooler carries prepared statements; measured, and not the same
+        # question despite the identical shape.
+        ("neon", "postgresql://u:p@ep-x-pooler.region.aws.neon.tech:6543/db"),
+        ("postgres", "postgresql://u:p@localhost:6543/db"),
+    ):
+        untouched: dict[str, object] = {}
+        _apply_transaction_pooling(provider, url, untouched)
+        assert untouched == {}, f"{provider} {url} should not have been changed"
+
+    explicit: dict[str, object] = {"statement_cache_size": 100}
+    _apply_transaction_pooling(
+        "supabase", "postgresql://u:p@aws-0-us-west-2.pooler.supabase.com:6543/postgres", explicit
+    )
+    assert explicit == {"statement_cache_size": 100}, "an explicit setting must win"

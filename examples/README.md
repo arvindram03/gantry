@@ -54,40 +54,43 @@ python examples/agent_sql.py
 
 ### Supabase
 
-Verified against a live Supabase project (PostgreSQL 17.6, direct endpoint).
+Verified against a live project (PostgreSQL 17.6) on the direct host and both
+poolers.
 
 ```bash
 export GANTRY_PROVIDER=supabase
-export GANTRY_DATABASE_URL="postgresql://postgres:PASSWORD@db.PROJECT_REF.supabase.co:5432/postgres"
+export GANTRY_DATABASE_URL="postgresql://postgres.PROJECT_REF:PASSWORD@REGION.pooler.supabase.com:6543/postgres"
 psql "$GANTRY_DATABASE_URL" -f examples/seed.sql
 python examples/agent_sql.py
 ```
 
-Three endpoints, and the choice changes what you must pass:
+**Use the transaction pooler (`:6543`).** Measured, 40 concurrent queries:
 
-| Endpoint | Host / port | Statement cache | Verified |
-|---|---|---|---|
-| Direct | `db.REF.supabase.co:5432` | keep it | **yes** |
-| Session pooler | `REGION.pooler.supabase.com:5432`, user `postgres.REF` | keep it | no |
-| Transaction pooler | same host, `:6543` | **`statement_cache_size=0`** | no |
+| Endpoint | Result |
+|---|---|
+| Transaction pooler `:6543` | **0/40 failed** |
+| Session pooler `:5432` | **25/40 failed** — `max clients reached` |
+| Direct `db.REF.supabase.co:5432` | 0/40, but IPv6-only |
 
-- **TLS is required** on all three.
-- **The direct host is IPv6-only.** Measured: it publishes an `AAAA` record and
-  **no `A` record at all**. It works from a machine with IPv6 and fails from one
-  without — including plenty of CI runners — with a name-resolution error that
-  does not mention IPv6. Use a pooler endpoint from IPv4-only networks.
-- **`statement_cache_size=0` belongs to the transaction pooler, not to
-  Supabase.** Only port 6543 recycles the session between statements, which is
-  what stops a server-side prepared statement from surviving; asyncpg prepares
-  every statement. On the direct host the cache is fine — measured, 30
-  concurrent distinct queries, no failures — and turning it off there gives up
-  caching for nothing. The example keys this off the port for that reason.
+The session pooler holds a backend for the life of each client connection. This
+library opens a connection per query, so concurrent queries exhaust the pool
+almost immediately — the session pooler is the wrong shape for this workload,
+not merely slower.
 
-The transaction-pooler row is still from Supabase's documentation rather than
-measurement: the project tested was reached directly. **Note that the equivalent
-claim proved false for Neon**, whose pooler does support protocol-level prepared
-statements — so if you run against Supabase's 6543 endpoint and it behaves the
-same way, this workaround should go.
+The direct host publishes an `AAAA` record and **no `A` record at all**. It
+works from a machine with IPv6 and fails from one without — including plenty of
+CI runners — with a resolution error that never mentions IPv6.
+
+**You do not need `statement_cache_size=0`; the adapter sets it for you** on
+`:6543`. asyncpg prepares every statement server-side, and a transaction-pooled
+backend is often not the one that prepared it.
+
+That workaround is widely described as obsolete, and it is worth knowing why it
+is not. Testing it here, 40 concurrent queries passed with the cache on, and so
+did one connection reused across 25 transactions — then an ordinary
+`describe()` failed on the very next run. Whether it bites depends on which
+backend the pooler hands you, so **a passing test is not evidence** and only the
+pooling mode is. Pass `statement_cache_size` explicitly to override.
 
 ### Running the tests against a hosted database
 

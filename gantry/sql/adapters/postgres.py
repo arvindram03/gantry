@@ -10,6 +10,7 @@ from contextlib import suppress
 from datetime import UTC, datetime
 from types import ModuleType
 from typing import Protocol, cast
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from gantry.context import Context
@@ -283,6 +284,7 @@ class PostgresAdapter:
         url = config.pop("url", None)
         config.pop("read_only", None)
         if isinstance(url, str):
+            _apply_transaction_pooling(self._target.provider, url, config)
             return await self._connect(url, **config)
         return await self._connect(**config)
 
@@ -313,3 +315,40 @@ def _unknown(handle: ExecutionHandle, message: str) -> Execution:
         ExecutionState.UNKNOWN,
         failure=Failure(FailureKind.UNKNOWN, False, message),
     )
+
+
+# Providers whose transaction-pooling endpoint cannot carry server-side prepared
+# statements, and the port that endpoint listens on.
+_TRANSACTION_POOLER_PORT = {"supabase": 6543}
+
+
+def _apply_transaction_pooling(provider: str, url: str, config: dict[str, object]) -> None:
+    """Disable the statement cache when the endpoint pools by transaction.
+
+    asyncpg prepares every statement server-side. A transaction-pooled endpoint
+    hands the next statement to whichever backend is free, which is often not
+    the one that did the preparing, and asyncpg then fails with `prepared
+    statement does not exist`.
+
+    This is worth doing here rather than leaving to the caller because of how
+    badly it hides. Forty concurrent queries against Supabase's `:6543` passed
+    with the cache on, and so did one connection reused across twenty-five
+    transactions — and then an ordinary `describe()` failed on the next run.
+    Whether it bites depends on which backend the pooler happens to hand you,
+    so a green test is not evidence and only the pooling mode is.
+
+    An explicit `statement_cache_size` always wins: a caller who has measured
+    their own deployment is better informed than this rule.
+    """
+    if "statement_cache_size" in config:
+        return
+    port = _TRANSACTION_POOLER_PORT.get(provider)
+    if port is None:
+        return
+    try:
+        if urlsplit(url).port == port:
+            config["statement_cache_size"] = 0
+    except ValueError:
+        # An unparseable port is the connect call's problem to report, not this
+        # helper's to guess about.
+        return

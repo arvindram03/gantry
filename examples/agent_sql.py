@@ -35,16 +35,6 @@ import gantry
 LOCAL_URL = "postgresql://gantry:gantry@localhost:15432/gantry"
 
 
-def _port(url: str) -> int | None:
-    """The port in a connection URL, if it names one."""
-    from urllib.parse import urlsplit
-
-    try:
-        return urlsplit(url).port
-    except ValueError:
-        return None
-
-
 def connect() -> gantry.sql.SQLConnection:
     """One connection, three hosting options.
 
@@ -63,18 +53,12 @@ def connect() -> gantry.sql.SQLConnection:
         return gantry.sql.connect("neon", url=url, ssl="require", timeout=30)
 
     if provider == "supabase":
-        # Supabase requires TLS on every endpoint.
-        #
-        # The statement cache is a *per-endpoint* question, not a per-provider
-        # one. Only the transaction pooler on port 6543 recycles the session
-        # between statements, which is what stops a server-side prepared
-        # statement from surviving; asyncpg prepares every statement, so there
-        # it must be turned off. On the direct host and the session pooler,
-        # doing that would give up statement caching for nothing.
-        extra: dict[str, object] = {}
-        if _port(url) == 6543:
-            extra["statement_cache_size"] = 0
-        return gantry.sql.connect("supabase", url=url, ssl="require", timeout=30, **extra)
+        # TLS on every endpoint. Nothing else is needed: on the transaction
+        # pooler (`:6543`) the adapter turns off asyncpg's statement cache for
+        # you, because a transaction-pooled backend is often not the one that
+        # prepared the statement. Pass `statement_cache_size` yourself if you
+        # have measured your own deployment and disagree.
+        return gantry.sql.connect("supabase", url=url, ssl="require", timeout=30)
 
     return gantry.sql.connect("postgres", url=url)
 
