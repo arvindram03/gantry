@@ -44,7 +44,7 @@ An agent receives only its narrow tool form:
 ```python
 tool = materialize.tool()
 
-tool.name          # "materialize_sql"
+tool.name  # "materialize_sql"
 tool.input_schema  # only {"sql": "..."}
 result = await tool.invoke(sql="CREATE TABLE agent_scratch.out AS SELECT * FROM raw.input")
 ```

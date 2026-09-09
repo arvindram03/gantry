@@ -147,7 +147,7 @@ Calling `.tool()` removes configuration from the model-visible interface:
 ```python
 tool = query.tool()
 
-tool.name          # "query_sql"
+tool.name  # "query_sql"
 tool.description
 tool.input_schema  # only {"sql": "..."}
 ```

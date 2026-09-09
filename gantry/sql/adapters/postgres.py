@@ -97,11 +97,15 @@ class PostgresAdapter:
         try:
             rows = await connection.fetch(
                 """
-                SELECT table_catalog, table_schema, table_name, table_type,
-                       column_name, data_type, is_nullable
-                FROM information_schema.columns
-                WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
-                ORDER BY table_catalog, table_schema, table_name, ordinal_position
+                SELECT c.table_catalog, c.table_schema, c.table_name, t.table_type,
+                       c.column_name, c.data_type, c.is_nullable
+                FROM information_schema.columns AS c
+                JOIN information_schema.tables AS t
+                  ON t.table_catalog = c.table_catalog
+                 AND t.table_schema = c.table_schema
+                 AND t.table_name = c.table_name
+                WHERE c.table_schema NOT IN ('pg_catalog', 'information_schema')
+                ORDER BY c.table_catalog, c.table_schema, c.table_name, c.ordinal_position
                 """
             )
         finally:

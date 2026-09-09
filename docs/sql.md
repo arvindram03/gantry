@@ -39,13 +39,27 @@ Or expose its narrow framework-neutral form to an agent:
 ```python
 tool = query.tool()
 
-tool.name         # "query_sql"
-tool.input_schema # only {"sql": "..."}
+tool.name  # "query_sql"
+tool.input_schema  # only {"sql": "..."}
 result = await tool.invoke(sql="SELECT COUNT(*) FROM analytics.payments")
 ```
 
 `db.describe()` and `db.explain(sql)` remain direct application operations. Query policy never
 appears in the agent tool schema.
+
+## A worked example
+
+`examples/agent_sql.py` is a runnable version of the above against local
+PostgreSQL, Neon, or Supabase — the same code, a different provider name and
+URL. `examples/README.md` covers the connection details that differ, including
+two that cause intermittent failures rather than clean ones:
+
+- **Neon** requires TLS, and a compute scaled to zero takes seconds to wake, so
+  the first connection is slow rather than broken.
+- **Supabase's transaction pooler** (port 6543) does not hold a session long
+  enough for server-side prepared statements to survive. asyncpg prepares every
+  statement, so pass `statement_cache_size=0` there. The session pooler and
+  direct connections have no such constraint.
 
 ## Safety boundary
 

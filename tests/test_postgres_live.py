@@ -1,0 +1,96 @@
+# SPDX-License-Identifier: Apache-2.0
+"""The PostgreSQL adapter against a real PostgreSQL.
+
+Every other test in this suite substitutes a stub adapter, which is the right
+way to test the governance layer and no way at all to test SQL. `describe()`
+shipped selecting `table_type` from `information_schema.columns`, where that
+column does not exist, and nothing noticed because nothing ran it.
+
+Skipped unless a database is reachable, so a clone without one still passes.
+Point it somewhere with `GANTRY_TEST_POSTGRES_URL` — including at Neon or
+Supabase, where the same tests are a useful check that the provider preset and
+TLS settings are right.
+"""
+
+from __future__ import annotations
+
+import os
+
+import gantry
+import pytest
+
+URL = os.environ.get(
+    "GANTRY_TEST_POSTGRES_URL", "postgresql://gantry:gantry@localhost:15432/gantry"
+)
+PROVIDER = os.environ.get("GANTRY_TEST_POSTGRES_PROVIDER", "postgres")
+
+
+def _connect() -> gantry.sql.SQLConnection:
+    pytest.importorskip("asyncpg")
+    return gantry.sql.connect(PROVIDER, url=URL)
+
+
+async def _reachable() -> bool:
+    """Is there actually a database there?
+
+    Imported dynamically, the way the adapter itself does it: asyncpg ships no
+    type information, and this test file is type-checked.
+    """
+    import importlib
+
+    asyncpg = importlib.import_module("asyncpg")
+    try:
+        connection = await asyncpg.connect(URL, timeout=5)
+    except Exception:
+        return False
+    await connection.close()
+    return True
+
+
+@pytest.fixture
+async def db() -> gantry.sql.SQLConnection:
+    connection = _connect()
+    if not await _reachable():
+        pytest.skip(f"no PostgreSQL at {URL.rsplit('@', 1)[-1]}")
+    return connection
+
+
+async def test_describe_reads_a_real_information_schema(
+    db: gantry.sql.SQLConnection,
+) -> None:
+    """The query has to be valid against the engine, not merely plausible."""
+    schema = await db.describe()
+
+    assert schema.schemas, "a live database has at least one non-system schema"
+    assert schema.tables, "and at least one table"
+    table = schema.tables[0]
+    assert table.columns, "a table must come back with its columns"
+    assert table.kind, "and its kind, which is what the broken query was reaching for"
+
+
+async def test_a_read_only_query_returns_bounded_rows(
+    db: gantry.sql.SQLConnection,
+) -> None:
+    query = db.query(read_only=True, max_rows=3, timeout=15)
+    result = await query("SELECT generate_series(1, 100) AS n")
+
+    assert result.inline is not None
+    assert len(result.inline.rows) <= 3
+    assert result.inline.truncated, "the row bound must be reported, not silently applied"
+
+
+async def test_a_write_is_refused_before_it_reaches_the_database(
+    db: gantry.sql.SQLConnection,
+) -> None:
+    """The refusal an agent will actually meet."""
+    query = db.query(read_only=True)
+    result = await query("CREATE TABLE gantry_should_not_exist (id int)")
+
+    assert result.status.value == "REJECTED"
+    assert result.failure is not None
+    assert "read-only" in result.failure.message
+
+
+async def test_explain_runs_against_the_engine(db: gantry.sql.SQLConnection) -> None:
+    plan = await db.explain("SELECT 1")
+    assert plan is not None
