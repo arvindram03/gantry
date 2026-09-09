@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Public Flink SQL connection API."""
+"""Internal Flink SQL runtime shared by batch and stream surfaces."""
 
 from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
 
 from gantry.capabilities import AdapterCapabilities
 from gantry.context import Context
@@ -22,15 +21,13 @@ from gantry.handle import ExecutionHandle
 from gantry.policy import PolicyRequirements
 from gantry.result import ResultStatus
 from gantry.runtime import ControlPlane, SubmissionError
+from gantry.sql.schema import Table
 from gantry.store import MemoryExecutionStore
 from gantry.verifier import VerificationResult
 
-if TYPE_CHECKING:
-    from gantry.flink.tool import FlinkTool
 
-
-class FlinkConnection:
-    """A credential-isolating control-plane connection to an existing cluster."""
+class FlinkRuntime:
+    """Internal credential-isolating runtime for an existing Flink cluster."""
 
     def __init__(self, target: FlinkTarget, adapter: FlinkAdapter | None = None) -> None:
         self._target = target
@@ -84,14 +81,25 @@ class FlinkConnection:
     async def metrics(self, handle: ExecutionHandle) -> FlinkMetrics:
         return await self._adapter.metrics(handle)
 
+    async def inspect_table(self, name: str, *, include_row_count: bool = False) -> Table | None:
+        return await self._adapter.inspect_table(name, include_row_count=include_row_count)
+
     async def health(
         self,
         handle: ExecutionHandle,
         *,
         checks: Sequence[FlinkHealthCheck] = (),
     ) -> StreamingHealth:
+        # Ask the adapter for metrics rather than rebuilding them from the
+        # execution's generic ones. `ExecutionMetrics.native` carries the raw
+        # Flink payloads (`job`, `vertices`, `output_rate`); the restart count
+        # and watermark lag are derived from those by the adapter and appear
+        # only on the FlinkMetrics it returns. Reconstructing them here found
+        # neither, so every check that needed one failed as "unavailable" on a
+        # perfectly healthy job.
         execution = await self.status(handle)
-        return _streaming_health(execution, checks)
+        metrics = await self.metrics(handle)
+        return _streaming_health(execution, checks, metrics)
 
     async def verify(
         self,
@@ -121,10 +129,40 @@ class FlinkConnection:
         )
         while True:
             execution = await self.status(handle)
-            metrics = FlinkMetrics.from_execution_metrics(execution.metrics)
+            # Metrics are fetched from the adapter, and only where a decision
+            # is actually made. `ExecutionMetrics.native` carries Flink's raw
+            # payloads; the restart count and watermark lag are derived from
+            # those by the adapter and appear only on the FlinkMetrics it
+            # returns, so rebuilding them here found neither and every check
+            # needing one failed as "unavailable" on a healthy job.
+            #
+            # Deriving it lazily also keeps the poll loop to one request:
+            # the value was previously computed on every iteration and used
+            # only in the terminal branches below.
+            metrics: FlinkMetrics | None = None
             if mode is FlinkMode.STREAMING and execution.state is ExecutionState.RUNNING:
-                health = _streaming_health(execution, checks)
+                metrics = await self.metrics(handle)
+                health = _streaming_health(execution, checks, metrics)
                 if not health.healthy:
+                    # Keep waiting rather than failing at the first look. A job
+                    # reaches RUNNING a moment before Flink registers its
+                    # metrics, so the earliest evaluation reports a restart
+                    # count of "not available yet" for a perfectly healthy job.
+                    # Failing on that made this flaky, which is worse than
+                    # wrong: it passed about one run in three.
+                    #
+                    # It is also what the operation promises — wait until the
+                    # stream reaches its health contract. Deciding at the first
+                    # unmet check is a different promise. The deadline still
+                    # bounds it, and a job that stops running leaves the loop
+                    # through the terminal branch below.
+                    # Only while a deadline bounds the wait. Without one there
+                    # is nothing to stop this waiting for ever on a stream that
+                    # is never going to be healthy, and refusing to decide is
+                    # worse than deciding early.
+                    if deadline is not None and datetime.now(UTC).timestamp() < deadline:
+                        await asyncio.sleep(poll_interval_seconds)
+                        continue
                     return _verification_failure(handle, health)
                 return FlinkResult(
                     ResultStatus.ACCEPTED,
@@ -136,6 +174,7 @@ class FlinkConnection:
                     health=health,
                 )
             if mode is FlinkMode.BATCH and execution.state is ExecutionState.SUCCEEDED:
+                metrics = await self.metrics(handle)
                 verification = verify_health(execution, metrics, tuple(checks))
                 if not verification.ok:
                     return FlinkResult(
@@ -155,7 +194,9 @@ class FlinkConnection:
                     metrics,
                     verification,
                 )
-            terminal = _terminal_result(execution, metrics)
+            terminal = _terminal_result(
+                execution, FlinkMetrics.from_execution_metrics(execution.metrics)
+            )
             if terminal is not None:
                 return terminal
             if deadline is not None and datetime.now(UTC).timestamp() >= deadline:
@@ -164,7 +205,7 @@ class FlinkConnection:
                     ResultStatus.FAILED,
                     handle=handle,
                     execution=execution,
-                    metrics=metrics,
+                    metrics=FlinkMetrics.from_execution_metrics(execution.metrics),
                     failure=Failure(
                         FailureKind.TIMEOUT,
                         True,
@@ -212,32 +253,21 @@ class FlinkConnection:
             timeout_seconds=timeout_seconds,
         )
 
-    def as_tool(
-        self,
-        *,
-        mode: FlinkMode | str = FlinkMode.STREAMING,
-        checks: Sequence[FlinkHealthCheck] = (),
-        timeout: float | None = None,
-    ) -> FlinkTool:
-        from gantry.flink.tool import FlinkTool
 
-        return FlinkTool(self, FlinkMode(mode), tuple(checks), timeout)
-
-
-def connect(
+def connect_runtime(
     endpoint: str,
     *,
     config: Mapping[str, object] | None = None,
     **options: object,
-) -> FlinkConnection:
-    """Connect to SQL Gateway, optionally using a separate JobManager endpoint."""
+) -> FlinkRuntime:
+    """Build the internal runtime shared by batch and stream surfaces."""
 
     values = dict(config or {})
     overlap = set(values) & set(options)
     if overlap:
         raise ValueError(f"duplicate Flink configuration fields: {', '.join(sorted(overlap))}")
     values.update(options)
-    return FlinkConnection(FlinkTarget(endpoint, values))
+    return FlinkRuntime(FlinkTarget(endpoint, values))
 
 
 def _coerce_artifact(value: FlinkSQLArtifact | str) -> FlinkSQLArtifact:
@@ -275,10 +305,12 @@ def _policy() -> PolicyRequirements:
 
 
 def _mode_from_handle(handle: ExecutionHandle) -> FlinkMode:
-    value = handle.metadata.get("mode", "streaming")
+    value = handle.metadata.get("flink_mode", handle.metadata.get("mode", "streaming"))
     try:
         if not isinstance(value, str):
             raise TypeError
+        if value == "stream":
+            return FlinkMode.STREAMING
         return FlinkMode(value)
     except (TypeError, ValueError):
         return FlinkMode.STREAMING
@@ -291,8 +323,13 @@ def _health_checks(checks: Sequence[FlinkHealthCheck]) -> tuple[FlinkHealthCheck
     return (JobRunning(), *values)
 
 
-def _streaming_health(execution: Execution, checks: Sequence[FlinkHealthCheck]) -> StreamingHealth:
-    metrics = FlinkMetrics.from_execution_metrics(execution.metrics)
+def _streaming_health(
+    execution: Execution,
+    checks: Sequence[FlinkHealthCheck],
+    metrics: FlinkMetrics | None = None,
+) -> StreamingHealth:
+    if metrics is None:
+        metrics = FlinkMetrics.from_execution_metrics(execution.metrics)
     verification = verify_health(execution, metrics, _health_checks(checks))
     return StreamingHealth(
         healthy=execution.state is ExecutionState.RUNNING and verification.ok,
@@ -303,13 +340,22 @@ def _streaming_health(execution: Execution, checks: Sequence[FlinkHealthCheck]) 
 
 
 def _terminal_result(execution: Execution, metrics: FlinkMetrics) -> FlinkResult | None:
+    """A finished job, whichever way it finished.
+
+    SUCCEEDED belongs here for a *streaming* job too. A pipeline over a bounded
+    source — a JDBC table, say — completes instead of settling into RUNNING, and
+    a wait that only recognised failure states span until its timeout waiting
+    for a steady state that had already come and gone.
+    """
     if execution.state not in {
+        ExecutionState.SUCCEEDED,
         ExecutionState.FAILED,
         ExecutionState.CANCELLED,
         ExecutionState.UNKNOWN,
     }:
         return None
     status = {
+        ExecutionState.SUCCEEDED: ResultStatus.ACCEPTED,
         ExecutionState.CANCELLED: ResultStatus.CANCELLED,
         ExecutionState.UNKNOWN: ResultStatus.UNKNOWN,
     }.get(execution.state, ResultStatus.FAILED)

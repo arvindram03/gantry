@@ -4,15 +4,30 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from gantry.execution import Execution, ExecutionState
 from gantry.flink.metrics import FlinkMetrics
 from gantry.verifier import CheckResult, VerificationResult
 
 
+@runtime_checkable
 class FlinkHealthCheck(Protocol):
     def check(self, execution: Execution, metrics: FlinkMetrics) -> CheckResult: ...
+
+
+@dataclass(frozen=True, slots=True)
+class JobSucceeded:
+    def check(self, execution: Execution, metrics: FlinkMetrics) -> CheckResult:
+        del metrics
+        ok = execution.state is ExecutionState.SUCCEEDED
+        return CheckResult(
+            "job_succeeded",
+            ok,
+            ExecutionState.SUCCEEDED.value,
+            execution.state.value,
+            None if ok else "Flink batch job did not succeed",
+        )
 
 
 @dataclass(frozen=True, slots=True)

@@ -41,3 +41,11 @@ class FlinkResult:
     @property
     def is_accepted(self) -> bool:
         return self.status is ResultStatus.ACCEPTED
+
+    @property
+    def ok(self) -> bool:
+        return self.status is ResultStatus.ACCEPTED
+
+    @property
+    def uri(self) -> str | None:
+        return None if not self.outputs else self.outputs[0].uri

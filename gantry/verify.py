@@ -5,10 +5,18 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import ClassVar, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, ClassVar, Protocol, runtime_checkable
 
 from gantry.sql.schema import Table
 from gantry.verifier import CheckResult
+
+if TYPE_CHECKING:
+    from gantry.flink.verification import (
+        JobRunning,
+        JobSucceeded,
+        MaxRestartCount,
+        MaxWatermarkLag,
+    )
 
 
 @runtime_checkable
@@ -30,6 +38,21 @@ class DestinationExists:
             expected=True,
             actual=exists,
             message=None if exists else "materialized destination does not exist",
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class OutputExists:
+    requires_row_count: ClassVar[bool] = False
+
+    def evaluate(self, table: Table | None) -> CheckResult:
+        exists = table is not None
+        return CheckResult(
+            name="output_exists",
+            ok=exists,
+            expected=True,
+            actual=exists,
+            message=None if exists else "Flink output does not exist",
         )
 
 
@@ -105,6 +128,10 @@ def destination_exists() -> DestinationExists:
     return DestinationExists()
 
 
+def output_exists() -> OutputExists:
+    return OutputExists()
+
+
 def row_count(*, min: int | None = None, max: int | None = None) -> RowCount:  # noqa: A002
     return RowCount(minimum=min, maximum=max)
 
@@ -113,12 +140,42 @@ def required_columns(columns: Sequence[str]) -> RequiredColumns:
     return RequiredColumns(tuple(columns))
 
 
+def job_succeeded() -> JobSucceeded:
+    from gantry.flink.verification import JobSucceeded
+
+    return JobSucceeded()
+
+
+def running() -> JobRunning:
+    from gantry.flink.verification import JobRunning
+
+    return JobRunning()
+
+
+def restart_count(*, max: int) -> MaxRestartCount:  # noqa: A002
+    from gantry.flink.verification import MaxRestartCount
+
+    return MaxRestartCount(max)
+
+
+def watermark_lag(*, max_seconds: float | str) -> MaxWatermarkLag:
+    from gantry.flink.verification import MaxWatermarkLag
+
+    return MaxWatermarkLag(max_seconds)
+
+
 __all__ = [
     "DestinationExists",
     "MaterializationCheck",
+    "OutputExists",
     "RequiredColumns",
     "RowCount",
     "destination_exists",
+    "job_succeeded",
+    "output_exists",
     "required_columns",
+    "restart_count",
     "row_count",
+    "running",
+    "watermark_lag",
 ]

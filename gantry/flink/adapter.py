@@ -26,6 +26,7 @@ from gantry.output import OutputKind, OutputRef
 from gantry.policy import PolicyRequirements
 from gantry.sql.classification import SQLOperation
 from gantry.sql.dialect import ConservativeDialect
+from gantry.sql.schema import Column, Table
 from gantry.target import ExecutionTarget
 
 _OPERATION_FAILURES = frozenset({"CANCELED", "CANCELLED", "ERROR", "CLOSED"})
@@ -96,7 +97,11 @@ class FlinkAdapter:
                 }
             )
         except (FlinkHTTPError, TimeoutError) as error:
-            return ValidationResult.rejected(str(error))
+            # The root cause, not the stack that wraps it. A rejected
+            # validation is the message an agent gets back to correct its own
+            # SQL with, and "Internal server error" followed by two hundred
+            # Java frames is not something anything can act on.
+            return ValidationResult.rejected(_root_cause(str(error)))
         finally:
             await self._close_gateway_resources(session, operation)
 
@@ -140,7 +145,9 @@ class FlinkAdapter:
                 target=self._target.name,
                 native_id=job_id,
                 metadata={
-                    "mode": mode.value,
+                    "mode": "stream" if mode is FlinkMode.STREAMING else "batch",
+                    "flink_mode": mode.value,
+                    "declared_inputs": tuple(artifact.declared_inputs),
                     "declared_outputs": tuple(artifact.declared_outputs),
                     "outputs": outputs,
                     "gateway_session": session,
@@ -228,6 +235,120 @@ class FlinkAdapter:
             raise ValueError(invalid)
         return _outputs(handle)
 
+    async def inspect_table(self, name: str, *, include_row_count: bool = False) -> Table | None:
+        """Inspect one catalog table through the existing SQL Gateway connection."""
+
+        # Two spellings, because "a.b" is genuinely ambiguous. A JDBC catalog
+        # exposes a PostgreSQL table as *one* identifier containing a dot
+        # (`analytics.orders`); other catalogs mean schema-then-table
+        # (`analytics`.`orders`). Guessing one way makes every table in a
+        # non-public schema uninspectable, so both are tried and whichever the
+        # engine recognises wins.
+        candidates = [_qualified_identifier(name)]
+        if "." in name:
+            single = _identifier(_unquote_identifier(name))
+            if single not in candidates:
+                candidates.insert(0, single)
+
+        describe = None
+        last: Exception | None = None
+        for candidate in candidates:
+            try:
+                describe = await self._query(f"DESCRIBE {candidate}")
+                break
+            except FlinkHTTPError as error:
+                last = error
+                continue
+        if describe is None:
+            if last is None or _is_missing_object(last):
+                return None
+            raise last
+        columns = _describe_columns(describe)
+        rows: int | None = None
+        if include_row_count:
+            count = await self._query(f"SELECT COUNT(*) FROM {candidate}")
+            rows = _row_count(count)
+        catalog, schema, table_name = _name_parts(name)
+        metadata: dict[str, object] = {}
+        if rows is not None:
+            metadata["rows"] = rows
+        return Table(
+            name=table_name,
+            schema=schema,
+            catalog=catalog,
+            columns=columns,
+            metadata=metadata,
+        )
+
+    async def _query(self, statement: str) -> Mapping[str, object]:
+        session: str | None = None
+        operation: str | None = None
+        try:
+            session = await self._open_configured_session(FlinkMode.BATCH)
+            operation = await self._client.execute_statement(
+                session,
+                statement,
+                execution_config=self._execution_config(FlinkMode.BATCH),
+            )
+            return await self._wait_for_operation(
+                session,
+                operation,
+                timeout_seconds=self._timeout("request_timeout", 30.0),
+            )
+        finally:
+            await self._close_gateway_resources(session, operation)
+
+    async def _collect_result(
+        self,
+        session: str,
+        operation: str,
+        *,
+        deadline: float,
+    ) -> Mapping[str, object]:
+        """Read every page of a finished operation's result.
+
+        Two things make a single fetch wrong, and both are silent.
+
+        The first page is often `NOT_READY`, and the first `PAYLOAD` page is
+        frequently empty with the rows on the page after it — so stopping at
+        the first payload returns "no rows" for a query that has plenty.
+
+        The pages are also a *changelog*, not a result set. A `SELECT COUNT(*)`
+        arrives as INSERT 1, UPDATE_BEFORE 1, UPDATE_AFTER 2, … up to the real
+        answer, so the rows have to be accumulated in order and interpreted by
+        their `kind` rather than read positionally.
+        """
+        token = 0
+        merged: list[object] = []
+        head: Mapping[str, object] | None = None
+        columns: object = None
+        while True:
+            response = await self._client.fetch_result(session, operation, token)
+            result_type = str(response.get("resultType", "PAYLOAD")).upper()
+            if head is None and result_type != "NOT_READY":
+                head = response
+            results = response.get("results")
+            if isinstance(results, Mapping):
+                if columns is None:
+                    columns = results.get("columns")
+                data = results.get("data")
+                if isinstance(data, list):
+                    merged.extend(data)
+            if result_type == "EOS":
+                break
+            if result_type == "NOT_READY" and time.monotonic() >= deadline:
+                raise TimeoutError("Flink SQL operation timed out")
+            if result_type != "NOT_READY":
+                token += 1
+            else:
+                await asyncio.sleep(0.05)
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Flink SQL operation timed out")
+
+        payload = dict(head or response)
+        payload["results"] = {"columns": columns or [], "data": merged}
+        return payload
+
     def _local_errors(self, artifact: Artifact) -> tuple[str, ...]:
         if artifact.kind != "flink_sql":
             return ("Flink adapter requires a flink_sql artifact",)
@@ -290,14 +411,7 @@ class FlinkAdapter:
         while True:
             status = await self._client.operation_status(session, operation)
             if status == "FINISHED":
-                response = await self._client.fetch_result(session, operation)
-                result_type = str(response.get("resultType", "PAYLOAD")).upper()
-                if result_type == "NOT_READY":
-                    if time.monotonic() >= deadline:
-                        raise TimeoutError("Flink SQL operation timed out")
-                    await asyncio.sleep(0.05)
-                    continue
-                return response
+                return await self._collect_result(session, operation, deadline=deadline)
             if status in _OPERATION_FAILURES:
                 # Fetching surfaces the planner or submission exception when available.
                 try:
@@ -578,7 +692,58 @@ def _classify_failure(message: str, *, native: object = None) -> Failure:
         kind = FailureKind.ENGINE_ERROR
         retryable = False
     native_mapping = native if isinstance(native, Mapping) else {}
-    return Failure(kind, retryable, message, native_message=message, native=native_mapping)
+    # `message` is the whole server-side stack, thousands of characters of Java
+    # frames wrapping one sentence that says what is actually wrong. The full
+    # text is kept as `native_message` for a human reading a log; the summary
+    # is the root cause, because the thing most likely to read this is a model
+    # deciding how to correct its own SQL, and it cannot do that from a stack
+    # trace.
+    return Failure(
+        kind, retryable, _root_cause(message), native_message=message, native=native_mapping
+    )
+
+
+def _is_missing_object(error: Exception) -> bool:
+    """Whether an error means "no such table" rather than "something broke".
+
+    A verification check has to tell those apart: a missing destination is a
+    result to report, and a broken connection is not. Flink wraps both in an
+    HTTP 500 with the same shape, so the distinction lives in the root cause —
+    "Tables or views with the identifier ... doesn't exist."
+    """
+    if getattr(error, "status", None) == 404:
+        return True
+    cause = _root_cause(str(error)).lower()
+    return any(
+        phrase in cause
+        for phrase in (
+            "doesn't exist",
+            "does not exist",
+            "not found",
+            "unknown table",
+        )
+    )
+
+
+def _root_cause(message: str) -> str:
+    """The innermost `Caused by:` sentence, or the message unchanged.
+
+    Java nests its causes, so the last one is the specific complaint —
+    "Column 'no_such_column' not found in any table" rather than "Internal
+    server error". Frames are skipped; only the exception line is wanted.
+    """
+    causes = [
+        line.strip()[len("Caused by:") :].strip()
+        for line in message.splitlines()
+        if line.strip().startswith("Caused by:")
+    ]
+    for cause in reversed(causes):
+        _, _, detail = cause.partition(": ")
+        text = (detail or cause).strip()
+        if text:
+            return text
+    first = message.strip().splitlines()
+    return first[0].strip() if first else message
 
 
 def _unknown(handle: ExecutionHandle, message: str, *, failure: Failure | None = None) -> Execution:
@@ -591,10 +756,12 @@ def _unknown(handle: ExecutionHandle, message: str, *, failure: Failure | None =
 
 
 def _handle_mode(handle: ExecutionHandle) -> FlinkMode:
-    value = handle.metadata.get("mode", "streaming")
+    value = handle.metadata.get("flink_mode", handle.metadata.get("mode", "streaming"))
     try:
         if not isinstance(value, str):
             raise TypeError
+        if value == "stream":
+            return FlinkMode.STREAMING
         return FlinkMode(value)
     except (TypeError, ValueError):
         return FlinkMode.STREAMING
@@ -624,6 +791,113 @@ def _outputs(handle: ExecutionHandle) -> tuple[OutputRef, ...]:
 
 def _identifier(value: str) -> str:
     return f"`{value.replace('`', '``')}`"
+
+
+def _qualified_identifier(value: str) -> str:
+    return ".".join(_identifier(_unquote_identifier(part.strip())) for part in value.split("."))
+
+
+def _unquote_identifier(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "`"}:
+        return value[1:-1].replace(value[0] * 2, value[0])
+    return value
+
+
+def _name_parts(value: str) -> tuple[str | None, str | None, str]:
+    parts = tuple(_unquote_identifier(part.strip()) for part in value.split("."))
+    if len(parts) == 3:
+        return parts[0], parts[1], parts[2]
+    if len(parts) == 2:
+        return None, parts[0], parts[1]
+    return None, None, parts[0]
+
+
+def _result_changelog(
+    payload: Mapping[str, object],
+) -> tuple[tuple[tuple[object, ...], str], ...]:
+    """Result rows paired with their changelog kind.
+
+    `_result_rows` drops the kind, which is right for a plain SELECT and wrong
+    for anything Flink computes incrementally.
+    """
+    results = payload.get("results")
+    if not isinstance(results, Mapping):
+        return ()
+    data = results.get("data")
+    if not isinstance(data, list):
+        return ()
+    rows: list[tuple[tuple[object, ...], str]] = []
+    for item in data:
+        if not isinstance(item, Mapping):
+            continue
+        fields = item.get("fields")
+        if isinstance(fields, list):
+            rows.append((tuple(fields), str(item.get("kind", "INSERT")).upper()))
+    return tuple(rows)
+
+
+def _result_rows(payload: Mapping[str, object]) -> tuple[tuple[object, ...], ...]:
+    results = payload.get("results")
+    if not isinstance(results, Mapping):
+        return ()
+    data = results.get("data")
+    if not isinstance(data, list):
+        return ()
+    rows: list[tuple[object, ...]] = []
+    for item in data:
+        if not isinstance(item, Mapping):
+            continue
+        fields = item.get("fields")
+        if isinstance(fields, list):
+            rows.append(tuple(fields))
+    return tuple(rows)
+
+
+def _describe_columns(payload: Mapping[str, object]) -> tuple[Column, ...]:
+    columns: list[Column] = []
+    for row in _result_rows(payload):
+        if len(row) < 2 or not isinstance(row[0], str) or not isinstance(row[1], str):
+            continue
+        # DESCRIBE includes physical columns first and may append watermark/constraint rows.
+        if row[0].startswith(("#", "WATERMARK", "CONSTRAINT")):
+            continue
+        nullable = True
+        if len(row) > 2 and isinstance(row[2], str):
+            nullable = row[2].upper() not in {"FALSE", "NO", "NOT NULL"}
+        columns.append(Column(row[0], row[1], nullable))
+    return tuple(columns)
+
+
+def _row_count(payload: Mapping[str, object]) -> int | None:
+    """The final value of an aggregate, read as a changelog.
+
+    Flink returns `SELECT COUNT(*)` as a stream of retractions: INSERT 1,
+    UPDATE_BEFORE 1, UPDATE_AFTER 2, and so on up to the answer. Taking the
+    first row gives 1 for any non-empty table, which is a plausible-looking
+    number and always wrong.
+
+    So the last row that is not a retraction wins. An empty table does emit a
+    single `0`, checked rather than assumed; None is reserved for a count that
+    never arrived at all, which the caller reports differently from a count of
+    zero.
+    """
+    for row, kind in reversed(_result_changelog(payload)):
+        if kind in {"UPDATE_BEFORE", "DELETE"}:
+            continue
+        if not row:
+            continue
+        value = row[0]
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            try:
+                return int(value)
+            except ValueError:
+                return None
+        return None
+    return None
 
 
 def _output_uri(name: str) -> str:

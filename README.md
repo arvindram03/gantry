@@ -373,22 +373,45 @@ Output Reference
 
 ### Flink SQL
 
-```text
-Agent
-  │ Flink SQL
-  ▼
-Gantry
-  │ admit
-  ▼
-Flink
-  │
-  ▼
-Streaming Job
-  │
-  ├── status
-  ├── health
-  ├── metrics
-  └── cancel
+Choose the execution model first, then use Flink as the engine. The SQL remains native Flink SQL.
+
+```python
+batch = gantry.batch.connect("flink", endpoint=FLINK_ENDPOINT)
+daily_orders = batch.job(
+    inputs=["raw.orders"],
+    outputs=["analytics.daily_orders"],
+    checks=[gantry.verify.output_exists(), gantry.verify.row_count(min=1)],
+)
+
+result = await daily_orders("""
+INSERT INTO analytics.daily_orders
+SELECT CAST(order_time AS DATE), COUNT(*)
+FROM raw.orders
+GROUP BY CAST(order_time AS DATE)
+""")
+```
+
+Long-running streams use the same configure-once shape, but acceptance means healthy and running
+rather than finished:
+
+```python
+stream = gantry.stream.connect("flink", endpoint=FLINK_ENDPOINT)
+clean_events = stream.job(
+    inputs=["raw.events"],
+    outputs=["clean.events"],
+    checks=[
+        gantry.verify.running(),
+        gantry.verify.restart_count(max=3),
+        gantry.verify.watermark_lag(max_seconds=60),
+    ],
+)
+
+result = await clean_events("""
+INSERT INTO clean.events
+SELECT * FROM raw.events WHERE event_type IS NOT NULL
+""")
+
+tools = [clean_events.tool()]  # the agent sees only {"sql": "..."}
 ```
 
 A database query may finish in milliseconds.
@@ -515,7 +538,7 @@ Gantry keeps those responsibilities separate.
 | BigQuery | Governed queries, output references, and SQL materialization |
 | Snowflake | Governed queries and reconnectable query jobs |
 | DuckDB | Governed queries and process-local SQL materialization |
-| Flink SQL | Long-running SQL submission, observation, verification, and cancellation |
+| Flink SQL | Governed batch and stream jobs with durable handles, verification, and cancellation |
 
 SQL materialization v0 is enabled for BigQuery and DuckDB. Other providers fail closed if that
 operation is requested; see the [provider support matrix](docs/materialization.md#provider-support).
