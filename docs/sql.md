@@ -55,11 +55,13 @@ URL. `examples/README.md` covers the connection details that differ, including
 two that cause intermittent failures rather than clean ones:
 
 - **Neon** requires TLS, and a compute scaled to zero takes seconds to wake, so
-  the first connection is slow rather than broken.
+  the first connection is slow rather than broken. Its pooled endpoint handles
+  server-side prepared statements — verified against a live instance.
 - **Supabase's transaction pooler** (port 6543) does not hold a session long
   enough for server-side prepared statements to survive. asyncpg prepares every
   statement, so pass `statement_cache_size=0` there. The session pooler and
-  direct connections have no such constraint.
+  direct connections have no such constraint. This one is from Supabase's
+  documentation, not measurement.
 
 ## Safety boundary
 

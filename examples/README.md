@@ -30,18 +30,27 @@ python examples/agent_sql.py
 
 ### Neon
 
+Verified against a live Neon instance (PostgreSQL 18.6, pooled endpoint).
+
 ```bash
 export GANTRY_PROVIDER=neon
-export GANTRY_DATABASE_URL="postgresql://USER:PASSWORD@ep-xxx.REGION.aws.neon.tech/dbname"
+export GANTRY_DATABASE_URL="postgresql://USER:PASSWORD@ep-xxx-pooler.REGION.aws.neon.tech/dbname?sslmode=require&channel_binding=require"
+psql "$GANTRY_DATABASE_URL" -f examples/seed.sql
 python examples/agent_sql.py
 ```
 
-Two things that bite:
-
-- **TLS is required.** The example passes `ssl="require"`.
-- **A compute scaled to zero takes a few seconds to wake.** The first
-  connection is slow, not broken, so the example allows a 30-second connect
-  timeout. Judge a Neon failure on the second attempt, not the first.
+- **TLS is required.** Neon's own connection string carries
+  `sslmode=require`, which asyncpg honours; the example also passes
+  `ssl="require"` so it works with a URL that omits it. `channel_binding=require`
+  is accepted and ignored by asyncpg.
+- **The pooled endpoint is fine as-is.** The `-pooler` host is PgBouncer in
+  transaction mode, but Neon's supports protocol-level prepared statements, so
+  asyncpg's statement cache works. Measured: 30 concurrent distinct queries,
+  no failures, with the cache on. **This is the opposite of Supabase below** —
+  do not carry that workaround over.
+- **A compute scaled to zero takes a few seconds to wake**, so the example
+  allows a 30-second connect timeout. Not measured here: the instance tested
+  was already warm and connected in ~0.6 s.
 
 ### Supabase
 
@@ -67,6 +76,12 @@ than a clean error at connect time. The example does this for you.
 
 The session pooler and direct connections have no such constraint, and keep
 statement caching.
+
+**Not verified against a live Supabase project.** Unlike the Neon notes above,
+this is from Supabase's documented pooler behaviour rather than measurement. If
+you have a project, `tests/test_postgres_live.py` pointed at it is the quickest
+way to confirm — and if the transaction pooler turns out to handle prepared
+statements the way Neon's now does, this workaround should go.
 
 ### Running the tests against a hosted database
 

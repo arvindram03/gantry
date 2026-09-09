@@ -58,12 +58,20 @@ async def db() -> gantry.sql.SQLConnection:
 async def test_describe_reads_a_real_information_schema(
     db: gantry.sql.SQLConnection,
 ) -> None:
-    """The query has to be valid against the engine, not merely plausible."""
+    """The query has to be valid against the engine, not merely plausible.
+
+    A brand-new database legitimately has no user tables, and that is not a
+    failure of the query — so it skips rather than asserting something about
+    the database it was pointed at. Run `examples/seed.sql` first for the
+    interesting version of this test.
+    """
     schema = await db.describe()
 
-    assert schema.schemas, "a live database has at least one non-system schema"
-    assert schema.tables, "and at least one table"
+    if not schema.tables:
+        pytest.skip("no user tables here; run examples/seed.sql against this database")
+
     table = schema.tables[0]
+    assert schema.schemas, "a table implies the schema it lives in"
     assert table.columns, "a table must come back with its columns"
     assert table.kind, "and its kind, which is what the broken query was reaching for"
 
