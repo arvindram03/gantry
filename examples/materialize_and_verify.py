@@ -6,7 +6,7 @@ order count, total spend, refund rate, days since last order. The SQL is written
 by an agent. The table is read by a training job that will not notice if it is
 wrong — it will just produce a worse model, next week, quietly.
 
-    pip install "gantry-io[duckdb]"
+    pip install "data-gantry[duckdb]"
     python examples/materialize_and_verify.py
 
 Two different questions get two different answers, and keeping them apart is the

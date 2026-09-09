@@ -1,5 +1,5 @@
 [project]
-name = "gantry-io"
+name = "data-gantry"
 version = "0.5.0"
 description = "A common execution control plane for agent-generated data work"
 readme = "README.md"
@@ -18,7 +18,7 @@ classifiers = [
     "Typing :: Typed",
 ]
 
-# The distribution is `gantry-io`; the import stays `gantry`. The name
+# The distribution is `data-gantry`; the import stays `gantry`. The name
 # `gantry` on PyPI belongs to an unrelated project.
 [project.urls]
 Homepage = "https://github.com/arvindram03/gantry"

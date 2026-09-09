@@ -7,7 +7,7 @@ Notable changes. Dates are release dates; the format follows
 
 ### Changed
 
-- **The distribution is now `gantry-io`.** The import stays `gantry`. The name
+- **The distribution is now `data-gantry`.** The import stays `gantry`. The name
   `gantry` on PyPI belongs to an unrelated project, so `pip install gantry`
   installs someone else's library.
 

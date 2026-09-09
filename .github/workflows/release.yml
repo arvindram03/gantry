@@ -7,7 +7,7 @@ name: release
 # trusted publisher for this repository, workflow `release.yml`, environment
 # `pypi`.
 #
-# The distribution is `gantry-io`. The import is `gantry`.
+# The distribution is `data-gantry`. The import is `gantry`.
 
 on:
   push:

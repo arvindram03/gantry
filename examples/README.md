@@ -74,7 +74,7 @@ connection string, because none of those are arguments it can pass.
 ### Run it
 
 ```bash
-pip install "gantry-io[postgres]"
+pip install "data-gantry[postgres]"
 psql "$GANTRY_DATABASE_URL" -f examples/seed.sql
 python examples/agent_sql.py
 ```

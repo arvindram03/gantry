@@ -67,7 +67,7 @@ class SnowflakeAdapter:
             module = importlib.import_module("snowflake.connector")
         except ImportError as error:
             raise ImportError(
-                'Snowflake support requires `pip install "gantry-io[snowflake]"`'
+                'Snowflake support requires `pip install "data-gantry[snowflake]"`'
             ) from error
         self._connect = cast(Callable[..., _Connection], module.connect)
         self._target = target

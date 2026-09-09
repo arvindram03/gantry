@@ -96,7 +96,7 @@ class BigQueryAdapter:
             module = importlib.import_module("google.cloud.bigquery")
         except ImportError as error:
             raise ImportError(
-                'BigQuery support requires `pip install "gantry-io[bigquery]"`'
+                'BigQuery support requires `pip install "data-gantry[bigquery]"`'
             ) from error
         self._job_config = cast(Callable[..., object], module.QueryJobConfig)
         client_type = cast(Callable[..., _Client], module.Client)

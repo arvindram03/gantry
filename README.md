@@ -31,12 +31,12 @@ Agent ──── proposal ────────> Gantry ──────�
 SQL is the simplest way to use Gantry today.
 
 ```bash
-pip install gantry-io
+pip install data-gantry
 ```
 
-> **The distribution is `gantry-io`; the import is `gantry`.** The name
+> **The distribution is `data-gantry`; the import is `gantry`.** The name
 > `gantry` on PyPI belongs to an unrelated project, so the package installs
-> under `gantry-io` and imports as `gantry`:
+> under `data-gantry` and imports as `gantry`:
 >
 > ```python
 > import gantry
@@ -600,7 +600,7 @@ Seven runnable examples, indexed by what you are trying to do, in
 [`examples/`](examples/). The quickest needs nothing but a Python environment:
 
 ```bash
-pip install "gantry-io[duckdb]"
+pip install "data-gantry[duckdb]"
 python examples/local_duckdb.py
 ```
 

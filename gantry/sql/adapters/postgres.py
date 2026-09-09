@@ -75,7 +75,7 @@ class PostgresAdapter:
             module = importlib.import_module("asyncpg")
         except ImportError as error:
             raise ImportError(
-                'PostgreSQL support requires `pip install "gantry-io[postgres]"`'
+                'PostgreSQL support requires `pip install "data-gantry[postgres]"`'
             ) from error
         self._connect = cast(Callable[..., Awaitable[_Connection]], module.connect)
         self._target = target
