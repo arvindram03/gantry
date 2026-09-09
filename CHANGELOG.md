@@ -5,6 +5,12 @@ Notable changes. Dates are release dates; the format follows
 
 ## Unreleased
 
+### Changed
+
+- **The distribution is now `gantry-io`.** The import stays `gantry`. The name
+  `gantry` on PyPI belongs to an unrelated project, so `pip install gantry`
+  installs someone else's library.
+
 ### Added
 
 - `gantry.batch` and `gantry.stream` as intent-named entry points for Flink SQL
@@ -14,6 +20,11 @@ Notable changes. Dates are release dates; the format follows
   the catalog they read through.
 - Live test suites against real PostgreSQL and a real Flink SQL Gateway. They
   skip when no engine is reachable, so a clone without one still passes.
+- A release workflow that publishes to PyPI on a version tag through trusted
+  publishing, and refuses to publish when the tag disagrees with the packaged
+  version.
+- `SECURITY.md`, stating that Gantry is an admission boundary rather than a
+  replacement for database permissions.
 
 ### Fixed
 

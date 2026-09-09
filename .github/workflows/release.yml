@@ -1,0 +1,52 @@
+name: release
+
+# Publishes to PyPI when a version tag is pushed.
+#
+# Uses trusted publishing (OIDC), so there is no API token in the repository
+# and nothing to leak or rotate. It requires a one-time setup on PyPI: add a
+# trusted publisher for this repository, workflow `release.yml`, environment
+# `pypi`.
+#
+# The distribution is `gantry-io`. The import is `gantry`.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy gantry tests
+      - run: uv run pytest
+      # A tag that disagrees with pyproject.toml would publish a version nobody
+      # asked for, and PyPI uploads cannot be replaced.
+      - name: the tag must match the packaged version
+        run: |
+          packaged=$(uv run python -c "import tomllib,pathlib;print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+          tagged="${GITHUB_REF_NAME#v}"
+          echo "packaged=$packaged tagged=$tagged"
+          [ "$packaged" = "$tagged" ] || { echo "::error::tag $tagged != version $packaged"; exit 1; }
+
+  publish:
+    needs: check
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv build
+      - uses: pypa/gh-action-pypi-publish@release/v1

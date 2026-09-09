@@ -1,11 +1,30 @@
 [project]
-name = "gantry"
+name = "gantry-io"
 version = "0.5.0"
 description = "A common execution control plane for agent-generated data work"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "Apache-2.0" }
 dependencies = []
+keywords = ["sql", "agents", "llm", "governance", "flink", "duckdb", "postgres"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries",
+    "Typing :: Typed",
+]
+
+# The distribution is `gantry-io`; the import stays `gantry`. The name
+# `gantry` on PyPI belongs to an unrelated project.
+[project.urls]
+Homepage = "https://github.com/arvindram03/gantry"
+Source = "https://github.com/arvindram03/gantry"
+Issues = "https://github.com/arvindram03/gantry/issues"
+Changelog = "https://github.com/arvindram03/gantry/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 postgres = ["asyncpg>=0.30"]

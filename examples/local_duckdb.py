@@ -6,7 +6,7 @@ a directory â€” a nightly dump, a data-request extract, a file pulled from S3 â€
 and an agent should answer questions about it. No server, no credentials, no
 network.
 
-    pip install "gantry[duckdb]"
+    pip install "gantry-io[duckdb]"
     python examples/local_duckdb.py
 
 It is also the cheapest way to see what the governance layer does before

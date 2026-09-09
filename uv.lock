@@ -584,7 +584,7 @@ wheels = [
 ]
 
 [[package]]
-name = "gantry"
+name = "gantry-io"
 version = "0.5.0"
 source = { editable = "." }
 

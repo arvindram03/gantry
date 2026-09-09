@@ -9,7 +9,7 @@ nothing else in this file changes.
     GANTRY_PROVIDER=neon     python examples/agent_sql.py
     GANTRY_PROVIDER=supabase python examples/agent_sql.py
 
-Needs `pip install "gantry[postgres]"`.
+Needs `pip install "gantry-io[postgres]"`.
 
 The shape worth copying is the split between two audiences:
 

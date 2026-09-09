@@ -48,7 +48,9 @@ class DuckDBAdapter(SQLAdapter):
         try:
             module = importlib.import_module("duckdb")
         except ImportError as error:
-            raise ImportError('DuckDB support requires `pip install "gantry[duckdb]"`') from error
+            raise ImportError(
+                'DuckDB support requires `pip install "gantry-io[duckdb]"`'
+            ) from error
         connect = cast(Callable[..., _Connection], module.connect)
         path = target.config.get("path", ":memory:")
         if not isinstance(path, str):

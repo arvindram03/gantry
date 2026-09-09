@@ -10,7 +10,7 @@ This is not a rare case. It is the most common way an agent-written query hurts
 you, and the answer is not a better prompt — it is a timeout, a handle, and the
 ability to cancel.
 
-    pip install "gantry[postgres]"
+    pip install "gantry-io[postgres]"
     psql "$GANTRY_DATABASE_URL" -f examples/seed.sql
     GANTRY_DATABASE_URL=postgresql://... python examples/long_running_query.py
 
