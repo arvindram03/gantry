@@ -54,34 +54,40 @@ python examples/agent_sql.py
 
 ### Supabase
 
+Verified against a live Supabase project (PostgreSQL 17.6, direct endpoint).
+
 ```bash
 export GANTRY_PROVIDER=supabase
-export GANTRY_DATABASE_URL="postgresql://postgres.PROJECT_REF:PASSWORD@aws-0-REGION.pooler.supabase.com:6543/postgres"
+export GANTRY_DATABASE_URL="postgresql://postgres:PASSWORD@db.PROJECT_REF.supabase.co:5432/postgres"
+psql "$GANTRY_DATABASE_URL" -f examples/seed.sql
 python examples/agent_sql.py
 ```
 
-Supabase offers three endpoints and the choice matters here:
+Three endpoints, and the choice changes what you must pass:
 
-| Endpoint | Port | Notes |
-|---|---|---|
-| Direct | 5432 | `db.PROJECT_REF.supabase.co`. Often IPv6-only |
-| Session pooler | 5432 | `aws-0-REGION.pooler.supabase.com`, user `postgres.PROJECT_REF` |
-| Transaction pooler | 6543 | Same host, best for many short-lived connections |
+| Endpoint | Host / port | Statement cache | Verified |
+|---|---|---|---|
+| Direct | `db.REF.supabase.co:5432` | keep it | **yes** |
+| Session pooler | `REGION.pooler.supabase.com:5432`, user `postgres.REF` | keep it | no |
+| Transaction pooler | same host, `:6543` | **`statement_cache_size=0`** | no |
 
-**On the transaction pooler, pass `statement_cache_size=0`.** asyncpg prepares
-every statement server-side, and transaction-mode pooling does not keep a
-session alive long enough for those to survive — without it you get
-intermittent `prepared statement does not exist` failures under load rather
-than a clean error at connect time. The example does this for you.
+- **TLS is required** on all three.
+- **The direct host is IPv6-only.** Measured: it publishes an `AAAA` record and
+  **no `A` record at all**. It works from a machine with IPv6 and fails from one
+  without — including plenty of CI runners — with a name-resolution error that
+  does not mention IPv6. Use a pooler endpoint from IPv4-only networks.
+- **`statement_cache_size=0` belongs to the transaction pooler, not to
+  Supabase.** Only port 6543 recycles the session between statements, which is
+  what stops a server-side prepared statement from surviving; asyncpg prepares
+  every statement. On the direct host the cache is fine — measured, 30
+  concurrent distinct queries, no failures — and turning it off there gives up
+  caching for nothing. The example keys this off the port for that reason.
 
-The session pooler and direct connections have no such constraint, and keep
-statement caching.
-
-**Not verified against a live Supabase project.** Unlike the Neon notes above,
-this is from Supabase's documented pooler behaviour rather than measurement. If
-you have a project, `tests/test_postgres_live.py` pointed at it is the quickest
-way to confirm — and if the transaction pooler turns out to handle prepared
-statements the way Neon's now does, this workaround should go.
+The transaction-pooler row is still from Supabase's documentation rather than
+measurement: the project tested was reached directly. **Note that the equivalent
+claim proved false for Neon**, whose pooler does support protocol-level prepared
+statements — so if you run against Supabase's 6543 endpoint and it behaves the
+same way, this workaround should go.
 
 ### Running the tests against a hosted database
 
