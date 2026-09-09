@@ -26,12 +26,15 @@ import urllib.request
 
 import gantry
 import pytest
-from gantry.flink import FlinkMode, FlinkSQLArtifact
+from gantry.batch import BatchConnection
+from gantry.flink.operation import FlinkBatchJob
 
 GATEWAY = os.environ.get("GANTRY_TEST_FLINK_GATEWAY", "http://localhost:18084")
 JOBMANAGER = os.environ.get("GANTRY_TEST_FLINK_JOBMANAGER", "http://localhost:18081")
 CATALOG = os.environ.get("GANTRY_TEST_FLINK_CATALOG", "pg")
 DATABASE = os.environ.get("GANTRY_TEST_FLINK_DATABASE", "gantry")
+DATABASE_SCHEMA = os.environ.get("GANTRY_TEST_FLINK_SCHEMA", "analytics")
+REPORTING_SCHEMA = os.environ.get("GANTRY_TEST_FLINK_REPORTING", "reporting")
 
 SOURCE = f"`{CATALOG}`.`{DATABASE}`.`flink_src`"
 SINK = f"`{CATALOG}`.`{DATABASE}`.`flink_sink`"
@@ -92,13 +95,14 @@ def _catalogs() -> set[str]:
 
 
 @pytest.fixture
-def flink() -> gantry.flink.FlinkConnection:
+def flink() -> BatchConnection:
     if not _reachable(f"{GATEWAY}/info") or not _reachable(f"{JOBMANAGER}/overview"):
         pytest.skip(f"no Flink at {GATEWAY} / {JOBMANAGER}")
     if CATALOG not in _catalogs():
         pytest.skip(f"catalog {CATALOG!r} is not registered on the gateway")
-    return gantry.flink.connect(
-        GATEWAY,
+    return gantry.batch.connect(
+        "flink",
+        endpoint=GATEWAY,
         jobmanager_endpoint=JOBMANAGER,
         default_catalog=CATALOG,
         default_database=DATABASE,
@@ -109,40 +113,41 @@ def flink() -> gantry.flink.FlinkConnection:
     )
 
 
-def _insert() -> FlinkSQLArtifact:
-    return FlinkSQLArtifact(
-        f"INSERT INTO {SINK} SELECT id, label FROM {SOURCE}",
-        mode=FlinkMode.BATCH,
-        declared_inputs=(f"{CATALOG}.{DATABASE}.flink_src",),
-        declared_outputs=(f"{CATALOG}.{DATABASE}.flink_sink",),
+@pytest.fixture
+def job(flink: BatchConnection) -> FlinkBatchJob:
+    return flink.job(
+        inputs=[f"{CATALOG}.{DATABASE}.flink_src"],
+        outputs=[f"{CATALOG}.{DATABASE}.flink_sink"],
+        poll_interval=0.25,
+        timeout=300,
     )
 
 
+def _insert() -> str:
+    return f"INSERT INTO {SINK} SELECT id, label FROM {SOURCE}"
+
+
 async def test_validation_uses_the_real_planner(
-    flink: gantry.flink.FlinkConnection,
+    job: FlinkBatchJob,
 ) -> None:
     """The statement has to be one the gateway accepts, not merely one that
     looks right. This is what the `executionTimeout` bug broke."""
-    result = await flink.validate(_insert())
+    result = await job.validate(_insert())
     assert result.ok, f"the real planner rejected it: {result.errors}"
 
 
 async def test_the_planner_rejects_sql_it_cannot_plan(
-    flink: gantry.flink.FlinkConnection,
+    job: FlinkBatchJob,
 ) -> None:
     """A failing validation must come back as errors, not as an exception."""
-    broken = FlinkSQLArtifact(
-        f"INSERT INTO {SINK} SELECT no_such_column FROM {SOURCE}",
-        mode=FlinkMode.BATCH,
-        declared_outputs=(f"{CATALOG}.{DATABASE}.flink_sink",),
-    )
-    result = await flink.validate(broken)
+    broken = f"INSERT INTO {SINK} SELECT no_such_column FROM {SOURCE}"
+    result = await job.validate(broken)
     assert not result.ok
     assert result.errors
 
 
 async def test_a_batch_job_runs_on_the_cluster(
-    flink: gantry.flink.FlinkConnection,
+    job: FlinkBatchJob,
 ) -> None:
     """A real job, submitted to a real JobManager, moving real rows.
 
@@ -150,23 +155,120 @@ async def test_a_batch_job_runs_on_the_cluster(
     submission over the JobManager's REST endpoint — has to be right for this
     to pass, and none of it is exercised by a fake transport.
     """
-    result = await flink.run(_insert(), timeout_seconds=300)
+    result = await job(_insert())
     assert result.status.value == "ACCEPTED", (
         f"the job did not succeed: {result.failure.message if result.failure else result.status}"
     )
 
 
 async def test_the_v0_boundary_is_enforced_before_the_gateway_sees_it(
-    flink: gantry.flink.FlinkConnection,
+    job: FlinkBatchJob,
 ) -> None:
     """Multiple statements are refused by Gantry, not by Flink — so the refusal
     does not depend on a cluster being reachable at all."""
-    result = await flink.validate(
-        FlinkSQLArtifact(
-            f"INSERT INTO {SINK} SELECT id, label FROM {SOURCE}; SELECT 1;",
-            mode=FlinkMode.BATCH,
-            declared_outputs=(f"{CATALOG}.{DATABASE}.flink_sink",),
-        )
-    )
+    result = await job.validate(f"INSERT INTO {SINK} SELECT id, label FROM {SOURCE}; SELECT 1;")
     assert not result.ok
     assert any("exactly one SQL statement" in error for error in result.errors)
+
+
+# --------------------------------------------------------------------------
+# The paths only a real engine proves. Each of these covers a bug that shipped
+# because a fake transport answered whatever it was asked.
+
+
+def _runtime() -> object:
+    from gantry.flink.api import FlinkRuntime
+    from gantry.flink.target import FlinkTarget
+
+    return FlinkRuntime(
+        FlinkTarget(
+            GATEWAY,
+            {
+                "jobmanager_endpoint": JOBMANAGER,
+                "default_catalog": CATALOG,
+                "default_database": DATABASE,
+                "request_timeout": 120.0,
+            },
+        )
+    )
+
+
+async def test_a_result_is_read_past_its_first_page(flink: BatchConnection) -> None:
+    """`SELECT COUNT(*)` arrives on the second page, not the first.
+
+    Page 0 comes back NOT_READY, the rows follow on page 1, EOS on page 2 —
+    and the rows are a changelog, so the count builds up 1, 2, 3 … rather than
+    arriving whole. Reading one page and taking the first row returned 1 for
+    any non-empty table: a plausible number, and always wrong.
+    """
+    runtime = _runtime()
+    table = await runtime.inspect_table(  # type: ignore[attr-defined]
+        f"{DATABASE_SCHEMA}.orders", include_row_count=True
+    )
+    assert table is not None, f"{DATABASE_SCHEMA}.orders should exist; run examples/seed.sql"
+    rows = table.metadata.get("rows")
+    assert isinstance(rows, int)
+    assert rows > 1, "a paged changelog read as one page reports 1"
+
+
+async def test_a_schema_qualified_table_can_be_inspected(
+    flink: BatchConnection,
+) -> None:
+    """A JDBC catalog exposes `analytics.orders` as one identifier containing a
+    dot. Quoting it as two named a database that does not exist, so every table
+    outside `public` was uninspectable — and `row_count` on it could never
+    pass."""
+    runtime = _runtime()
+    table = await runtime.inspect_table(f"{DATABASE_SCHEMA}.orders")  # type: ignore[attr-defined]
+    assert table is not None
+    assert {column.name for column in table.columns} >= {"order_id", "status", "amount"}
+
+
+async def test_a_missing_table_is_absent_rather_than_an_error(
+    flink: BatchConnection,
+) -> None:
+    """Trying both spellings must not turn "no such table" into a raised
+    exception, or a verification check cannot distinguish a missing
+    destination from a broken connection."""
+    runtime = _runtime()
+    assert await runtime.inspect_table("analytics.no_such_table_here") is None  # type: ignore[attr-defined]
+
+
+async def test_running_job_metrics_reach_the_health_checks(
+    flink: BatchConnection,
+) -> None:
+    """Restart count is derived by the adapter and appears only on the metrics
+    it returns. The health path rebuilt them from the execution's generic
+    metrics instead, found nothing, and failed every check that needed one on a
+    perfectly healthy job."""
+    stream = gantry.stream.connect(
+        "flink",
+        endpoint=GATEWAY,
+        jobmanager_endpoint=JOBMANAGER,
+        default_catalog=CATALOG,
+        default_database=DATABASE,
+        submission_timeout=180.0,
+        request_timeout=180.0,
+    )
+    job = stream.job(
+        inputs=[f"{DATABASE_SCHEMA}.orders"],
+        outputs=[f"{REPORTING_SCHEMA}.orders_replica"],
+        checks=[gantry.verify.running()],
+        timeout=180,
+    )
+    result = await job(
+        f"INSERT INTO `{REPORTING_SCHEMA}.orders_replica` "
+        f"SELECT order_id, customer_id, region, amount FROM `{DATABASE_SCHEMA}.orders`"
+    )
+    if result.execution is None or result.execution.state.value != "RUNNING":
+        pytest.skip("the job finished before it could be observed running")
+    if not result.metrics.native.get("job"):
+        # Flink registers job metrics a moment after the job reaches RUNNING,
+        # so the earliest observation can legitimately have none. Skipping is
+        # honest here; asserting would make this fail about one run in three
+        # for a reason that is not the one under test.
+        pytest.skip("Flink had not registered job metrics yet")
+    assert result.metrics.restart_count is not None, (
+        "a running job must report a restart count; None means the health "
+        "checks are reading metrics from the wrong object"
+    )

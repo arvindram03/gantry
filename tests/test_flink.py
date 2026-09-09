@@ -7,17 +7,13 @@ from datetime import UTC, datetime
 
 import gantry
 import pytest
-from gantry import ExecutionHandle, ExecutionState, FailureKind, OutputKind, ResultStatus
-from gantry.flink import (
-    FlinkConnection,
-    FlinkMode,
-    FlinkSQLArtifact,
-    FlinkTarget,
-    HTTPResponse,
-    MaxRestartCount,
-    MaxWatermarkLag,
-    MinOutputRate,
-)
+from gantry import ExecutionState, FailureKind, OutputKind, ResultStatus
+from gantry.batch import BatchCapabilities, BatchConnection
+from gantry.flink.artifact import FlinkMode, FlinkSQLArtifact
+from gantry.flink.client import HTTPResponse
+from gantry.flink.operation import FlinkJobError, FlinkJobStatement
+from gantry.flink.target import FlinkTarget
+from gantry.stream import StreamCapabilities, StreamConnection
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +33,8 @@ class FakeFlinkTransport:
         self.failure = "Kafka connector could not connect to broker"
         self.fail_explain = False
         self.cancelled = False
+        self.row_count = 3
+        self.restart_count = 1
         self._operation = 0
         self._watermark = datetime.now(UTC).timestamp() * 1000 - 5_000
 
@@ -68,6 +66,27 @@ class FakeFlinkTransport:
                 return HTTPResponse(400, {"errors": ["Unknown table raw_events"]})
             if statement.startswith(("EXPLAIN", "USE")):
                 return HTTPResponse(200, {"resultType": "EOS", "resultKind": "SUCCESS"})
+            if statement.startswith("DESCRIBE"):
+                return HTTPResponse(
+                    200,
+                    {
+                        "resultType": "EOS",
+                        "results": {
+                            "data": [
+                                {"fields": ["id", "BIGINT", "FALSE"]},
+                                {"fields": ["label", "STRING", "TRUE"]},
+                            ]
+                        },
+                    },
+                )
+            if statement.startswith("SELECT COUNT"):
+                return HTTPResponse(
+                    200,
+                    {
+                        "resultType": "EOS",
+                        "results": {"data": [{"fields": [self.row_count]}]},
+                    },
+                )
             return HTTPResponse(
                 200,
                 {
@@ -102,7 +121,7 @@ class FakeFlinkTransport:
             return HTTPResponse(
                 200,
                 [
-                    {"id": "numRestarts", "value": "1"},
+                    {"id": "numRestarts", "value": str(self.restart_count)},
                     {"id": "uptime", "value": "12000"},
                 ],
             )
@@ -130,22 +149,31 @@ class FakeFlinkTransport:
         raise AssertionError(f"unexpected Flink request: {method} {url}")
 
 
-def _connection(
-    transport: FakeFlinkTransport,
-    **config: object,
-) -> FlinkConnection:
-    values = {
-        "jobmanager_endpoint": "https://jobmanager.example",
-        "transport": transport,
-        **config,
-    }
-    return gantry.flink.connect(
-        "https://gateway.example/flink",
-        config=values,
+def _batch(transport: FakeFlinkTransport, **config: object) -> BatchConnection:
+    return gantry.batch.connect(
+        "flink",
+        endpoint="https://gateway.example/flink",
+        config={
+            "jobmanager_endpoint": "https://jobmanager.example",
+            "transport": transport,
+            **config,
+        },
     )
 
 
-def test_flink_artifact_and_target_validate_the_v0_boundary() -> None:
+def _stream(transport: FakeFlinkTransport, **config: object) -> StreamConnection:
+    return gantry.stream.connect(
+        "flink",
+        endpoint="https://gateway.example/flink",
+        config={
+            "jobmanager_endpoint": "https://jobmanager.example",
+            "transport": transport,
+            **config,
+        },
+    )
+
+
+def test_flink_internals_validate_the_engine_boundary() -> None:
     artifact = FlinkSQLArtifact(
         "INSERT INTO clean SELECT * FROM raw",
         declared_inputs=["raw"],
@@ -154,31 +182,40 @@ def test_flink_artifact_and_target_validate_the_v0_boundary() -> None:
 
     assert artifact.mode is FlinkMode.STREAMING
     assert artifact.to_artifact().kind == "flink_sql"
-    assert artifact.declared_outputs == ("clean",)
     with pytest.raises(ValueError, match="must not be empty"):
         FlinkSQLArtifact(" ")
     with pytest.raises(ValueError, match=r"streaming.*batch"):
         FlinkSQLArtifact("INSERT INTO x SELECT 1", mode="continuous")
-    with pytest.raises(TypeError, match="collection"):
-        FlinkSQLArtifact("INSERT INTO x SELECT 1", declared_inputs="raw")
     with pytest.raises(ValueError, match="http"):
         FlinkTarget("localhost:8083")
     with pytest.raises(ValueError, match="unknown Flink"):
         FlinkTarget("https://flink.example", {"typo": True})
 
 
+def test_batch_and_stream_have_distinct_capabilities() -> None:
+    batch = _batch(FakeFlinkTransport())
+    stream = _stream(FakeFlinkTransport())
+
+    assert batch.provider == stream.provider == "flink"
+    assert batch.capabilities() == BatchCapabilities(True, True, True, True, True, True)
+    assert stream.capabilities() == StreamCapabilities(True, True, True, True, True, True)
+    with pytest.raises(ValueError, match="unsupported batch provider"):
+        gantry.batch.connect("beam", endpoint="https://runner.example")
+
+
 async def test_validation_uses_gateway_planner_and_configured_namespace() -> None:
     transport = FakeFlinkTransport()
-    flink = _connection(
+    job = _stream(
         transport,
         default_catalog="prod-catalog",
         default_database="analytics",
         session_properties={"sql-gateway.session.idle-timeout": "10 min"},
-    )
+    ).job(inputs=["raw"], outputs=["clean"])
 
-    validation = await flink.validate("INSERT INTO clean SELECT * FROM raw")
+    validation = await job.validate("INSERT INTO clean SELECT * FROM raw")
 
     assert validation.ok
+    assert validation.metadata["mode"] == "stream"
     assert list(transport.statements.values()) == [
         "USE CATALOG `prod-catalog`",
         "USE `analytics`",
@@ -192,68 +229,148 @@ async def test_validation_uses_gateway_planner_and_configured_namespace() -> Non
     }
 
 
-async def test_validation_rejects_unsupported_sql_and_planner_errors() -> None:
+async def test_admission_enforces_actual_inputs_outputs_and_operations_locally() -> None:
     transport = FakeFlinkTransport()
-    flink = _connection(transport)
+    job = _stream(transport).job(inputs=["raw.*"], outputs=["clean.*"])
 
-    unsupported = await flink.validate("CREATE TABLE events (id INT)")
-    multiple = await flink.validate("INSERT INTO a SELECT 1; INSERT INTO b SELECT 2")
-    transport.fail_explain = True
-    unresolved = await flink.validate("INSERT INTO clean SELECT * FROM raw_events")
+    denied_input = await job("INSERT INTO clean.events SELECT * FROM finance.events")
+    denied_output = await job("INSERT INTO finance.events SELECT * FROM raw.events")
+    denied_operation = await job("DROP TABLE raw.events")
+    overwrite = await job("INSERT OVERWRITE clean.events SELECT * FROM raw.events")
 
-    assert not unsupported.ok
-    assert "only INSERT" in unsupported.errors[0]
-    assert not multiple.ok
-    assert "exactly one" in multiple.errors[0]
-    assert not unresolved.ok
-    assert "Unknown table" in unresolved.errors[0]
+    assert denied_input.failure is not None
+    assert denied_input.failure.kind is FailureKind.INPUT_NOT_ALLOWED
+    assert denied_output.failure is not None
+    assert denied_output.failure.kind is FailureKind.OUTPUT_NOT_ALLOWED
+    assert denied_operation.failure is not None
+    assert denied_operation.failure.kind is FailureKind.OPERATION_NOT_ALLOWED
+    assert overwrite.failure is not None
+    assert overwrite.failure.kind is FailureKind.OPERATION_NOT_ALLOWED
+    assert not transport.calls
 
 
-async def test_streaming_run_returns_durable_job_handle_health_and_output_refs() -> None:
+async def test_batch_allows_overwrite_and_derives_concrete_scope() -> None:
     transport = FakeFlinkTransport()
-    flink = _connection(transport, token="secret-token", output_refs={"clean": "kafka://clean"})
+    transport.states = ["FINISHED"]
+    job = _batch(transport).job(inputs=["raw.*"], outputs=["snapshots.*"], poll_interval=0)
+    sql = "INSERT OVERWRITE snapshots.daily SELECT * FROM raw.orders"
 
-    result = await flink.run(
-        sql="INSERT INTO clean SELECT * FROM raw",
-        declared_inputs=("raw",),
-        declared_outputs=("clean",),
-        checks=(MaxRestartCount(2), MaxWatermarkLag("60s"), MinOutputRate(1)),
-        poll_interval_seconds=0,
+    plan = job.inspect(sql)
+    result = await job(sql)
+
+    assert plan.statement is FlinkJobStatement.INSERT_OVERWRITE
+    assert plan.inputs == ("raw.orders",)
+    assert plan.output == "snapshots.daily"
+    assert result.ok
+    assert result.handle is not None
+    assert result.handle.metadata["mode"] == "batch"
+    assert result.handle.metadata["declared_inputs"] == ("raw.orders",)
+    assert result.handle.metadata["declared_outputs"] == ("snapshots.daily",)
+
+
+async def test_batch_waits_for_success_then_verifies_the_output() -> None:
+    transport = FakeFlinkTransport()
+    transport.states = ["RUNNING", "FINISHED"]
+    job = _batch(transport).job(
+        inputs=["raw"],
+        outputs=["snapshot"],
+        checks=[
+            gantry.verify.job_succeeded(),
+            gantry.verify.output_exists(),
+            gantry.verify.row_count(min=1),
+            gantry.verify.required_columns(["id", "label"]),
+        ],
+        poll_interval=0,
     )
 
+    result = await job("INSERT INTO snapshot SELECT * FROM raw")
+
     assert result.status is ResultStatus.ACCEPTED
-    assert result.handle is not None
-    assert result.handle.native_id == "0123456789abcdef0123456789abcdef"
-    assert result.handle.metadata["mode"] == "streaming"
-    assert "secret-token" not in repr(result.handle)
     assert result.execution is not None
-    assert result.execution.state is ExecutionState.RUNNING
-    assert result.health is not None and result.health.healthy
-    assert result.health.checks == {
-        "job_running": True,
-        "max_restarts": True,
-        "max_watermark_lag": True,
-        "min_output_rate": True,
+    assert result.execution.state is ExecutionState.SUCCEEDED
+    assert result.outputs[0].kind is OutputKind.TABLE
+    assert result.uri == "flink-table:///snapshot"
+    assert result.verification is not None
+    assert {check.name: check.ok for check in result.verification.checks} == {
+        "job_succeeded": True,
+        "output_exists": True,
+        "row_count": True,
+        "required_columns": True,
     }
+    assert "DESCRIBE `snapshot`" in transport.statements.values()
+    assert "SELECT COUNT(*) FROM `snapshot`" in transport.statements.values()
+
+
+async def test_engine_success_is_not_accepted_when_batch_verification_fails() -> None:
+    transport = FakeFlinkTransport()
+    transport.states = ["FINISHED"]
+    transport.row_count = 0
+    job = _batch(transport).job(
+        inputs=["raw"],
+        outputs=["snapshot"],
+        checks=[gantry.verify.row_count(min=1)],
+        poll_interval=0,
+    )
+
+    result = await job("INSERT INTO snapshot SELECT * FROM raw")
+
+    assert result.execution is not None
+    assert result.execution.state is ExecutionState.SUCCEEDED
+    assert result.status is ResultStatus.VERIFICATION_FAILED
+    assert result.failure is not None
+    assert result.failure.kind is FailureKind.VERIFICATION_FAILED
+
+
+async def test_stream_accepts_a_healthy_running_job_and_returns_stream_uri() -> None:
+    transport = FakeFlinkTransport()
+    job = _stream(transport, token="secret-token", output_refs={"clean": "kafka://clean"}).job(
+        inputs=["raw"],
+        outputs=["clean"],
+        checks=[
+            gantry.verify.running(),
+            gantry.verify.restart_count(max=2),
+            gantry.verify.watermark_lag(max_seconds="60s"),
+        ],
+        poll_interval=0,
+    )
+
+    result = await job("INSERT INTO clean SELECT * FROM raw")
+
+    assert result.ok
+    assert result.handle is not None
+    assert result.handle.metadata["mode"] == "stream"
+    assert result.execution is not None and result.execution.state is ExecutionState.RUNNING
+    assert result.health is not None and result.health.healthy
     assert result.metrics.records_in == 19
     assert result.metrics.records_out == 17
-    assert result.metrics.restart_count == 1
     assert result.outputs[0].kind is OutputKind.STREAM
-    assert result.outputs[0].uri == "kafka://clean"
+    assert result.uri == "kafka://clean"
+    assert "secret-token" not in repr(result.handle)
     assert transport.calls[0].headers["Authorization"] == "Bearer secret-token"
 
 
-async def test_handle_reconnects_from_a_fresh_connection_and_cancel_uses_jobmanager() -> None:
-    first_transport = FakeFlinkTransport()
-    first = _connection(first_transport)
-    handle = await first.submit(
-        FlinkSQLArtifact(
-            "INSERT INTO clean SELECT * FROM raw",
-            declared_outputs=("clean",),
-        )
+async def test_running_stream_is_not_accepted_when_health_check_fails() -> None:
+    transport = FakeFlinkTransport()
+    transport.restart_count = 4
+    job = _stream(transport).job(
+        inputs=["raw"],
+        outputs=["clean"],
+        checks=[gantry.verify.restart_count(max=3)],
+        poll_interval=0,
     )
+
+    result = await job("INSERT INTO clean SELECT * FROM raw")
+
+    assert result.execution is not None
+    assert result.execution.state is ExecutionState.RUNNING
+    assert result.status is ResultStatus.VERIFICATION_FAILED
+
+
+async def test_handle_reconnects_from_a_fresh_configured_job_and_can_be_cancelled() -> None:
+    first = _stream(FakeFlinkTransport()).job(inputs=["raw"], outputs=["clean"])
+    handle = await first.submit("INSERT INTO clean SELECT * FROM raw")
     second_transport = FakeFlinkTransport()
-    reconnected = _connection(second_transport)
+    reconnected = _stream(second_transport).job(inputs=["raw"], outputs=["clean"])
 
     execution = await reconnected.status(handle)
     cancelled = await reconnected.cancel(handle)
@@ -264,93 +381,78 @@ async def test_handle_reconnects_from_a_fresh_connection_and_cancel_uses_jobmana
     assert cancel_call.url.endswith(f"/jobs/{handle.native_id}?mode=cancel")
 
 
+async def test_tool_exposes_only_sql_and_uses_the_same_governed_job() -> None:
+    transport = FakeFlinkTransport()
+    job = _stream(transport, basic_auth=("agent", "password")).job(
+        inputs=["raw"], outputs=["clean"], poll_interval=0
+    )
+    tool = job.tool()
+
+    result = await tool.invoke(sql="INSERT INTO clean SELECT * FROM raw")
+
+    assert result.ok
+    assert tool.name == "flink_stream_job"
+    assert tool.input_schema["properties"] == {"sql": {"type": "string"}}
+    assert "password" not in repr(tool)
+    assert "inputs" not in repr(tool.input_schema)
+    with pytest.raises(ValueError, match="unexpected"):
+        await tool.invoke(sql="INSERT INTO clean SELECT * FROM raw", outputs=["finance"])
+
+
 async def test_failed_job_maps_connector_failure_and_preserves_native_state() -> None:
     transport = FakeFlinkTransport()
     transport.states = ["FAILED"]
-    flink = _connection(transport)
-    handle = ExecutionHandle(
-        "flink_existing",
-        "flink",
-        "flink",
-        "0123456789abcdef0123456789abcdef",
-        metadata={"mode": "streaming"},
-    )
+    job = _stream(transport).job(inputs=["raw"], outputs=["clean"], poll_interval=0)
 
-    execution = await flink.status(handle)
-    result = await flink.wait(handle, poll_interval_seconds=0)
+    result = await job("INSERT INTO clean SELECT * FROM raw")
 
-    assert execution.state is ExecutionState.FAILED
-    assert execution.native["state"] == "FAILED"
-    assert execution.failure is not None
-    assert execution.failure.kind is FailureKind.CONNECTOR_ERROR
     assert result.status is ResultStatus.FAILED
-
-
-async def test_batch_waits_for_finished_and_returns_table_reference() -> None:
-    transport = FakeFlinkTransport()
-    transport.states = ["RUNNING", "FINISHED"]
-    flink = _connection(transport)
-    handle = await flink.submit(
-        FlinkSQLArtifact(
-            "INSERT INTO snapshot SELECT * FROM raw",
-            mode="batch",
-            declared_outputs=("snapshot",),
-        )
-    )
-
-    result = await flink.wait(handle, poll_interval_seconds=0)
-
-    assert result.status is ResultStatus.ACCEPTED
     assert result.execution is not None
-    assert result.execution.state is ExecutionState.SUCCEEDED
-    assert result.outputs[0].kind is OutputKind.TABLE
-    assert result.outputs[0].uri == "flink-table:///snapshot"
+    assert result.execution.native["state"] == "FAILED"
+    assert result.failure is not None
+    assert result.failure.kind is FailureKind.CONNECTOR_ERROR
 
 
-async def test_tool_is_small_credential_free_and_runs_the_same_lifecycle() -> None:
+async def test_planner_rejections_are_normalized() -> None:
     transport = FakeFlinkTransport()
-    tool = _connection(transport, basic_auth=("agent", "password")).as_tool(timeout=5)
+    transport.fail_explain = True
+    job = _stream(transport).job(inputs=["raw_events"], outputs=["clean"])
 
-    result = await tool("INSERT INTO clean SELECT * FROM raw", declared_outputs=("clean",))
+    result = await job("INSERT INTO clean SELECT * FROM raw_events")
 
-    assert result.status is ResultStatus.ACCEPTED
-    assert "password" not in repr(tool.input_schema)
-    assert "endpoint" not in repr(tool.input_schema["properties"])
-    assert not hasattr(tool, "config")
-    assert not hasattr(tool, "client")
+    assert result.status is ResultStatus.REJECTED
+    assert result.failure is not None
+    assert result.failure.kind is FailureKind.VALIDATION_ERROR
+    assert "Unknown table" in result.failure.message
+
+
+async def test_submit_surfaces_structured_admission_failure() -> None:
+    job = _batch(FakeFlinkTransport()).job(inputs=["raw"], outputs=["clean"])
+
+    with pytest.raises(FlinkJobError) as captured:
+        await job.submit("INSERT INTO finance SELECT * FROM raw")
+
+    assert captured.value.failure.kind is FailureKind.OUTPUT_NOT_ALLOWED
 
 
 async def test_statement_requests_carry_no_execution_timeout() -> None:
-    """Flink's SQL Gateway refuses any positive `executionTimeout`.
-
-    `SqlGatewayService doesn't support timeout mechanism now` — it throws
-    before planning the statement, so a request carrying one fails outright and
-    every operation with it. Gantry sent one derived from its own configured
-    timeouts, which made the adapter unusable against a real gateway while
-    every test here passed.
-
-    The timeout that matters is on the HTTP call, which is what actually bounds
-    how long a caller waits, and it is asserted here too so removing the field
-    cannot quietly remove the bound as well.
-    """
     transport = FakeFlinkTransport()
-    transport.states = ["RUNNING", "FINISHED"]
-    connection = _connection(transport)
-    handle = await connection.submit(
-        FlinkSQLArtifact(
-            "INSERT INTO sink SELECT * FROM src",
-            mode="batch",
-            declared_inputs=("src",),
-            declared_outputs=("sink",),
-        )
-    )
-    await connection.wait(handle, poll_interval_seconds=0)
+    transport.states = ["FINISHED"]
+    job = _batch(transport).job(inputs=["src"], outputs=["sink"], poll_interval=0)
+
+    await job("INSERT INTO sink SELECT * FROM src")
 
     statements = [call for call in transport.calls if call.url.endswith("/statements")]
-    assert statements, "the run should have submitted at least one statement"
+    assert statements
     for call in statements:
         assert call.body is not None
-        assert "executionTimeout" not in call.body, (
-            "Flink rejects a positive executionTimeout; it must not be sent at all"
-        )
-        assert call.timeout_seconds > 0, "the HTTP call must still be bounded"
+        assert "executionTimeout" not in call.body
+        assert call.timeout_seconds > 0
+
+
+def test_old_public_flink_api_is_removed() -> None:
+    import gantry.flink as flink
+
+    assert not hasattr(flink, "connect")
+    assert not hasattr(flink, "FlinkConnection")
+    assert not hasattr(flink, "FlinkSQLTool")
