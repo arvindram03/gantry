@@ -3,7 +3,7 @@
 Gantry SQL is a governed execution boundary for agent-generated, engine-native SQL. It does not
 expose a database connection or invent a portable query language.
 
-## Connect and expose a tool
+## Configure once
 
 Install only the provider driver you need, then connect once:
 
@@ -11,24 +11,41 @@ Install only the provider driver you need, then connect once:
 import gantry
 
 db = gantry.sql.connect("neon", url=database_url)
-tool = db.as_tool(
-    operations=("describe", "query"),
+query = db.query(
     read_only=True,
-    allowed_schemas=("analytics",),
+    schemas=("analytics",),
     max_rows=500,
     timeout=30,
 )
 ```
 
-The callable form is the smallest framework-neutral integration:
+Call the governed operation directly:
 
 ```python
-result = await tool("SELECT customer_id, COUNT(*) FROM analytics.payments GROUP BY 1")
+result = await query("SELECT customer_id, COUNT(*) FROM analytics.payments GROUP BY 1")
 ```
 
-`tool.invoke("describe")` and `tool.invoke("explain", sql=...)` provide the optional operation
-surface. Framework packages can wrap the same object without adding an agent SDK dependency to
-Gantry.
+When the engine provides an output reference, access its URI without downloading the full result:
+
+```python
+uri = (await query("SELECT * FROM analytics.payments")).uri
+```
+
+`SQLResult.uri` is the first non-inline output URI. It is `None` for providers that return only
+bounded inline rows; inspect `result.inline` in that case.
+
+Or expose its narrow framework-neutral form to an agent:
+
+```python
+tool = query.tool()
+
+tool.name         # "query_sql"
+tool.input_schema # only {"sql": "..."}
+result = await tool.invoke(sql="SELECT COUNT(*) FROM analytics.payments")
+```
+
+`db.describe()` and `db.explain(sql)` remain direct application operations. Query policy never
+appears in the agent tool schema.
 
 ## Safety boundary
 
@@ -97,3 +114,7 @@ db = gantry.sql.connect("internal-warehouse", tenant="finance")
 
 Custom adapters implement the `SQLAdapter` protocol and declare only the capabilities they can
 actually enforce or observe. Admission fails closed when a policy requires anything else.
+
+Create-only derived datasets use the separate [`db.materialize(...)`](materialization.md)
+operation. Both configured operations are directly callable and expose `.tool()` when an agent
+needs them.

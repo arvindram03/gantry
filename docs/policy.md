@@ -6,15 +6,15 @@ the adapter's native validation before Gantry submits it to the target system.
 Policy is a guardrail around execution, not a replacement for database authorization. Always use
 least-privilege roles, scoped IAM, network controls, and provider resource limits underneath it.
 
-## Configure a tool
+## Configure an operation
 
-The simplest way to apply policy is when creating the agent tool:
+Policy is fixed when trusted application code creates a query operation:
 
 ```python
-tool = db.as_tool(
+query = db.query(
     read_only=True,
-    allowed_schemas=("analytics",),
-    allowed_tables=("analytics.customers", "analytics.orders"),
+    schemas=("analytics",),
+    tables=("analytics.customers", "analytics.orders"),
     denied_tables=("analytics.payroll",),
     max_rows=100,
     timeout=15,
@@ -23,10 +23,17 @@ tool = db.as_tool(
 )
 ```
 
-The tool owns this policy. The agent receives a small `describe` and `query` surface, but it does
-not receive the connection, provider client, or credentials.
+Call it directly or expose its narrow tool form:
 
-For application code, construct the same policy explicitly:
+```python
+result = await query("SELECT customer_id, total FROM analytics.orders")
+tool = query.tool()
+```
+
+The agent sees only the tool's `sql` argument. It does not receive the connection, provider client,
+credentials, or any policy fields.
+
+`SQLPolicy` remains the internal authority model used by adapters and lower-level execution APIs:
 
 ```python
 policy = gantry.sql.SQLPolicy(
@@ -35,31 +42,25 @@ policy = gantry.sql.SQLPolicy(
     max_rows=100,
     timeout_seconds=15,
 )
-
-result = await db.query(
-    "SELECT customer_id, total FROM analytics.orders",
-    policy=policy,
-)
 ```
-
-`db.as_tool(timeout=...)` maps to `SQLPolicy.timeout_seconds`.
 
 ## Policy fields
 
 | Field | Default | Guarantee |
 | --- | ---: | --- |
 | `read_only` | `True` | Reject write statements and require a native read-only execution boundary. |
-| `allowed_schemas` | empty | When set, every referenced table must be qualified with an allowed schema. |
-| `allowed_tables` | empty | When set, every referenced table must match an allowed base or qualified name. |
+| `schemas` | empty | When set, every referenced table must be qualified with an allowed schema. |
+| `tables` | empty | When set, every referenced table must match an allowed base or qualified name. |
 | `denied_tables` | empty | Reject matching base or qualified table names. |
 | `max_rows` | `1000` | Materialize at most this many rows in the agent result. |
-| `timeout_seconds` | `30` | Require a native timeout or a reconnectable job Gantry can monitor and cancel. |
+| `timeout` | `30` | Require a native timeout or a reconnectable job Gantry can monitor and cancel. |
 | `max_bytes_scanned` | `None` | Reject work whose native estimate exceeds the byte limit. |
 | `max_cost_usd` | `None` | Reject work whose native estimate exceeds the cost limit. |
 | `allow_multiple_statements` | `False` | Reject more than one SQL statement by default. |
 
-Schema and table names are compared case-insensitively. An allowlist that cannot be evaluated
-safely rejects the statement. For example, when `allowed_schemas` is set, use
+These are the arguments to `db.query(...)`; adapters receive their normalized `SQLPolicy`
+equivalents. Schema and table names are compared case-insensitively. An allowlist that cannot be
+evaluated safely rejects the statement. For example, when `schemas` is set, use
 `analytics.orders` rather than an unqualified `orders` reference.
 
 ## How admission works
@@ -98,19 +99,18 @@ the native dry-run statement type. Snowflake requires a genuinely read-only role
 `read_only=True` connection assertion. Static classification alone is never treated as sufficient
 isolation.
 
-To permit writes deliberately, use an appropriately scoped database identity and opt in:
+For governed writes that create derived data, configure a separate materialization operation:
 
 ```python
-write_tool = db.as_tool(
-    read_only=False,
-    allowed_schemas=("agent_scratch",),
-    allowed_tables=("agent_scratch.results",),
+materialize = db.materialize(
+    sources=("analytics.*",),
+    destinations=("agent_scratch.*",),
     timeout=15,
 )
 ```
 
-This succeeds only if the adapter declares write support. Gantry does not grant database
-permissions; the configured identity must already have them.
+This succeeds only if the adapter declares the required materialization support. Gantry does not
+grant database permissions; the configured identity must already have them.
 
 ## Result and resource bounds
 
@@ -129,7 +129,7 @@ If the target cannot produce the required estimate, the query is rejected.
 Policy rejection is structured and does not raise from the callable tool:
 
 ```python
-result = await tool("DELETE FROM analytics.orders")
+result = await query("DELETE FROM analytics.orders")
 
 if result.status is gantry.ResultStatus.REJECTED:
     print(result.failure.kind)
@@ -140,19 +140,23 @@ Operational failures use normalized kinds such as `AUTH_ERROR`, `OBJECT_NOT_FOUN
 `SYNTAX_ERROR`, `TIMEOUT`, and `ENGINE_ERROR`, while native details remain available for
 diagnosis.
 
-## Expose only the operations the agent needs
+## Agent exposure
 
-The default tool operations are `describe` and `query`. They can be narrowed further:
+Calling `.tool()` removes configuration from the model-visible interface:
 
 ```python
-schema_tool = db.as_tool(
-    operations=("describe",),
-    read_only=True,
-)
+tool = query.tool()
+
+tool.name          # "query_sql"
+tool.description
+tool.input_schema  # only {"sql": "..."}
 ```
 
-Available operations are `describe`, `query`, and `explain`. Omitting an operation removes it
-from the tool schema and causes direct attempts to invoke it to fail.
+`query.tool()` requires `read_only=True`. Expose agent writes through a separately scoped
+`db.materialize(...)` operation.
+
+Keep schema discovery and explanation in trusted application code through `db.describe()` and
+`db.explain(sql)` unless a separate integration deliberately exposes them.
 
 ## Production checklist
 

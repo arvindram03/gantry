@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Gantry: the execution control plane for agent-generated data work."""
 
-from gantry import flink, sql
+from gantry import flink, sql, verify
 from gantry.adapter import ExecutionAdapter
 from gantry.admission import AdmissionDecision, admit
 from gantry.artifact import Artifact
@@ -27,6 +27,7 @@ from gantry.runtime import (
 )
 from gantry.store import ExecutionStore, MemoryExecutionStore, RunRecord
 from gantry.target import ExecutionTarget
+from gantry.tool import Tool
 from gantry.verifier import CheckResult, VerificationResult, Verifier
 
 __version__ = "0.5.0"
@@ -56,6 +57,7 @@ __all__ = [
     "ResultStatus",
     "RunRecord",
     "SubmissionError",
+    "Tool",
     "ValidationResult",
     "VerificationResult",
     "Verifier",
@@ -69,5 +71,6 @@ __all__ = [
     "run",
     "sql",
     "submit",
+    "verify",
     "wait",
 ]

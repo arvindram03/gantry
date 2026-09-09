@@ -25,6 +25,10 @@ class SQLCapabilities:
     bytes_scanned: bool = False
     query_metrics: bool = False
     result_reference: bool = False
+    create_table_as: bool = False
+    create_view_as: bool = False
+    destination_introspection: bool = False
+    materialization_reference: bool = False
 
     def core_capabilities(self) -> AdapterCapabilities:
         return AdapterCapabilities(

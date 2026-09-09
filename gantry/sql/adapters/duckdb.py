@@ -18,6 +18,7 @@ from gantry.output import OutputKind, OutputRef
 from gantry.sql.adapter import SQLAdapter
 from gantry.sql.capabilities import SQLCapabilities
 from gantry.sql.explain import ExplainResult
+from gantry.sql.materialization import MaterializationPlan, TableRef
 from gantry.sql.output import InlineRows
 from gantry.sql.policy import SQLPolicy
 from gantry.sql.schema import Column, DatabaseSchema, Table
@@ -72,6 +73,10 @@ class DuckDBAdapter(SQLAdapter):
             statement_timeout=True,
             row_limit=True,
             query_metrics=True,
+            create_table_as=not self._read_only,
+            create_view_as=not self._read_only,
+            destination_introspection=True,
+            materialization_reference=not self._read_only,
         )
 
     async def describe(self, target: SQLTarget) -> DatabaseSchema:
@@ -121,6 +126,49 @@ class DuckDBAdapter(SQLAdapter):
         rows = await self._query_all(f"EXPLAIN {sql}")
         return ExplainResult(supported=True, native={"rows": tuple(rows)})
 
+    async def inspect_table(
+        self,
+        reference: TableRef,
+        target: SQLTarget,
+        *,
+        include_row_count: bool = False,
+    ) -> Table | None:
+        schema = await self.describe(target)
+        table = next(
+            (
+                candidate
+                for candidate in schema.tables
+                if candidate.name.lower() == reference.name.lower()
+                and (
+                    reference.schema is None
+                    or (candidate.schema or "").lower() == reference.schema.lower()
+                )
+                and (
+                    reference.catalog is None
+                    or (candidate.catalog or "").lower() == reference.catalog.lower()
+                )
+            ),
+            None,
+        )
+        if table is None:
+            return None
+        if not include_row_count:
+            return table
+        rows = await self._query_all(f"SELECT COUNT(*) FROM {_quoted_ref(reference)}")
+        count_value = rows[0][0]
+        if not isinstance(count_value, int) or isinstance(count_value, bool):
+            raise TypeError("DuckDB returned a non-integer row count")
+        count = count_value
+        return Table(
+            table.name,
+            table.schema,
+            table.catalog,
+            table.columns,
+            table.primary_key,
+            table.kind,
+            {**table.metadata, "rows": count},
+        )
+
     async def submit(
         self,
         sql: str,
@@ -131,12 +179,25 @@ class DuckDBAdapter(SQLAdapter):
         if not isinstance(policy, SQLPolicy):
             raise ValueError("governed SQL policy is missing from execution context")
         gantry_id = f"run_{uuid4().hex}"
+        metadata: dict[str, object] = {
+            "database": target.config.get("path", ":memory:"),
+            "max_rows": policy.max_rows,
+            "timeout_seconds": policy.timeout_seconds,
+        }
+        plan = context.metadata.get("gantry.sql.materialization.plan")
+        if isinstance(plan, MaterializationPlan):
+            metadata.update(
+                {
+                    "gantry.sql.materialization.destination": plan.destination.qualified_name,
+                    "gantry.sql.materialization.operation": plan.operation.value,
+                }
+            )
         handle = ExecutionHandle(
             gantry_id=gantry_id,
             engine="sql",
             target=target.provider,
             native_id=f"duckdb_{uuid4().hex}",
-            metadata={"database": target.config.get("path", ":memory:")},
+            metadata=metadata,
         )
         self._jobs[gantry_id] = asyncio.create_task(self._execute(handle, sql, policy))
         return handle
@@ -226,11 +287,19 @@ class DuckDBAdapter(SQLAdapter):
                 ),
             )
         runtime = asyncio.get_running_loop().time() - started
-        output = OutputRef(
-            OutputKind.INLINE,
-            f"inline://{handle.gantry_id}",
-            metadata={"inline": inline},
-        )
+        destination = handle.metadata.get("gantry.sql.materialization.destination")
+        if isinstance(destination, str):
+            output = OutputRef(
+                OutputKind.TABLE,
+                f"duckdb://{destination.replace('.', '/')}",
+                metadata={"object_kind": _materialization_kind(handle)},
+            )
+        else:
+            output = OutputRef(
+                OutputKind.INLINE,
+                f"inline://{handle.gantry_id}",
+                metadata={"inline": inline},
+            )
         return ExecutionResult.succeeded(
             handle,
             outputs=(output,),
@@ -247,3 +316,16 @@ class DuckDBAdapter(SQLAdapter):
     async def _query_all(self, sql: str) -> list[tuple[object, ...]]:
         async with self._lock:
             return await asyncio.to_thread(lambda: self._connection.execute(sql).fetchall())
+
+
+def _quoted_ref(reference: TableRef) -> str:
+    return ".".join(
+        f'"{part.replace(chr(34), chr(34) * 2)}"'
+        for part in (reference.catalog, reference.schema, reference.name)
+        if part is not None
+    )
+
+
+def _materialization_kind(handle: ExecutionHandle) -> str:
+    operation = handle.metadata.get("gantry.sql.materialization.operation")
+    return "view" if operation == "CREATE_VIEW_AS" else "table"

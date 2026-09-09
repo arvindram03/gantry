@@ -19,6 +19,7 @@ from gantry.metrics import ExecutionMetrics
 from gantry.output import OutputKind, OutputRef
 from gantry.sql.capabilities import SQLCapabilities
 from gantry.sql.explain import ExplainResult
+from gantry.sql.materialization import MaterializationPlan, TableRef
 from gantry.sql.output import InlineRows
 from gantry.sql.policy import SQLPolicy
 from gantry.sql.schema import Column, DatabaseSchema, Table
@@ -83,7 +84,7 @@ class _Client(Protocol):
 
     def list_tables(self, dataset: str) -> Iterable[_TableRef]: ...
 
-    def get_table(self, table: _TableRef) -> _Table: ...
+    def get_table(self, table: object) -> _Table: ...
 
 
 class BigQueryAdapter:
@@ -133,6 +134,10 @@ class BigQueryAdapter:
             bytes_scanned=True,
             query_metrics=True,
             result_reference=True,
+            create_table_as=True,
+            create_view_as=True,
+            destination_introspection=True,
+            materialization_reference=True,
         )
 
     async def describe(self, target: SQLTarget) -> DatabaseSchema:
@@ -179,6 +184,22 @@ class BigQueryAdapter:
             native={"job_id": job.job_id},
         )
 
+    async def inspect_table(
+        self,
+        reference: TableRef,
+        target: SQLTarget,
+        *,
+        include_row_count: bool = False,
+    ) -> Table | None:
+        identifier = _bigquery_identifier(reference, target)
+        try:
+            native = await asyncio.to_thread(self._client.get_table, identifier)
+        except Exception as error:
+            if _is_not_found(error):
+                return None
+            raise
+        return _normalized_table(native)
+
     async def submit(
         self,
         sql: str,
@@ -193,21 +214,47 @@ class BigQueryAdapter:
             job_timeout_ms=max(1, int(policy.timeout_seconds * 1_000)),
         )
         location = target.config.get("location")
-        kwargs = {"job_config": job_config}
+        gantry_id = f"run_{uuid4().hex}"
+        job_id = f"gantry_{gantry_id.removeprefix('run_')}"
+        kwargs: dict[str, object] = {"job_config": job_config, "job_id": job_id}
         if isinstance(location, str):
             kwargs["location"] = location
-        job = await asyncio.to_thread(self._client.query, sql, **kwargs)
+        try:
+            job = await asyncio.to_thread(self._client.query, sql, **kwargs)
+        except Exception as submission_error:
+            recovery_kwargs: dict[str, object] = {"project": target.config["project"]}
+            if isinstance(location, str):
+                recovery_kwargs["location"] = location
+            try:
+                job = await asyncio.to_thread(
+                    self._client.get_job,
+                    job_id,
+                    **recovery_kwargs,
+                )
+            except Exception as recovery_error:
+                raise submission_error from recovery_error
+        if job.job_id != job_id:
+            raise RuntimeError("BigQuery returned a different job ID than the submitted identity")
+        metadata: dict[str, object] = {
+            "project": target.config["project"],
+            "location": location or "",
+            "max_rows": policy.max_rows,
+            "timeout_seconds": policy.timeout_seconds,
+        }
+        plan = context.metadata.get("gantry.sql.materialization.plan")
+        if isinstance(plan, MaterializationPlan):
+            metadata.update(
+                {
+                    "gantry.sql.materialization.destination": plan.destination.qualified_name,
+                    "gantry.sql.materialization.operation": plan.operation.value,
+                }
+            )
         return ExecutionHandle(
-            f"run_{uuid4().hex}",
+            gantry_id,
             "sql",
             target.provider,
             job.job_id,
-            metadata={
-                "project": target.config["project"],
-                "location": location or "",
-                "max_rows": policy.max_rows,
-                "timeout_seconds": policy.timeout_seconds,
-            },
+            metadata=metadata,
         )
 
     async def status(self, handle: ExecutionHandle) -> Execution:
@@ -267,6 +314,15 @@ class BigQueryAdapter:
                     f"bigquery://{destination.project}/{destination.dataset_id}/{destination.table_id}",
                 )
             )
+        elif isinstance(handle.metadata.get("gantry.sql.materialization.destination"), str):
+            qualified = str(handle.metadata["gantry.sql.materialization.destination"])
+            outputs.append(
+                OutputRef(
+                    OutputKind.TABLE,
+                    f"bigquery://{qualified.replace('.', '/')}",
+                    metadata={"object_kind": _materialization_kind(handle)},
+                )
+            )
         return ExecutionResult.succeeded(
             handle,
             outputs=tuple(outputs),
@@ -292,6 +348,9 @@ class BigQueryAdapter:
         location = handle.metadata.get("location")
         if isinstance(location, str) and location:
             kwargs["location"] = location
+        project = handle.metadata.get("project")
+        if isinstance(project, str) and project:
+            kwargs["project"] = project
         return await asyncio.to_thread(self._client.get_job, handle.native_id, **kwargs)
 
     def _dry_run(self, sql: str) -> _Job:
@@ -314,20 +373,7 @@ class BigQueryAdapter:
         for dataset in datasets:
             for reference in self._client.list_tables(f"{project}.{dataset}"):
                 native = self._client.get_table(reference)
-                columns = tuple(
-                    Column(field.name, field.field_type, field.is_nullable)
-                    for field in native.schema
-                )
-                tables.append(
-                    Table(
-                        native.table_id,
-                        native.dataset_id,
-                        native.project,
-                        columns,
-                        kind=native.table_type.lower(),
-                        metadata={"rows": native.num_rows, "bytes": native.num_bytes},
-                    )
-                )
+                tables.append(_normalized_table(native))
         return tuple(tables)
 
     def _metrics(self, job: _Job) -> ExecutionMetrics:
@@ -370,3 +416,36 @@ def _unknown(handle: ExecutionHandle, message: str) -> Execution:
         ExecutionState.UNKNOWN,
         failure=Failure(FailureKind.UNKNOWN, False, message),
     )
+
+
+def _bigquery_identifier(reference: TableRef, target: SQLTarget) -> str:
+    project = reference.catalog or str(target.config["project"])
+    dataset = reference.schema or target.config.get("dataset")
+    if not isinstance(dataset, str) or not dataset:
+        raise ValueError("BigQuery table reference requires a dataset")
+    return f"{project}.{dataset}.{reference.name}"
+
+
+def _normalized_table(native: _Table) -> Table:
+    columns = tuple(
+        Column(field.name, field.field_type, field.is_nullable) for field in native.schema
+    )
+    return Table(
+        native.table_id,
+        native.dataset_id,
+        native.project,
+        columns,
+        kind=native.table_type.lower(),
+        metadata={"rows": native.num_rows, "bytes": native.num_bytes},
+    )
+
+
+def _is_not_found(error: Exception) -> bool:
+    name = type(error).__name__.lower()
+    message = str(error).lower()
+    return "notfound" in name or "not found" in message or "404" in message
+
+
+def _materialization_kind(handle: ExecutionHandle) -> str:
+    operation = handle.metadata.get("gantry.sql.materialization.operation")
+    return "view" if operation == "CREATE_VIEW_AS" else "table"

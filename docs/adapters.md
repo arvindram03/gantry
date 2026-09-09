@@ -75,6 +75,10 @@ def capabilities(self) -> SQLCapabilities:
         bytes_scanned=True,
         query_metrics=True,
         result_reference=True,
+        create_table_as=True,
+        create_view_as=False,
+        destination_introspection=True,
+        materialization_reference=True,
     )
 ```
 
@@ -86,6 +90,11 @@ Set a field to `True` only when the adapter has a concrete implementation for it
 - `reconnect` means a fresh adapter process can recover the job from the handle.
 - `result_reference` means large outputs can stay in the target system.
 - `cost_limit` requires a usable native estimate, not merely post-execution billing data.
+- `create_table_as` and `create_view_as` declare the materialization forms accepted by the target.
+- `destination_introspection` requires targeted existence, column, and row-count metadata through
+  `inspect_table`.
+- `materialization_reference` means the adapter returns a non-inline reference to the created
+  object.
 
 If a requested policy guarantee has no matching capability, Gantry rejects the run before
 submission.
@@ -120,6 +129,37 @@ async def explain(self, sql, target):
 
 Never mutate or rewrite the submitted SQL during validation. The validated, engine-native
 statement should be the statement that is executed.
+
+## Materialization support
+
+Materialization is an optional, operation-specific adapter extension. It does not add a required
+method to query-only adapters. An adapter opts into `db.materialize(...)` by declaring the
+materialization capability fields and implementing:
+
+```python
+async def inspect_table(
+    self,
+    reference: gantry.sql.TableRef,
+    target: gantry.sql.SQLTarget,
+    *,
+    include_row_count: bool = False,
+) -> gantry.sql.Table | None: ...
+```
+
+Gantry passes the inspected
+`MaterializationPlan` in `context.metadata["gantry.sql.materialization.plan"]` during submission.
+Use it to retain only the non-secret destination metadata needed for result references and
+recovery.
+
+`inspect_table` must return `None` when the object is absent and a normalized `Table` when it
+exists. When `include_row_count=True`, include the count as `table.metadata["rows"]` for the
+built-in row-count verifier. Keep the default existence check lightweight. Destination inspection
+must query native metadata; do not infer existence from the proposed SQL.
+
+Materialization results must contain a non-inline `OutputRef` for the created object. Data remains
+inside the target engine. If an adapter cannot enforce destination introspection or return a
+reference, leave the corresponding materialization capability `False` and admission will fail
+closed.
 
 ## Submit and return a durable handle
 
@@ -223,7 +263,8 @@ gantry.sql.register(
 )
 
 db = gantry.sql.connect("acme")
-tool = db.as_tool(read_only=True, max_rows=100, timeout=15)
+query = db.query(read_only=True, max_rows=100, timeout=15)
+tool = query.tool()
 ```
 
 The adapter remains private inside `SQLConnection`; the agent receives only `tool`.

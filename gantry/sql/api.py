@@ -23,7 +23,7 @@ from gantry.sql.output import InlineRows
 from gantry.sql.policy import SQLPolicy
 from gantry.sql.registry import resolve_dialect, resolve_provider
 from gantry.sql.result import SQLResult
-from gantry.sql.schema import DatabaseSchema
+from gantry.sql.schema import DatabaseSchema, Table
 from gantry.sql.target import SQLTarget
 from gantry.store import MemoryExecutionStore
 from gantry.target import ExecutionTarget
@@ -31,7 +31,9 @@ from gantry.verifier import Verifier
 
 if TYPE_CHECKING:
     from gantry.sql.capabilities import SQLCapabilities
-    from gantry.sql.tool import SQLTool
+    from gantry.sql.materialization import SQLMaterializer, TableRef
+    from gantry.sql.query import SQLQuery
+    from gantry.verify import MaterializationCheck
 
 
 class SQLConnection:
@@ -129,17 +131,49 @@ class SQLConnection:
             poll_interval_seconds=poll_interval_seconds,
         )
 
-    async def query(
+    def query(
+        self,
+        *,
+        read_only: bool = True,
+        schemas: Sequence[str] = (),
+        tables: Sequence[str] = (),
+        denied_tables: Sequence[str] = (),
+        max_rows: int = 1_000,
+        timeout: float = 30,
+        max_bytes_scanned: int | None = None,
+        max_cost_usd: float | None = None,
+        allow_multiple_statements: bool = False,
+        verify: Sequence[Verifier] = (),
+    ) -> SQLQuery:
+        """Configure a governed query operation."""
+
+        from gantry.sql.query import SQLQuery
+
+        configured_policy = SQLPolicy(
+            read_only=read_only,
+            allowed_schemas=schemas,
+            allowed_tables=tables,
+            denied_tables=denied_tables,
+            max_rows=max_rows,
+            timeout_seconds=timeout,
+            max_bytes_scanned=max_bytes_scanned,
+            max_cost_usd=max_cost_usd,
+            allow_multiple_statements=allow_multiple_statements,
+        )
+        return SQLQuery(self, configured_policy, tuple(verify))
+
+    async def _query(
         self,
         sql: str,
         *,
-        policy: SQLPolicy | None = None,
+        policy: SQLPolicy,
         context: Context | None = None,
         verify: Sequence[Verifier] = (),
     ) -> SQLResult:
-        active_policy = policy or SQLPolicy()
-        result = await self.execute(sql, policy=active_policy, context=context, verify=verify)
-        inline = _find_inline(result, active_policy.max_rows)
+        """Execute SQL for a configured query operation."""
+
+        result = await self.execute(sql, policy=policy, context=context, verify=verify)
+        inline = _find_inline(result, policy.max_rows)
         return SQLResult(
             status=result.status,
             handle=result.handle,
@@ -208,34 +242,55 @@ class SQLConnection:
                 )
             await asyncio.sleep(poll_interval_seconds)
 
-    def as_tool(
+    def materialize(
         self,
         *,
-        operations: Sequence[str] = ("describe", "query"),
-        read_only: bool = True,
-        max_rows: int = 1_000,
-        timeout: float = 30,
-        allowed_schemas: Sequence[str] = (),
-        allowed_tables: Sequence[str] = (),
-        denied_tables: Sequence[str] = (),
+        sources: Sequence[str] = (),
+        destinations: Sequence[str],
+        create_only: bool = True,
         max_bytes_scanned: int | None = None,
         max_cost_usd: float | None = None,
-        allow_multiple_statements: bool = False,
-    ) -> SQLTool:
-        from gantry.sql.tool import SQLTool
+        timeout: float = 300,
+        verify: Sequence[MaterializationCheck] = (),
+    ) -> SQLMaterializer:
+        """Configure a governed, create-only native SQL materialization operation."""
 
-        policy = SQLPolicy(
-            read_only=read_only,
-            allowed_schemas=frozenset(allowed_schemas),
-            allowed_tables=frozenset(allowed_tables),
-            denied_tables=frozenset(denied_tables),
-            max_rows=max_rows,
+        from gantry.sql.materialization import (
+            MaterializationPolicy,
+            SQLMaterializer,
+        )
+        from gantry.verify import MaterializationCheck
+
+        checks: list[MaterializationCheck] = []
+        for check in verify:
+            if not isinstance(check, MaterializationCheck):
+                raise TypeError("verify must contain materialization verification checks")
+            checks.append(check)
+        policy = MaterializationPolicy(
+            sources=sources,
+            destinations=destinations,
+            create_only=create_only,
             timeout_seconds=timeout,
             max_bytes_scanned=max_bytes_scanned,
             max_cost_usd=max_cost_usd,
-            allow_multiple_statements=allow_multiple_statements,
         )
-        return SQLTool(self, policy, tuple(operations))
+        return SQLMaterializer(self, policy, checks)
+
+    async def _inspect_table(
+        self,
+        reference: TableRef,
+        *,
+        include_row_count: bool = False,
+    ) -> Table | None:
+        from gantry.sql.materialization import MaterializationAdapter
+
+        if not isinstance(self._adapter, MaterializationAdapter):
+            raise NotImplementedError(f"{self.provider} does not support table introspection")
+        return await self._adapter.inspect_table(
+            reference,
+            self._target,
+            include_row_count=include_row_count,
+        )
 
     def _bridge(self, policy: SQLPolicy) -> SQLExecutionAdapter:
         return SQLExecutionAdapter(self._adapter, self._dialect, self._target, policy)

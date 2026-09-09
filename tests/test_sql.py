@@ -130,26 +130,29 @@ def test_custom_provider_uses_public_connection_without_exposing_config() -> Non
     )
 
     db = gantry.sql.connect("test-internal", password="do-not-expose")
-    tool = db.as_tool(max_rows=2)
+    query = db.query(max_rows=2)
+    tool = query.tool()
 
     assert db.provider == "test-internal"
     assert db.dialect == "postgres"
     assert "password" not in tool.input_schema
     assert not hasattr(tool, "config")
-    assert tool.operations == ("describe", "query")
+    assert tool.input_schema["required"] == ["sql"]
 
 
 async def test_tool_runs_lifecycle_and_defensively_bounds_inline_rows() -> None:
     adapter = StubSQLAdapter()
     gantry.sql.register("test-tool", adapter=adapter, dialect="postgres", replace=True)
-    tool = gantry.sql.connect("test-tool", secret="hidden").as_tool(max_rows=2, timeout=4)
+    query = gantry.sql.connect("test-tool", secret="hidden").query(max_rows=2, timeout=4)
+    tool = query.tool()
 
-    result = await tool("SELECT id FROM public.events")
+    result = await tool.invoke(sql="SELECT id FROM public.events")
 
     assert result.status is ResultStatus.ACCEPTED
     assert result.handle is adapter.handle
     assert result.inline == InlineRows(("id",), ((1,), (2,)), truncated=True)
     assert result.outputs[1].uri == "warehouse://temporary/sql-run"
+    assert result.uri == "warehouse://temporary/sql-run"
     assert adapter.policy is not None
     assert adapter.policy.max_rows == 2
     assert adapter.policy.timeout_seconds == 4
@@ -175,7 +178,7 @@ async def test_read_only_policy_rejects_write_before_submission() -> None:
     gantry.sql.register("test-policy", adapter=adapter, dialect="postgres", replace=True)
     db = gantry.sql.connect("test-policy")
 
-    result = await db.query("DELETE FROM public.events")
+    result = await db.query()("DELETE FROM public.events")
 
     assert result.status is ResultStatus.REJECTED
     assert result.failure is not None
@@ -187,7 +190,7 @@ async def test_missing_native_read_only_boundary_fails_closed() -> None:
     adapter = StubSQLAdapter(read_only=False)
     gantry.sql.register("test-unscoped", adapter=adapter, dialect="postgres", replace=True)
 
-    result = await gantry.sql.connect("test-unscoped").query("SELECT 1")
+    result = await gantry.sql.connect("test-unscoped").query()("SELECT 1")
 
     assert result.status is ResultStatus.REJECTED
     assert result.failure is not None
@@ -195,22 +198,30 @@ async def test_missing_native_read_only_boundary_fails_closed() -> None:
     assert adapter.submissions == 0
 
 
-async def test_tool_operations_are_explicit() -> None:
+async def test_query_tool_is_narrow_and_framework_neutral() -> None:
     adapter = StubSQLAdapter()
     gantry.sql.register("test-operations", adapter=adapter, dialect="postgres", replace=True)
-    tool = gantry.sql.connect("test-operations").as_tool(operations=("describe", "explain"))
+    query = gantry.sql.connect("test-operations").query()
+    tool = query.tool(name="query_analytics")
 
-    described = await tool.invoke("describe")
-    explained = await tool.invoke("explain", sql="SELECT 1")
+    result = await tool.invoke({"sql": "SELECT 1"})
 
-    assert isinstance(described.result, DatabaseSchema)
-    assert isinstance(explained.result, ExplainResult)
-    with pytest.raises(PermissionError, match="query is not exposed"):
-        await tool("SELECT 1")
-    with pytest.raises(PermissionError, match="not exposed"):
-        await tool.invoke("query", sql="SELECT 1")
-    with pytest.raises(ValueError, match="unsupported"):
-        gantry.sql.connect("test-operations").as_tool(operations=("drop",))
+    assert tool.name == "query_analytics"
+    assert tool.input_schema == {
+        "type": "object",
+        "properties": {"sql": {"type": "string"}},
+        "required": ["sql"],
+        "additionalProperties": False,
+    }
+    assert result.ok
+    with pytest.raises(TypeError, match="sql must be a string"):
+        await tool.invoke()
+    with pytest.raises(ValueError, match="unexpected query tool arguments"):
+        await tool.invoke(sql="SELECT 1", policy="untrusted")
+    with pytest.raises(TypeError, match="mapping or keywords"):
+        await tool.invoke({"sql": "SELECT 1"}, sql="SELECT 2")
+    with pytest.raises(ValueError, match="requires read_only=True"):
+        gantry.sql.connect("test-operations").query(read_only=False).tool()
 
 
 def test_conservative_dialect_handles_comments_quotes_ctes_and_multiple_statements() -> None:
@@ -275,12 +286,14 @@ async def test_duckdb_provider_discovers_schema_bounds_rows_and_rejects_writes(
     db = gantry.sql.connect("duckdb", path=str(path), read_only=True)
 
     schema = await db.describe()
-    result = await db.query("SELECT id FROM events ORDER BY id", policy=SQLPolicy(max_rows=2))
-    rejected = await db.query("DROP TABLE events")
+    query = db.query(max_rows=2)
+    result = await query("SELECT id FROM events ORDER BY id")
+    rejected = await query("DROP TABLE events")
 
     assert any(table.name == "events" for table in schema.tables)
     assert result.status is ResultStatus.ACCEPTED
     assert result.inline == InlineRows(("id",), ((0,), (1,)), truncated=True)
+    assert result.uri is None
     assert rejected.status is ResultStatus.REJECTED
 
 

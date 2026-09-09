@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from gantry.failure import Failure
 from gantry.handle import ExecutionHandle
 from gantry.metrics import ExecutionMetrics
-from gantry.output import OutputRef
+from gantry.output import OutputKind, OutputRef
 from gantry.result import ResultStatus
 from gantry.sql.output import InlineRows
 from gantry.verifier import VerificationResult
@@ -25,3 +25,12 @@ class SQLResult:
     @property
     def ok(self) -> bool:
         return self.status is ResultStatus.ACCEPTED
+
+    @property
+    def uri(self) -> str | None:
+        """Return the first engine-owned output URI, excluding inline rows."""
+
+        return next(
+            (output.uri for output in self.outputs if output.kind is not OutputKind.INLINE),
+            None,
+        )
