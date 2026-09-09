@@ -30,27 +30,37 @@ python examples/agent_sql.py
 
 ### Neon
 
-Verified against a live Neon instance (PostgreSQL 18.6, pooled endpoint).
+Verified against a live instance (PostgreSQL 18.6) on both endpoints. Either
+works; the direct endpoint is the simpler default.
 
 ```bash
 export GANTRY_PROVIDER=neon
-export GANTRY_DATABASE_URL="postgresql://USER:PASSWORD@ep-xxx-pooler.REGION.aws.neon.tech/dbname?sslmode=require&channel_binding=require"
+export GANTRY_DATABASE_URL="postgresql://USER:PASSWORD@ep-xxx.REGION.aws.neon.tech/dbname?sslmode=require"
 psql "$GANTRY_DATABASE_URL" -f examples/seed.sql
 python examples/agent_sql.py
 ```
 
-- **TLS is required.** Neon's own connection string carries
-  `sslmode=require`, which asyncpg honours; the example also passes
-  `ssl="require"` so it works with a URL that omits it. `channel_binding=require`
-  is accepted and ignored by asyncpg.
-- **The pooled endpoint is fine as-is.** The `-pooler` host is PgBouncer in
-  transaction mode, but Neon's supports protocol-level prepared statements, so
-  asyncpg's statement cache works. Measured: 30 concurrent distinct queries,
-  no failures, with the cache on. **This is the opposite of Supabase below** —
-  do not carry that workaround over.
+| Endpoint | Host | 40 concurrent queries |
+|---|---|---|
+| Direct | `ep-xxx.REGION.aws.neon.tech` | **0/40 failed**, `max_connections` 901 |
+| Pooled | `ep-xxx-pooler.REGION.aws.neon.tech` | **0/40 failed** |
+
+- **TLS is required.** Neon's own connection string carries `sslmode=require`,
+  which asyncpg honours; the example also passes `ssl="require"` so a URL
+  without it still works. `channel_binding=require` is accepted and ignored.
+- **Both endpoints are dual-stack** — `A` and `AAAA` records — so neither needs
+  IPv6, unlike Supabase's direct host.
+- **Neither needs a statement-cache workaround.** Neon's pooler supports
+  protocol-level prepared statements, so the adapter leaves both endpoints
+  alone. Do not carry Supabase's `:6543` workaround across; the URLs look alike
+  and the answer is different.
 - **A compute scaled to zero takes a few seconds to wake**, so the example
   allows a 30-second connect timeout. Not measured here: the instance tested
-  was already warm and connected in ~0.6 s.
+  was warm, connecting in ~0.7 s on the direct endpoint every time.
+
+Use the pooled endpoint if you expect many more concurrent clients than a single
+compute should hold open; the direct endpoint is otherwise one less thing
+between you and the database.
 
 ### Supabase
 
