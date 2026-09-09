@@ -318,3 +318,39 @@ async def test_tool_is_small_credential_free_and_runs_the_same_lifecycle() -> No
     assert "endpoint" not in repr(tool.input_schema["properties"])
     assert not hasattr(tool, "config")
     assert not hasattr(tool, "client")
+
+
+async def test_statement_requests_carry_no_execution_timeout() -> None:
+    """Flink's SQL Gateway refuses any positive `executionTimeout`.
+
+    `SqlGatewayService doesn't support timeout mechanism now` — it throws
+    before planning the statement, so a request carrying one fails outright and
+    every operation with it. Gantry sent one derived from its own configured
+    timeouts, which made the adapter unusable against a real gateway while
+    every test here passed.
+
+    The timeout that matters is on the HTTP call, which is what actually bounds
+    how long a caller waits, and it is asserted here too so removing the field
+    cannot quietly remove the bound as well.
+    """
+    transport = FakeFlinkTransport()
+    transport.states = ["RUNNING", "FINISHED"]
+    connection = _connection(transport)
+    handle = await connection.submit(
+        FlinkSQLArtifact(
+            "INSERT INTO sink SELECT * FROM src",
+            mode="batch",
+            declared_inputs=("src",),
+            declared_outputs=("sink",),
+        )
+    )
+    await connection.wait(handle, poll_interval_seconds=0)
+
+    statements = [call for call in transport.calls if call.url.endswith("/statements")]
+    assert statements, "the run should have submitted at least one statement"
+    for call in statements:
+        assert call.body is not None
+        assert "executionTimeout" not in call.body, (
+            "Flink rejects a positive executionTimeout; it must not be sent at all"
+        )
+        assert call.timeout_seconds > 0, "the HTTP call must still be bounded"

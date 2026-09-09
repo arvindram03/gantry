@@ -5,6 +5,33 @@ planning, connectors, execution, data movement, and sink writes. Gantry validate
 Flink SQL, captures the native JobID, observes and cancels the job, and evaluates lightweight
 health checks.
 
+## Running against a real cluster
+
+`tests/test_flink_live.py` exercises the adapter against an actual Flink SQL
+Gateway, and `examples/flink/docker-compose.yml` brings one up:
+
+```bash
+docker compose -f examples/flink/docker-compose.yml up -d
+pytest tests/test_flink_live.py -q
+```
+
+They skip when no gateway is reachable, so a clone without one still passes.
+
+Three details cost real time to find, and none of them are visible from a
+fake transport:
+
+- **`rest.address` and `rest.port` must point the gateway at the JobManager.**
+  Without them it submits to its own loopback and every job fails with
+  `Connection refused` after exhausting retries — long after the statement was
+  accepted.
+- **The gateway's default catalog is per-session and in-memory.** A table
+  created in one session is invisible to the next, so Gantry's one-statement
+  boundary leaves nowhere to create one. A file catalog store plus a JDBC
+  catalog gives the statement tables that outlive the session.
+- **A batch job takes longer to deploy than the 30-second default timeout**, so
+  `submission_timeout` needs raising for anything real.
+
+
 ## Connect
 
 Flink exposes two REST surfaces with different responsibilities:

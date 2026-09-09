@@ -1,0 +1,60 @@
+# A Flink cluster with the SQL Gateway, for tests/test_flink_live.py.
+#
+#   docker compose -f examples/flink/docker-compose.yml up -d
+#
+# Two settings are load-bearing and easy to get wrong:
+#
+#   rest.address / rest.port  — the gateway submits jobs over the JobManager's
+#     REST API. Without these it tries 0.0.0.0:8081, its own loopback, and every
+#     submission fails with "Connection refused" after exhausting retries.
+#
+#   table.catalog-store — the gateway's default catalog is per-session and
+#     in-memory, so a table created in one session is invisible to the next. A
+#     file catalog store persists catalog *definitions*, which is what lets a
+#     single INSERT statement reference tables that already exist.
+#
+# The JDBC catalog points at the same PostgreSQL the rest of the examples use,
+# so its tables are real and durable rather than session-scoped.
+
+name: gantry-flink
+
+x-flink: &flink
+  image: gantry/flink:1.20
+  build:
+    context: .
+  environment:
+    FLINK_PROPERTIES: |
+      jobmanager.rpc.address: jobmanager
+      rest.address: jobmanager
+      rest.port: 8081
+      taskmanager.numberOfTaskSlots: 4
+
+services:
+  jobmanager:
+    <<: *flink
+    command: jobmanager
+    ports:
+      - "18081:8081"
+
+  taskmanager:
+    <<: *flink
+    command: taskmanager
+    depends_on: [jobmanager]
+
+  sql-gateway:
+    <<: *flink
+    depends_on: [jobmanager]
+    ports:
+      - "18084:8083"
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        rest.address: jobmanager
+        rest.port: 8081
+        table.catalog-store.kind: file
+        table.catalog-store.file.path: /tmp/catalog-store
+    command: >
+      bash -c "mkdir -p /tmp/catalog-store &&
+      /opt/flink/bin/sql-gateway.sh start-foreground
+      -Dsql-gateway.endpoint.rest.address=0.0.0.0
+      -Dsql-gateway.endpoint.rest.port=8083"

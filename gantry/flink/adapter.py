@@ -81,7 +81,6 @@ class FlinkAdapter:
             operation = await self._client.execute_statement(
                 session,
                 f"EXPLAIN PLAN FOR {sql}",
-                execution_timeout_ms=self._timeout_ms("validation_timeout", 30.0),
                 execution_config=self._execution_config(mode),
             )
             response = await self._wait_for_operation(
@@ -120,7 +119,6 @@ class FlinkAdapter:
             operation = await self._client.execute_statement(
                 session,
                 sql,
-                execution_timeout_ms=self._timeout_ms("submission_timeout", 30.0),
                 execution_config=self._execution_config(mode),
             )
             response = await self._wait_for_operation(
@@ -269,7 +267,6 @@ class FlinkAdapter:
         operation = await self._client.execute_statement(
             session,
             statement,
-            execution_timeout_ms=self._timeout_ms("request_timeout", 30.0),
             execution_config=self._execution_config(mode),
         )
         try:
@@ -421,9 +418,6 @@ class FlinkAdapter:
         value = self._target.config.get(name, fallback)
         assert isinstance(value, (int, float)) and not isinstance(value, bool)
         return float(value)
-
-    def _timeout_ms(self, name: str, default: float) -> int:
-        return int(self._timeout(name, default) * 1000)
 
     def _output_metadata(
         self, artifact: Artifact, mode: FlinkMode

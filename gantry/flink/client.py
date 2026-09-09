@@ -124,15 +124,21 @@ class FlinkRESTClient:
         session: str,
         statement: str,
         *,
-        execution_timeout_ms: int,
         execution_config: Mapping[str, str],
     ) -> str:
+        """Submit one statement.
+
+        No `executionTimeout` is sent. Flink's SQL Gateway rejects any positive
+        value outright — `SqlGatewayService doesn't support timeout mechanism
+        now` — so a request carrying one fails before the statement is planned.
+        The timeout that matters is applied to the HTTP call itself, which is
+        what actually bounds how long a caller waits.
+        """
         payload = await self._gateway_request(
             "POST",
             f"sessions/{_segment(session)}/statements",
             body={
                 "statement": statement,
-                "executionTimeout": execution_timeout_ms,
                 "executionConfig": dict(execution_config),
             },
         )
