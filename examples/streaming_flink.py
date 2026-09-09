@@ -31,8 +31,8 @@ import os
 
 import gantry
 
-GATEWAY = os.environ.get("GANTRY_FLINK_GATEWAY", "http://localhost:18084")
-JOBMANAGER = os.environ.get("GANTRY_FLINK_JOBMANAGER", "http://localhost:18081")
+GATEWAY = os.environ.get("GANTRY_FLINK_GATEWAY", "http://localhost:8083")
+JOBMANAGER = os.environ.get("GANTRY_FLINK_JOBMANAGER", "http://localhost:8081")
 CATALOG = os.environ.get("GANTRY_FLINK_CATALOG", "pg")
 DATABASE = os.environ.get("GANTRY_FLINK_DATABASE", "gantry")
 

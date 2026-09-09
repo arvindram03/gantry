@@ -29,15 +29,18 @@ import pytest
 from gantry.batch import BatchConnection
 from gantry.flink.operation import FlinkBatchJob
 
-GATEWAY = os.environ.get("GANTRY_TEST_FLINK_GATEWAY", "http://localhost:18084")
-JOBMANAGER = os.environ.get("GANTRY_TEST_FLINK_JOBMANAGER", "http://localhost:18081")
+GATEWAY = os.environ.get("GANTRY_TEST_FLINK_GATEWAY", "http://localhost:8083")
+JOBMANAGER = os.environ.get("GANTRY_TEST_FLINK_JOBMANAGER", "http://localhost:8081")
 CATALOG = os.environ.get("GANTRY_TEST_FLINK_CATALOG", "pg")
 DATABASE = os.environ.get("GANTRY_TEST_FLINK_DATABASE", "gantry")
 DATABASE_SCHEMA = os.environ.get("GANTRY_TEST_FLINK_SCHEMA", "analytics")
 REPORTING_SCHEMA = os.environ.get("GANTRY_TEST_FLINK_REPORTING", "reporting")
 
-SOURCE = f"`{CATALOG}`.`{DATABASE}`.`flink_src`"
-SINK = f"`{CATALOG}`.`{DATABASE}`.`flink_sink`"
+# The tables examples/seed.sql creates. A JDBC catalog exposes a PostgreSQL
+# table as one identifier containing a dot, so the schema is quoted inside the
+# name rather than as a separate part.
+SOURCE = f"`{DATABASE_SCHEMA}.orders`"
+SINK = f"`{REPORTING_SCHEMA}.orders_replica`"
 
 
 def _reachable(url: str) -> bool:
@@ -116,15 +119,15 @@ def flink() -> BatchConnection:
 @pytest.fixture
 def job(flink: BatchConnection) -> FlinkBatchJob:
     return flink.job(
-        inputs=[f"{CATALOG}.{DATABASE}.flink_src"],
-        outputs=[f"{CATALOG}.{DATABASE}.flink_sink"],
+        inputs=[f"{DATABASE_SCHEMA}.orders"],
+        outputs=[f"{REPORTING_SCHEMA}.orders_replica"],
         poll_interval=0.25,
         timeout=300,
     )
 
 
 def _insert() -> str:
-    return f"INSERT INTO {SINK} SELECT id, label FROM {SOURCE}"
+    return f"INSERT INTO {SINK} SELECT order_id, customer_id, region, amount FROM {SOURCE}"
 
 
 async def test_validation_uses_the_real_planner(

@@ -19,9 +19,7 @@ import os
 import gantry
 import pytest
 
-URL = os.environ.get(
-    "GANTRY_TEST_POSTGRES_URL", "postgresql://gantry:gantry@localhost:15432/gantry"
-)
+URL = os.environ.get("GANTRY_TEST_POSTGRES_URL", "postgresql://gantry:gantry@localhost:5432/gantry")
 PROVIDER = os.environ.get("GANTRY_TEST_POSTGRES_PROVIDER", "postgres")
 
 

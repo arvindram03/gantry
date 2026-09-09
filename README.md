@@ -585,6 +585,30 @@ If an existing system already knows how to perform the work, Gantry should use i
 
 ---
 
+## Try it
+
+Seven runnable examples, indexed by what you are trying to do, in
+[`examples/`](examples/). The quickest needs nothing but a Python environment:
+
+```bash
+pip install "gantry[duckdb]"
+python examples/local_duckdb.py
+```
+
+For the rest, one stack brings up PostgreSQL, Flink, and the catalog they read
+through:
+
+```bash
+docker compose -f examples/stack/docker-compose.yml up -d --wait
+psql postgresql://gantry:gantry@localhost:5432/gantry -f examples/seed.sql
+python examples/warehouse_rollup.py
+```
+
+`warehouse_rollup.py` is the one to read if you want the point rather than the
+API: an agent writes a rollup over 200,000 orders, and of its four attempts one
+is accepted, one runs perfectly and produces a table nobody should read, one
+writes where it was not asked to, and one is refused by the planner.
+
 ## Documentation
 
 - [SQL providers](docs/sql.md)

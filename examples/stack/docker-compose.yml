@@ -1,0 +1,138 @@
+# Everything the examples need, on one network.
+#
+#   docker compose -f examples/stack/docker-compose.yml up -d --wait
+#   psql postgresql://gantry:gantry@localhost:5432/gantry -f examples/seed.sql
+#   python examples/agent_sql.py
+#
+# PostgreSQL alone is enough for most of them. Flink is needed only by
+# batch_flink.py, streaming_flink.py and warehouse_rollup.py, and the
+# `catalog-init` service registers the catalog those three read through.
+
+name: gantry-examples
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: gantry
+      POSTGRES_PASSWORD: gantry
+      POSTGRES_DB: gantry
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gantry"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  jobmanager:
+    build: ../flink
+    image: gantry/flink:1.20
+    command: jobmanager
+    ports:
+      - "8081:8081"
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        rest.address: jobmanager
+        rest.port: 8081
+        taskmanager.numberOfTaskSlots: 4
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8081/overview || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  taskmanager:
+    build: ../flink
+    image: gantry/flink:1.20
+    command: taskmanager
+    depends_on:
+      jobmanager:
+        condition: service_healthy
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        rest.address: jobmanager
+        rest.port: 8081
+        taskmanager.numberOfTaskSlots: 4
+
+  sql-gateway:
+    build: ../flink
+    image: gantry/flink:1.20
+    depends_on:
+      jobmanager:
+        condition: service_healthy
+    ports:
+      - "8083:8083"
+    environment:
+      # rest.address must point at the JobManager. Without it the gateway
+      # submits to its own loopback and every job fails with "Connection
+      # refused" long after the statement was accepted.
+      #
+      # The catalog store persists catalog *definitions* between sessions. The
+      # gateway's default catalog is per-session and in-memory, so without this
+      # a table registered by one session is invisible to the next — and
+      # Gantry's one-statement boundary leaves nowhere to create one.
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        rest.address: jobmanager
+        rest.port: 8081
+        table.catalog-store.kind: file
+        table.catalog-store.file.path: /tmp/catalog-store
+    command: >
+      bash -c "mkdir -p /tmp/catalog-store &&
+      /opt/flink/bin/sql-gateway.sh start-foreground
+      -Dsql-gateway.endpoint.rest.address=0.0.0.0
+      -Dsql-gateway.endpoint.rest.port=8083"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8083/info || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  # Registers the `pg` catalog once, so the Flink examples can name real
+  # PostgreSQL tables. Runs to completion and exits.
+  catalog-init:
+    image: curlimages/curl:8.10.1
+    depends_on:
+      sql-gateway:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -eu
+        gw=http://sql-gateway:8083
+        session=$$(curl -sf -X POST "$$gw/v2/sessions" \
+          -H 'Content-Type: application/json' -d '{}' |
+          sed -n 's/.*"sessionHandle":"\([^"]*\)".*/\1/p')
+
+        # The payload goes in a file. Inline, the shell eats the SQL's single
+        # quotes and the statement arrives with its connector options unquoted
+        # and invalid — which the gateway accepts as an operation and fails
+        # asynchronously, so nothing notices.
+        cat > /tmp/catalog.json <<'JSON'
+        {"statement":"CREATE CATALOG IF NOT EXISTS pg WITH ('type'='jdbc','base-url'='jdbc:postgresql://postgres:5432','default-database'='gantry','username'='gantry','password'='gantry')"}
+        JSON
+
+        op=$$(curl -sf -X POST "$$gw/v2/sessions/$$session/statements" \
+          -H 'Content-Type: application/json' --data-binary @/tmp/catalog.json |
+          sed -n 's/.*"operationHandle":"\([^"]*\)".*/\1/p')
+
+        # Submitting is not succeeding. Wait for the verdict and fail loudly,
+        # or the Flink examples start with a catalog that is not there.
+        i=0
+        while [ $$i -lt 40 ]; do
+          status=$$(curl -sf "$$gw/v2/sessions/$$session/operations/$$op/status" |
+            sed -n 's/.*"status":"\([^"]*\)".*/\1/p')
+          case "$$status" in
+            FINISHED) echo "registered the pg catalog"; exit 0 ;;
+            ERROR|CANCELED) echo "CREATE CATALOG failed: $$status" >&2; exit 1 ;;
+          esac
+          i=$$((i+1)); sleep 1
+        done
+        echo "CREATE CATALOG did not finish in time" >&2
+        exit 1

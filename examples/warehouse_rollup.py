@@ -28,8 +28,8 @@ import os
 
 import gantry
 
-GATEWAY = os.environ.get("GANTRY_FLINK_GATEWAY", "http://localhost:18084")
-JOBMANAGER = os.environ.get("GANTRY_FLINK_JOBMANAGER", "http://localhost:18081")
+GATEWAY = os.environ.get("GANTRY_FLINK_GATEWAY", "http://localhost:8083")
+JOBMANAGER = os.environ.get("GANTRY_FLINK_JOBMANAGER", "http://localhost:8081")
 CATALOG = os.environ.get("GANTRY_FLINK_CATALOG", "pg")
 DATABASE = os.environ.get("GANTRY_FLINK_DATABASE", "gantry")
 
@@ -84,6 +84,14 @@ async def main() -> int:
     print(f"   {result.status.value}  ->  {result.uri}")
     for check in result.verification.checks if result.verification else ():
         print(f"     {check.name:16s} ok={check.ok!s:6s} actual={check.actual}")
+    if not result.ok:
+        # The happy path is the point of the example. Exiting 0 here would let
+        # a broken setup look like a successful run, which is exactly the
+        # confusion this library exists to prevent.
+        print(f"   {result.failure.message if result.failure else 'no result'}")
+        print("\n   Is the stack up and the `pg` catalog registered?")
+        print("   docker compose -f examples/stack/docker-compose.yml up -d --wait")
+        return 1
 
     print("\n2. the same query, but grouped by the wrong column")
     print("   Valid SQL. The engine will run it happily. It produces 5,000 rows")

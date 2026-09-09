@@ -32,7 +32,7 @@ import gantry
 
 # ---------------------------------------------------------------- connecting
 
-LOCAL_URL = "postgresql://gantry:gantry@localhost:15432/gantry"
+LOCAL_URL = "postgresql://gantry:gantry@localhost:5432/gantry"
 
 
 def connect() -> gantry.sql.SQLConnection:

@@ -34,7 +34,7 @@ import os
 import gantry
 from gantry.sql import SQLPolicy
 
-URL = os.environ.get("GANTRY_DATABASE_URL", "postgresql://gantry:gantry@localhost:15432/gantry")
+URL = os.environ.get("GANTRY_DATABASE_URL", "postgresql://gantry:gantry@localhost:5432/gantry")
 
 # The policy travels with the submission, not with the wait.
 POLICY = SQLPolicy(
