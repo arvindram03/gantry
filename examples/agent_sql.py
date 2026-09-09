@@ -69,14 +69,25 @@ def connect() -> gantry.sql.SQLConnection:
 def build_tool(db: gantry.sql.SQLConnection) -> object:
     """The narrow thing an agent is handed.
 
-    Everything restrictive is decided here, once. `read_only=True` is enforced
-    by a PostgreSQL read-only transaction as well as by classification, so a
-    statement that slips past the parser still cannot write.
+    Everything restrictive is decided here, once, by code that holds the
+    credentials. Note what the policy is made of: a schema allow-list, a
+    denied table, a row cap and a timeout. Those are the four knobs that
+    actually matter in production.
+
+    `read_only=True` is enforced by a PostgreSQL read-only transaction as well
+    as by classification, so a statement that slips past the parser still
+    cannot write.
     """
     query = db.query(
         read_only=True,
+        # The agent may read the warehouse, and nothing else in the database.
         schemas=("analytics",),
-        denied_tables=("analytics.customer_pii",),
+        # Belt and braces: even if `analytics_pii` were added to the schema
+        # list by mistake, this table stays out of reach.
+        denied_tables=("analytics_pii.customer_contacts",),
+        # An answer needs a few hundred rows. A model asking for 200,000 has
+        # misunderstood the question, and a row cap is cheaper than finding
+        # out downstream.
         max_rows=200,
         timeout=15,
     )
@@ -84,6 +95,41 @@ def build_tool(db: gantry.sql.SQLConnection) -> object:
 
 
 # --------------------------------------------------------------- the example
+
+# What someone might actually ask an analytics agent, and what it writes.
+QUESTIONS = {
+    "revenue by region, paid orders only": (
+        "SELECT region, count(*) AS orders, round(sum(amount), 2) AS revenue "
+        "FROM analytics.orders WHERE status = 'paid' "
+        "GROUP BY region ORDER BY revenue DESC"
+    ),
+    "which plans refund the most": (
+        "SELECT c.plan, "
+        "       count(*) FILTER (WHERE o.status = 'refunded') AS refunds, "
+        "       count(*) AS orders, "
+        "       round(100.0 * count(*) FILTER (WHERE o.status = 'refunded') / count(*), 2) AS pct "
+        "FROM analytics.orders o "
+        "JOIN analytics.customers c ON c.customer_id = o.customer_id "
+        "GROUP BY c.plan ORDER BY pct DESC"
+    ),
+    "last 7 days by channel": (
+        "SELECT channel, count(*) AS orders "
+        "FROM analytics.orders "
+        "WHERE placed_at >= now() - interval '7 days' "
+        "GROUP BY channel ORDER BY orders DESC"
+    ),
+}
+
+# The ones that must not run. Each is a plausible thing a model produces.
+REFUSALS = {
+    "reads the PII table": "SELECT email FROM analytics_pii.customer_contacts LIMIT 5",
+    "deletes rows it was asked to count": ("DELETE FROM analytics.orders WHERE status = 'failed'"),
+    "reaches outside the warehouse": "SELECT * FROM pg_catalog.pg_user",
+    "smuggles a second statement": (
+        "SELECT count(*) FROM analytics.orders; DROP TABLE analytics.orders"
+    ),
+    "is not valid SQL at all": "SELEC region FROM analytics.orders",
+}
 
 
 async def main() -> int:
@@ -94,50 +140,40 @@ async def main() -> int:
     #    this is metadata only — no table contents are read.
     schema = await db.describe()
     for table in schema.tables:
-        if table.schema != "analytics":
+        if table.schema not in {"analytics", "analytics_pii"}:
             continue
-        columns = ", ".join(f"{c.name} {c.type}" for c in table.columns)
-        print(f"  {table.schema}.{table.name}  ({columns})")
-    print()
+        columns = ", ".join(c.name for c in table.columns)
+        print(f"  {table.schema}.{table.name} ({columns})")
+    print("\n  Note analytics_pii is visible to `describe()` and unreadable by")
+    print("  the tool. Knowing a table exists is not permission to read it.\n")
 
     tool = build_tool(db)
-    print(f"tool: {tool.name}")
-    print(f"agent may pass: {sorted(tool.input_schema['properties'])}\n")
+    print(f"tool: {tool.name}, agent may pass {sorted(tool.input_schema['properties'])}\n")
 
-    # 2. The agent asks a question. This is the only thing it controls.
-    answer = await tool.invoke(
-        sql=(
-            "SELECT customer_id, count(*) AS payments, sum(amount) AS total "
-            "FROM analytics.payments GROUP BY 1 ORDER BY total DESC"
-        )
-    )
-    print(f"query -> {answer.status.value}")
-    if answer.inline is not None:
-        print(f"  columns: {answer.inline.columns}")
+    # 2. Real questions.
+    for question, sql in QUESTIONS.items():
+        answer = await tool.invoke(sql=sql)
+        print(f"Q: {question}")
+        if answer.inline is None:
+            print(f"   {answer.status.value}: {answer.failure.message if answer.failure else ''}")
+            continue
+        print(f"   {answer.inline.columns}")
         for row in answer.inline.rows[:3]:
-            print(f"  {row}")
-        if answer.inline.truncated:
-            print("  (truncated by policy — the bound is reported, not hidden)")
-    print()
+            print(f"   {row}")
+        print()
 
     # 3. And the refusals, which are the reason to use this at all. Each is
     #    refused before the database is touched.
-    refusals = {
-        "writes": "DELETE FROM analytics.payments WHERE amount < 100",
-        "a denied table": "SELECT * FROM analytics.customer_pii",
-        "another schema": "SELECT * FROM public.internal_ledger",
-        "stacked statements": "SELECT 1; DROP TABLE analytics.payments",
-        "sql it cannot parse": "SELEC 1",
-    }
-    for label, sql in refusals.items():
+    print("refused:")
+    for label, sql in REFUSALS.items():
         outcome = await tool.invoke(sql=sql)
         reason = outcome.failure.message if outcome.failure else "(no reason given)"
-        print(f"  {label:20s} {outcome.status.value:9s} {reason}")
+        print(f"  {label:34s} {outcome.status.value:9s} {reason}")
 
     print(
-        "\nNote the last one: unparseable SQL is classified UNKNOWN and refused "
-        "rather than tried.\nA parser that guesses is a parser that eventually "
-        "guesses wrong about a DELETE."
+        "\nThe last one is worth noticing: unparseable SQL is classified UNKNOWN\n"
+        "and refused rather than tried. A parser that guesses is a parser that\n"
+        "eventually guesses wrong about a DELETE."
     )
     return 0
 

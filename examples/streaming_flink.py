@@ -1,22 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
-"""A continuous job, and the different questions it forces you to ask.
+"""A long-running job, and the different question it forces you to ask.
 
-**When you want this:** the work does not finish. A pipeline that keeps reading
-a stream and writing results has no final row count and no exit code to check,
-so "did it succeed?" is the wrong question — the right one is "is it still
-healthy?"
+**The situation.** A job on the cluster is doing real work — a wide join over
+the orders table, feeding the reporting database. It will run for minutes. There
+is no exit code to check yet, and "did it succeed?" is the wrong question. The
+right one is **"is it still healthy?"**, and that is a question about restarts
+and progress rather than about a return value.
 
     docker compose -f examples/flink/docker-compose.yml up -d
+    psql "$GANTRY_DATABASE_URL" -f examples/seed.sql
     python examples/streaming_flink.py
 
-**When you do not want this:** if the job ends, use `gantry.sql`. A Flink
-cluster is a large thing to operate, and a batch `INSERT ... SELECT` against
-your database is simpler in every way that matters. Reach for this when the
-input is unbounded or the engine is genuinely Flink.
+**When you do not want this.** If the job finishes quickly, use `gantry.batch`
+and check its output — `batch_flink.py`. Health checks are for work that
+outlives your attention.
 
-What Gantry adds is the same boundary as everywhere else: one statement,
-declared inputs and outputs, a handle you can come back to, and health checks
-that answer a question a job state cannot.
+**One honest limit.** A genuinely unbounded source — Kafka, CDC — needs its
+table definition to survive between sessions, and Flink's SQL Gateway keeps
+tables per session unless you run a metastore. Gantry's boundary is one INSERT
+over tables that already exist, so an unbounded demo would need a Hive metastore
+alongside the cluster. That is a lot of moving parts to show a health check, so
+this example uses a long-running bounded job instead. Everything below behaves
+identically against a Kafka source; only the source changes.
 """
 
 from __future__ import annotations
@@ -25,69 +30,79 @@ import asyncio
 import os
 
 import gantry
-from gantry.flink import (
-    FlinkMode,
-    FlinkSQLArtifact,
-    JobRunning,
-    MaxRestartCount,
-    MinOutputRate,
-)
 
 GATEWAY = os.environ.get("GANTRY_FLINK_GATEWAY", "http://localhost:18084")
 JOBMANAGER = os.environ.get("GANTRY_FLINK_JOBMANAGER", "http://localhost:18081")
 CATALOG = os.environ.get("GANTRY_FLINK_CATALOG", "pg")
 DATABASE = os.environ.get("GANTRY_FLINK_DATABASE", "gantry")
 
+SOURCE = "analytics.orders"
+SINK = "reporting.orders_replica"
+
+# Every order joined to every other order from the same customer: about eight
+# million pairs. Enough work that the job is still going when you look at it,
+# which is the whole premise.
+HEAVY = (
+    f"INSERT INTO `{SINK}` "
+    f"SELECT o.order_id, o.customer_id, o.region, o.amount "
+    f"FROM `{SOURCE}` o JOIN `{SOURCE}` p ON o.customer_id = p.customer_id "
+    f"WHERE p.status = 'refunded'"
+)
+
 
 async def main() -> int:
-    flink = gantry.flink.connect(
-        GATEWAY,
+    stream = gantry.stream.connect(
+        "flink",
+        endpoint=GATEWAY,
         jobmanager_endpoint=JOBMANAGER,
         default_catalog=CATALOG,
         default_database=DATABASE,
-        # A batch job takes longer to deploy than the 30-second default allows.
-        submission_timeout=180.0,
-        request_timeout=180.0,
+        submission_timeout=180,
+        request_timeout=180,
     )
 
-    # One statement, and its inputs and outputs named. Gantry refuses anything
-    # else: a script that creates tables as it goes has no boundary to check.
-    artifact = FlinkSQLArtifact(
-        f"INSERT INTO `{CATALOG}`.`{DATABASE}`.`flink_sink` "
-        f"SELECT id, label FROM `{CATALOG}`.`{DATABASE}`.`flink_src`",
-        mode=FlinkMode.BATCH,
-        declared_inputs=(f"{CATALOG}.{DATABASE}.flink_src",),
-        declared_outputs=(f"{CATALOG}.{DATABASE}.flink_sink",),
+    job = stream.job(
+        inputs=[SOURCE],
+        outputs=[SINK],
+        checks=[
+            # Still running, and not quietly thrashing. A job in RUNNING that
+            # has restarted forty times is not healthy, and no job state says so.
+            gantry.verify.running(),
+            gantry.verify.restart_count(max=3),
+        ],
+        # The bound on how long to wait for the contract to be met. Flink
+        # registers a job's metrics a moment after it reaches RUNNING, so
+        # "healthy" is not knowable on the first look.
+        timeout=120,
     )
 
-    # Validation is the real planner's opinion, not a parse. It is the cheapest
-    # way to find out that a column does not exist.
-    check = await flink.validate(artifact)
-    print(f"validate -> ok={check.ok} {check.errors if not check.ok else ''}")
-    if not check.ok:
+    print("submitting a job that will run for a while")
+    result = await job(HEAVY)
+    print(f"  {result.status.value}")
+    for check in result.verification.checks if result.verification else ():
+        print(f"    {check.name:16s} ok={check.ok!s:6s} actual={check.actual}")
+
+    if result.handle is None:
+        print(f"  {result.failure.message[:120] if result.failure else ''}")
         return 1
 
-    result = await flink.run(artifact, timeout_seconds=300)
-    print(f"run      -> {result.status.value}")
-    if result.failure is not None:
-        print(f"  {result.failure.message[:160]}")
-        return 1
+    print(f"\n  job id: {result.handle.native_id}")
+    print("  This handle outlives the process. A supervisor, a dashboard, or a")
+    print("  person on call can poll it without holding anything open.")
 
-    # For a *streaming* job the shape is different, and this is the part worth
-    # copying. You do not wait for it to finish, because it does not. You
-    # submit, keep the handle, and ask whether it is healthy — which is a
-    # question about restarts and output rate, not about a return code.
-    print("\nfor a streaming job you would instead:")
-    print("  handle = await flink.submit(artifact)          # mode='streaming'")
-    print("  health = await flink.health(handle, checks=[")
-    print("      JobRunning(), MaxRestartCount(3), MinOutputRate(100),")
-    print("  ])")
+    # Ask again, the way a monitor would.
+    health = await job.health(result.handle)
+    print(f"\n  healthy now: {health.healthy}")
+    print(f"  restarts:    {health.metrics.restart_count}")
+
+    # And end it, because this one exists only to be looked at.
+    ended = await job.cancel(result.handle)
+    print(f"  cancelled -> {ended.state.value}")
+
     print(
-        "\nA job in RUNNING that has restarted forty times and emits nothing is\n"
-        "not healthy, and no job state will tell you so."
-    )
-    print(
-        f"\navailable checks: {[c.__name__ for c in (JobRunning, MaxRestartCount, MinOutputRate)]}"
+        "\nWhat this buys you: the job reached a state you declared acceptable\n"
+        "before anything downstream was told it had started. `DONE` would have\n"
+        "told you the job ended. Nothing would have told you it was well."
     )
     return 0
 

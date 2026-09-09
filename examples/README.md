@@ -1,18 +1,43 @@
 # Examples
 
-Each file is runnable and does one thing. Start with the row that matches what
-you are trying to do.
+Every example runs against a realistic warehouse: 200,000 orders, 5,000
+customers, a long tail of refunds and failures, and a PII table an agent must
+not read. Seed it once:
+
+```bash
+psql "$GANTRY_DATABASE_URL" -f examples/seed.sql
+```
 
 | I want to… | Example | Needs |
 |---|---|---|
-| Let an agent answer questions about a database | [`agent_sql.py`](agent_sql.py) | PostgreSQL (local, Neon, or Supabase) |
-| Try all of this with nothing to set up | [`local_duckdb.py`](local_duckdb.py) | a file on disk |
-| Let an agent **build** a table, and check it before trusting it | [`materialize_and_verify.py`](materialize_and_verify.py) | a file on disk |
-| Run something expensive without holding a request open | [`long_running_query.py`](long_running_query.py) | PostgreSQL |
-| Run a continuous job, and know whether it is healthy | [`streaming_flink.py`](streaming_flink.py) | a Flink cluster |
+| Let an agent answer questions about a warehouse | [`agent_sql.py`](agent_sql.py) | PostgreSQL |
+| Try this with nothing to set up | [`local_duckdb.py`](local_duckdb.py) | a file on disk |
+| Let an agent build a feature table a model will train on | [`materialize_and_verify.py`](materialize_and_verify.py) | a file on disk |
+| Survive an agent writing a query that never finishes | [`long_running_query.py`](long_running_query.py) | PostgreSQL |
+| Have an agent build a rollup that is checked before anyone reads it | [`warehouse_rollup.py`](warehouse_rollup.py) | Flink + PostgreSQL |
+| Run a nightly job unattended and know it did something | [`batch_flink.py`](batch_flink.py) | Flink + PostgreSQL |
+| Run a continuous job, and know whether it is healthy | [`streaming_flink.py`](streaming_flink.py) | Flink + PostgreSQL |
 
-If you are only reading one, read `local_duckdb.py`. It needs nothing, and the
-boundary it demonstrates is the same one every other example relies on.
+If you are only reading one, read `local_duckdb.py` — it needs nothing to run.
+If you want to see the point of the library rather than its API, read
+`warehouse_rollup.py`: an agent writes a rollup, and of its four attempts one is
+accepted, one runs perfectly and produces a table nobody should read, one is
+refused for writing where it was not asked to, and one is refused by the
+planner.
+
+## The schema
+
+| | |
+|---|---|
+| `analytics.orders` | 200,000 rows; `paid`, `refunded` and `failed` in realistic proportions |
+| `analytics.customers` | 5,000 rows across four plans and three regions |
+| `analytics_pii.customer_contacts` | emails and names — a real table, deliberately reachable, so denying it does something |
+| `reporting.*` | where verified results are published |
+| `agent_scratch` | where an agent may build its own tables |
+
+`placed_at` is `timestamp` and not `timestamptz` on purpose: Flink's JDBC
+connector refuses `TIMESTAMP_LTZ`, so a `timestamptz` column makes the table
+unreadable from the Flink examples. Store UTC and say so.
 
 ## What they have in common
 

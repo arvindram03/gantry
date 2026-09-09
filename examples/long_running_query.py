@@ -1,22 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Queries that outlive the request that started them.
+"""An agent asks for something that will never finish.
 
-**When you want this:** an agent asks for something expensive. You do not want
-to hold an HTTP request open for four minutes, and you want the option to give
-up on a query that is costing more than the answer is worth.
+**The situation.** A model was asked which regions have overlapping customers
+and produced a self-join with no selective predicate. Over 200,000 orders that
+is roughly thirteen billion pairs. It is valid SQL, the planner accepts it, and
+it will run until something stops it.
+
+This is not a rare case. It is the most common way an agent-written query hurts
+you, and the answer is not a better prompt — it is a timeout, a handle, and the
+ability to cancel.
 
     pip install "gantry[postgres]"
+    psql "$GANTRY_DATABASE_URL" -f examples/seed.sql
     GANTRY_DATABASE_URL=postgresql://... python examples/long_running_query.py
 
-`await query(sql)` runs to completion and is the right call most of the time.
-When it is not, the same governed path splits into three:
+`await query(sql)` runs to completion and is right most of the time. When it is
+not, the same governed path splits into three:
 
     handle = await db.submit(sql, policy=...)   # returns immediately
     execution = await db.status(handle)         # poll from anywhere
     await db.cancel(handle)                     # stop paying for it
 
-The handle is a value you can store and come back to. Everything the policy
-decided still applies — submitting does not skip the checks, it only stops
+The handle is a value you can store and come back to from another process. The
+policy still applies — submitting does not skip the checks, it only stops
 waiting for the answer.
 """
 
@@ -31,37 +37,67 @@ from gantry.sql import SQLPolicy
 URL = os.environ.get("GANTRY_DATABASE_URL", "postgresql://gantry:gantry@localhost:15432/gantry")
 
 # The policy travels with the submission, not with the wait.
-POLICY = SQLPolicy(read_only=True, max_rows=100, timeout_seconds=120)
+POLICY = SQLPolicy(
+    read_only=True,
+    allowed_schemas=("analytics",),
+    max_rows=200,
+    # A server-side statement timeout. The last line of defence, and the one
+    # that works even if nothing is watching.
+    timeout_seconds=300,
+)
+
+# What the agent produced. A self-join on a three-value column.
+RUNAWAY = (
+    "SELECT a.region, count(*) AS pairs "
+    "FROM analytics.orders a "
+    "JOIN analytics.orders b ON a.region = b.region "
+    "GROUP BY a.region"
+)
+
+# What it should have written.
+INTENDED = (
+    "SELECT region, count(DISTINCT customer_id) AS customers "
+    "FROM analytics.orders GROUP BY region ORDER BY customers DESC"
+)
 
 
 async def main() -> int:
     db = gantry.sql.connect(os.environ.get("GANTRY_PROVIDER", "postgres"), url=URL)
 
-    # 1. The ordinary case, for contrast: run it and wait.
-    quick = await db.query(read_only=True, max_rows=5)("SELECT 1 AS answer")
-    print(f"await query(...)      -> {quick.status.value}")
+    # 1. The query that should have been written: fast, bounded, answered.
+    good = await db.query(read_only=True, schemas=("analytics",), max_rows=10)(INTENDED)
+    print(f"the intended question -> {good.status.value}")
+    if good.inline is not None:
+        for row in good.inline.rows:
+            print(f"  {row}")
 
-    # 2. Submit something slow. Control comes back immediately.
-    handle = await db.submit("SELECT pg_sleep(30), 1 AS answer", policy=POLICY)
-    print("\nsubmitted, not waiting")
-    print(f"  handle:   {handle.gantry_id}")
-    print(f"  engine:   {handle.engine} / {handle.target}")
-    print(f"  native:   {handle.native_id}")
-    print("  A value you can persist and come back to from another process.")
+    # 2. The runaway. Submit it and get control straight back.
+    print("\nthe query the agent actually wrote")
+    handle = await db.submit(RUNAWAY, policy=POLICY)
+    print(f"  submitted: {handle.gantry_id}")
+    print(f"  native id: {handle.native_id}")
+    print("  Control is back immediately. Nothing is waiting on this.")
 
-    await asyncio.sleep(1)
+    await asyncio.sleep(2)
     running = await db.status(handle)
-    print(f"\nstatus -> {running.state.value}")
+    print(f"  status after 2s: {running.state.value}")
 
-    # 3. Decide it is not worth it.
+    # 3. Stop paying for it. In a real system this is a button, or a supervisor
+    #    that cancels anything still running after N seconds.
     cancelled = await db.cancel(handle)
-    print(f"cancel -> {cancelled.state.value}")
+    print(f"  cancelled -> {cancelled.state.value}")
 
-    # 4. A refusal still happens at submit time, before anything runs. Policy
-    #    is not something `wait` gets around to checking later.
-    refused = await db.execute("DELETE FROM pg_class", policy=POLICY)
-    print(f"\nsubmitting a write under a read-only policy -> {refused.status.value}")
+    # 4. And the checks still happen at submission, before anything runs.
+    #    Being asynchronous does not mean being unguarded.
+    refused = await db.execute("DELETE FROM analytics.orders", policy=POLICY)
+    print(f"\na write submitted under a read-only policy -> {refused.status.value}")
     print(f"  {refused.failure.message}")
+
+    print(
+        "\nThree defences, in order of preference: a policy that refuses the\n"
+        "query, a timeout that bounds it, and a handle that lets a human end it.\n"
+        "The third is the one people forget to build."
+    )
     return 0
 
 
