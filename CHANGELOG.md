@@ -5,6 +5,12 @@ Notable changes. Dates are release dates; the format follows
 
 ## Unreleased
 
+### Changed
+
+- CI runs the type check and test suite against both supported interpreters,
+  3.12 and 3.13, rather than one unpinned one. `mypy`'s `python_version` pin is
+  removed so each leg checks under its own interpreter's semantics.
+
 ### Fixed
 
 - The statement splitter honours backslash escapes inside PostgreSQL `E''`

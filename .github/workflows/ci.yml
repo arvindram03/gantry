@@ -8,16 +8,38 @@ permissions:
   contents: read
 
 jobs:
-  check:
+  # Version-independent checks, run once. Formatting and lint results cannot
+  # differ between interpreters, and neither can the built artifacts.
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
+          python-version: "3.12"
       - run: uv sync
       - run: uv run ruff check .
       - run: uv run ruff format --check .
+      - run: uv run python -m build
+
+  # Both interpreters the package claims to support. `fail-fast: false` so a
+  # break on one version still reports the other, which is the difference
+  # between "3.13 is broken" and "something is broken somewhere".
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+      - run: uv sync
+      # mypy no longer pins python_version, so it type-checks under the
+      # semantics of whichever interpreter is running rather than always 3.12.
       - run: uv run mypy gantry tests
       - run: uv run pytest --cov=gantry --cov-report=term-missing
-      - run: uv run python -m build

@@ -65,7 +65,9 @@ src = ["gantry", "tests"]
 select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "SIM", "TID", "RUF", "ASYNC"]
 
 [tool.mypy]
-python_version = "3.12"
+# Deliberately unpinned. Pinning python_version meant the type check only ever
+# saw 3.12 semantics, including on the 3.13 leg of CI, so a 3.13-only typing
+# problem could not be caught. mypy follows the running interpreter instead.
 strict = true
 warn_unreachable = true
 
