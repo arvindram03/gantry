@@ -49,6 +49,13 @@ class SubmissionError(Exception):
 
 
 class ControlPlane:
+    """Routes executions to adapters by target kind and records their state.
+
+    Holds the adapter registry and the execution store behind the
+    module-level `submit`/`get`/`wait`/`cancel`/`run` helpers. Construct one
+    directly to keep adapters and history isolated from the process default.
+    """
+
     def __init__(
         self,
         adapters: Mapping[str, ExecutionAdapter] | None = None,
@@ -435,12 +442,18 @@ _default = ControlPlane()
 
 
 def register_adapter(target_kind: str, adapter: ExecutionAdapter) -> None:
+    """Register `adapter` on the process-default control plane for `target_kind`.
+
+    Raises `ValueError` if the target kind is empty. A later registration for
+    the same kind replaces the earlier one.
+    """
     _default.register_adapter(target_kind, adapter)
 
 
 def configure(
     *, adapters: Mapping[str, ExecutionAdapter], store: ExecutionStore | None = None
 ) -> None:
+    """Replace the default control plane's adapters and execution store."""
     global _default
     _default = ControlPlane(adapters, store)
 
@@ -452,10 +465,23 @@ async def submit(
     context: Context,
     policy: PolicyRequirements,
 ) -> ExecutionHandle:
+    """Validate, admit and start an artifact, returning a durable handle.
+
+    The handle outlives this call, so work can be polled or cancelled from
+    another process. Admission happens here: a policy the adapter cannot
+    enforce is refused before anything runs.
+    """
     return await _default.submit(artifact, target=target, context=context, policy=policy)
 
 
 async def get(handle: ExecutionHandle) -> Execution:
+    """Return the current `Execution` for `handle` without waiting.
+
+    Refreshes state from the adapter registered for the handle's target. Never
+    raises: a missing adapter, an adapter that fails, or a reply for a
+    different handle all come back as an `Execution` in state `UNKNOWN`
+    carrying the reason as its failure.
+    """
     return await _default.get(handle)
 
 
@@ -465,6 +491,12 @@ async def wait(
     verify: Sequence[Verifier] = (),
     poll_interval_seconds: float = 1.0,
 ) -> Result:
+    """Block until an execution finishes, then verify it.
+
+    A terminal engine state is not the answer on its own — the verifiers decide
+    whether the result may be believed, and their outcome is part of the
+    `Result`.
+    """
     return await _default.wait(
         handle,
         verify=verify,
@@ -473,6 +505,14 @@ async def wait(
 
 
 async def cancel(handle: ExecutionHandle, *, mode: str = "default") -> Execution:
+    """Ask the adapter owning `handle` to stop that execution.
+
+    `mode` is passed through to the adapter; engines that distinguish a
+    graceful stop from a hard kill interpret it. Returns the `Execution` the
+    adapter reports after the request, which may still be running if the
+    engine stops asynchronously. Like `get`, a missing or failing adapter
+    yields an `Execution` in state `UNKNOWN` rather than an exception.
+    """
     return await _default.cancel(handle, mode=mode)
 
 
@@ -485,6 +525,11 @@ async def run(
     verify: Sequence[Verifier] = (),
     poll_interval_seconds: float = 1.0,
 ) -> Result:
+    """Submit an artifact and wait for it, returning the verified result.
+
+    The common case. Use `submit` and `wait` separately when the work outlives
+    the request that started it.
+    """
     return await _default.run(
         artifact,
         target=target,

@@ -39,6 +39,13 @@ all-sql = [
 ]
 
 [dependency-groups]
+# Documentation only. Kept out of `dev` so the ordinary check loop does not
+# pull a site generator and its tree of dependencies.
+docs = [
+    "mkdocs>=1.6",
+    "mkdocs-material>=9.5",
+    "mkdocstrings[python]>=0.26",
+]
 dev = [
     "build>=1.2",
     "duckdb>=1.1",
@@ -65,6 +72,10 @@ src = ["gantry", "tests"]
 select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "SIM", "TID", "RUF", "ASYNC"]
 
 [tool.mypy]
+# `scripts/` is on the path because tests/test_capability_matrix.py imports the
+# generator. Following that import means the script is type-checked too, which
+# is right: the published matrix depends on it being correct.
+mypy_path = "scripts"
 # Deliberately unpinned. Pinning python_version meant the type check only ever
 # saw 3.12 semantics, including on the 3.13 leg of CI, so a 3.13-only typing
 # problem could not be caught. mypy follows the running interpreter instead.

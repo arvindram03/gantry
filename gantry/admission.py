@@ -32,6 +32,12 @@ def admit(
     capabilities: AdapterCapabilities,
     policy: PolicyRequirements,
 ) -> AdmissionDecision:
+    """Decide whether an artifact may run, given what the adapter can enforce.
+
+    The decision is the gate between proposing and executing. A policy the
+    adapter cannot enforce is a refusal rather than a warning: a bound nobody
+    applies is worse than no bound, because callers act as though it held.
+    """
     reasons = [
         Failure(
             kind=FailureKind.VALIDATION_ERROR,

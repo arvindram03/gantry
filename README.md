@@ -620,6 +620,11 @@ writes where it was not asked to, and one is refused by the planner.
 
 ## Documentation
 
+The rendered site, including the generated API reference, is at
+**<https://arvindram03.github.io/gantry/>**.
+
+- [API reference](https://arvindram03.github.io/gantry/api/) — public symbols,
+  signatures, and returned types, generated from the source
 - [SQL providers](docs/sql.md)
 - [SQL materialization](docs/materialization.md)
 - [Safety and policies](docs/policy.md)

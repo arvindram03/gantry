@@ -5,6 +5,20 @@ Notable changes. Dates are release dates; the format follows
 
 ## Unreleased
 
+### Added
+
+- An API reference for the public surface, published to GitHub Pages from
+  `mkdocs.yml` and the pages under `docs/api/`. Signatures and types are
+  generated from the source by `mkdocstrings`, so the reference cannot drift
+  from the code; `mkdocs build --strict` fails on a dead link or an
+  unresolvable reference, and runs on every pull request.
+- Docstrings for every symbol in `gantry.__all__` and `gantry.sql.__all__`,
+  which the reference renders.
+- The capability matrix in the reference is generated from each adapter's
+  declared `SQLCapabilities` by `scripts/capability_matrix.py`. Capabilities
+  that depend on how a connection was opened are rendered as the condition
+  ("read-only conn" / "writable conn") rather than as a flat yes or no.
+
 ### Changed
 
 - The coverage floor is enforced in CI rather than only measured: `pytest`

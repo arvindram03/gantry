@@ -27,6 +27,7 @@ _dialects: dict[str, SQLDialect] = {}
 
 
 def register_dialect(name: str, dialect: SQLDialect, *, replace: bool = False) -> None:
+    """Register a SQL dialect under a name, for classification and splitting."""
     key = name.strip().lower()
     if not key:
         raise ValueError("dialect name must not be empty")
@@ -45,6 +46,14 @@ def register_provider(
     metadata: Mapping[str, object] | None = None,
     replace: bool = False,
 ) -> None:
+    """Register a provider that `gantry.sql.connect` can open by name.
+
+    `adapter_factory` is called with the resolved `SQLTarget` each time a
+    connection is opened, so one provider can serve many targets.
+    `validate_config` runs before the factory and should raise on
+    configuration the adapter cannot honour. Raises `ValueError` if the name
+    is empty, or already registered and `replace` is false.
+    """
     key = name.strip().lower()
     if not key:
         raise ValueError("provider name must not be empty")
@@ -68,6 +77,12 @@ def register(
     driver: str | None = None,
     replace: bool = False,
 ) -> None:
+    """Register a single already-built `adapter` as a provider named `name`.
+
+    A shorthand over `register_provider` for tests and embedded adapters: every
+    target resolved through this name shares the one adapter instance. `driver`
+    defaults to `name`.
+    """
     register_provider(
         name,
         dialect=dialect,
@@ -93,6 +108,7 @@ def resolve_dialect(name: str) -> SQLDialect:
 
 
 def providers() -> tuple[str, ...]:
+    """Every registered provider name, sorted."""
     return tuple(sorted(_providers))
 
 

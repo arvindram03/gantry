@@ -50,8 +50,8 @@ appears in the agent tool schema.
 ## Worked examples
 
 `examples/` holds a runnable file per scenario, with an index in
-[examples/README.md](../examples/README.md) that starts from what you are trying
-to do:
+[examples/README.md](https://github.com/arvindram03/gantry/tree/main/examples)
+that starts from what you are trying to do:
 
 | I want to… | Example |
 |---|---|

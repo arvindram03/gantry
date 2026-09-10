@@ -1,0 +1,65 @@
+site_name: Gantry
+site_description: A common execution control plane for agent-generated data work
+site_url: https://arvindram03.github.io/gantry/
+repo_url: https://github.com/arvindram03/gantry
+repo_name: arvindram03/gantry
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle: { icon: material/brightness-7, name: Switch to dark mode }
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle: { icon: material/brightness-4, name: Switch to light mode }
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            # Generated from source so the reference cannot drift from the
+            # code. The package is checked with `mypy --strict`, so the
+            # signatures here are the real ones.
+            show_source: true
+            show_signature_annotations: true
+            separate_signature: true
+            signature_crossrefs: true
+            docstring_style: google
+            members_order: source
+            show_root_heading: true
+            show_symbol_type_heading: true
+            show_symbol_type_toc: true
+            filters: ["!^_"]
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Guides:
+      - SQL: sql.md
+      - Policies: policy.md
+      - Materialization: materialization.md
+      - Flink backends: flink.md
+      - Adapters: adapters.md
+  - API reference:
+      - Overview: api/index.md
+      - SQL: api/sql.md
+      - Results and outputs: api/results.md
+      - Failures: api/failures.md
+      - Handles and execution: api/execution.md
+      - Batch and stream jobs: api/jobs.md
+      - Capability matrix: api/capabilities.md

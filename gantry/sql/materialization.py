@@ -502,6 +502,16 @@ class SQLMaterializer:
 
 
 def parse_materialization(sql: str) -> MaterializationPlan:
+    """Parse caller-proposed SQL into a create-only `MaterializationPlan`.
+
+    Accepts exactly one `CREATE TABLE ... AS` or `CREATE VIEW ... AS` whose
+    destination names a schema, and returns the operation, the schema-qualified
+    destination, and the source tables the body reads. Raises
+    `MaterializationError` for anything else: several statements, a non-create
+    operation, `OR REPLACE` or `IF NOT EXISTS`, an unqualified destination, a
+    body that is not a `SELECT`/`WITH` query, or a body carrying a second
+    effect such as `DELETE` or `DROP`.
+    """
     proposal = MaterializationProposal(sql)
     statements = _split_statements(proposal.sql)
     if len(statements) != 1:
