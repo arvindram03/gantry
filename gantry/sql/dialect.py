@@ -111,17 +111,25 @@ def _split_statements(sql: str) -> tuple[str, ...]:
     parts: list[str] = []
     start = 0
     quote: str | None = None
+    backslash_escapes = False
     index = 0
     while index < len(sql):
         char = sql[index]
         if quote is not None:
-            if char == quote:
+            if backslash_escapes and char == "\\" and index + 1 < len(sql):
+                # Inside an E'' string a backslash escapes whatever follows,
+                # including the closing quote. Skip the pair so `E'O\'Brien'`
+                # stays one string rather than ending at the escaped quote.
+                index += 1
+            elif char == quote:
                 if index + 1 < len(sql) and sql[index + 1] == quote:
                     index += 1
                 else:
                     quote = None
+                    backslash_escapes = False
         elif char in {"'", '"', "`"}:
             quote = char
+            backslash_escapes = char == "'" and _has_escape_prefix(sql, index)
         elif char == "-" and index + 1 < len(sql) and sql[index + 1] == "-":
             newline = sql.find("\n", index + 2)
             index = len(sql) if newline == -1 else newline
@@ -134,6 +142,27 @@ def _split_statements(sql: str) -> tuple[str, ...]:
         index += 1
     parts.append(sql[start:])
     return tuple(parts)
+
+
+def _has_escape_prefix(sql: str, index: int) -> bool:
+    """Whether the quote at `index` opens a PostgreSQL `E''` string.
+
+    Backslashes are only special in the `E''` form. With
+    `standard_conforming_strings` on — the default since 9.1 — a backslash in
+    an ordinary `'...'` string is a literal backslash, so treating it as an
+    escape everywhere would run the opposite risk: a string ending later than
+    it should.
+
+    The `E` has to be a token of its own. In `tableE'x'` PostgreSQL reads
+    `tableE` as an identifier and `'x'` as a plain string, so an `E` preceded
+    by an identifier character is not a prefix.
+    """
+    if index == 0 or sql[index - 1] not in {"E", "e"}:
+        return False
+    before = index - 2
+    if before < 0:
+        return True
+    return not (sql[before].isalnum() or sql[before] in {"_", "$"})
 
 
 def _unquote(identifier: str) -> str:

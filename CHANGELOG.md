@@ -7,6 +7,10 @@ Notable changes. Dates are release dates; the format follows
 
 ### Fixed
 
+- The statement splitter honours backslash escapes inside PostgreSQL `E''`
+  strings, so `E'O\'Brien; x'` is one statement rather than two. Backslashes
+  stay literal in ordinary strings, matching `standard_conforming_strings`, and
+  an `E` at the end of an identifier is not treated as a string prefix.
 - Ship `gantry/py.typed`. Without it PEP 561 requires type checkers to ignore
   the installed package, so every Gantry symbol resolved to `Any` downstream
   and the `Typing :: Typed` classifier was a claim the wheel did not honour.

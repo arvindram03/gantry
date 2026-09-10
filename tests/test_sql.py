@@ -243,6 +243,45 @@ def test_conservative_dialect_handles_comments_quotes_ctes_and_multiple_statemen
     assert multiple.statement_count == 2
 
 
+def test_conservative_dialect_honours_backslash_escapes_only_in_e_strings() -> None:
+    """Backslashes are special in `E''` and nowhere else.
+
+    Every expectation here was checked against PostgreSQL 16 with
+    `standard_conforming_strings` on, which is the default: a backslash escapes
+    the next character inside `E''`, is a literal backslash in an ordinary
+    string, and an `E` glued to the end of an identifier is part of that
+    identifier rather than a string prefix.
+    """
+    dialect = ConservativeDialect()
+
+    # The escaped quote does not end the string, so the `;` inside it is not a
+    # separator.
+    escaped = dialect.classify(
+        r"SELECT * FROM analytics.customers WHERE name = E'O\'Brien; DROP TABLE t'"
+    )
+    assert escaped.operation is SQLOperation.SELECT
+    assert escaped.statement_count == 1
+    assert escaped.read_only
+
+    # Lower case is the same prefix.
+    assert dialect.classify(r"SELECT e'O\'Brien; x' AS c").statement_count == 1
+
+    # Doubling still works inside an E string.
+    assert dialect.classify("SELECT E'O''Brien; x' AS c").statement_count == 1
+
+    # In an ordinary string the backslash is literal, so the string ends at the
+    # next quote and the `;` after it really does separate two statements.
+    plain = dialect.classify(r"SELECT 'a\'; SELECT 2")
+    assert plain.operation is SQLOperation.MULTI_STATEMENT
+    assert plain.statement_count == 2
+
+    # An escaped backslash ends the E string, so this `;` is a separator too.
+    assert dialect.classify(r"SELECT E'a\\'; SELECT 2").statement_count == 2
+
+    # `tableE` is an identifier; the string that follows is an ordinary one.
+    assert dialect.classify(r"SELECT * FROM tableE'x\'; DROP TABLE t'").statement_count == 2
+
+
 def test_policy_normalizes_allow_lists_and_checks_explain_limits() -> None:
     policy = SQLPolicy(
         allowed_schemas=["Analytics"],
