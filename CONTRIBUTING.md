@@ -6,6 +6,11 @@ Gantry v0 is intentionally small. Changes should preserve the single lifecycle:
 propose → constrain → execute → verify → accept
 ```
 
+## Code of conduct
+
+This project follows the [Contributor Covenant](CODE_OF_CONDUCT.md). By taking part you
+agree to uphold it; report unacceptable behavior to arvindram03@gmail.com.
+
 ## Setup
 
 ```bash
