@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/arvindram03/gantry/blob/main/SECURITY.md
+    about: A way past a policy, or a credential reachable from an agent tool. Report privately, not here.
