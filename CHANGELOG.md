@@ -7,6 +7,8 @@ Notable changes. Dates are release dates; the format follows
 
 ### Changed
 
+- The coverage floor is enforced in CI rather than only measured: `pytest`
+  fails below 77%.
 - CI runs the type check and test suite against both supported interpreters,
   3.12 and 3.13, rather than one unpinned one. `mypy`'s `python_version` pin is
   removed so each leg checks under its own interpreter's semantics.

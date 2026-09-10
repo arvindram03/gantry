@@ -74,4 +74,19 @@ warn_unreachable = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-addopts = "--strict-markers"
+# The coverage floor is enforced, not merely measured.
+#
+# 77 and not 78, even though the TOTAL line prints "78%". Two roundings
+# disagree: pytest-cov decides the printed verdict from the precise figure
+# (77.68), while the exit code comes from coverage.py comparing that figure
+# rounded to the configured precision. At 78 the build stays green *and* every
+# log carries "FAIL Required test coverage of 78% not reached" — a gate that
+# contradicts itself in writing is worse than one set a point lower.
+#
+# At 77 the message and the exit code agree, and the build fails if coverage
+# genuinely drops below 76.5. Raise it as coverage improves, and re-check the
+# boundary rather than reading the rounded number off a log.
+#
+# It only applies when coverage is collected, so running a single test file is
+# unaffected.
+addopts = "--strict-markers --cov-fail-under=77"
