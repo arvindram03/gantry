@@ -17,6 +17,7 @@ _OBJECT = re.compile(
     re.IGNORECASE,
 )
 _FUNCTION = re.compile(r"\b([A-Za-z_][A-Za-z0-9_$]*)\s*\(")
+_DOLLAR_QUOTE = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$")
 _DDL = {"CREATE", "ALTER", "DROP", "TRUNCATE", "GRANT", "REVOKE", "COMMENT"}
 _OPERATIONS = {
     "SELECT": SQLOperation.SELECT,
@@ -111,10 +112,15 @@ def _split_statements(sql: str) -> tuple[str, ...]:
     parts: list[str] = []
     start = 0
     quote: str | None = None
+    dollar_quote: str | None = None
     index = 0
     while index < len(sql):
         char = sql[index]
-        if quote is not None:
+        if dollar_quote is not None:
+            if sql.startswith(dollar_quote, index):
+                index += len(dollar_quote) - 1
+                dollar_quote = None
+        elif quote is not None:
             if char == quote:
                 if index + 1 < len(sql) and sql[index + 1] == quote:
                     index += 1
@@ -122,6 +128,11 @@ def _split_statements(sql: str) -> tuple[str, ...]:
                     quote = None
         elif char in {"'", '"', "`"}:
             quote = char
+        elif char == "$":
+            match = _DOLLAR_QUOTE.match(sql, index)
+            if match is not None:
+                dollar_quote = match.group(0)
+                index += len(dollar_quote) - 1
         elif char == "-" and index + 1 < len(sql) and sql[index + 1] == "-":
             newline = sql.find("\n", index + 2)
             index = len(sql) if newline == -1 else newline

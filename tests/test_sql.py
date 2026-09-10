@@ -243,6 +243,23 @@ def test_conservative_dialect_handles_comments_quotes_ctes_and_multiple_statemen
     assert multiple.statement_count == 2
 
 
+def test_conservative_dialect_treats_dollar_quoted_bodies_as_opaque() -> None:
+    dialect = ConservativeDialect()
+
+    untagged = dialect.classify("SELECT regexp_replace(note, $$a;b$$, '') FROM analytics.customers")
+    tagged = dialect.classify("SELECT $tag$one; two$tag$ FROM analytics.customers")
+    control = dialect.classify("SELECT $$one$$; SELECT 2")
+
+    assert untagged.operation is SQLOperation.SELECT
+    assert untagged.statement_count == 1
+    assert untagged.read_only
+    assert tagged.operation is SQLOperation.SELECT
+    assert tagged.statement_count == 1
+    assert tagged.read_only
+    assert control.operation is SQLOperation.MULTI_STATEMENT
+    assert control.statement_count == 2
+
+
 def test_policy_normalizes_allow_lists_and_checks_explain_limits() -> None:
     policy = SQLPolicy(
         allowed_schemas=["Analytics"],
