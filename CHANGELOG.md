@@ -3,6 +3,14 @@
 Notable changes. Dates are release dates; the format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Fixed
+
+- Ship `gantry/py.typed`. Without it PEP 561 requires type checkers to ignore
+  the installed package, so every Gantry symbol resolved to `Any` downstream
+  and the `Typing :: Typed` classifier was a claim the wheel did not honour.
+
 ## 0.5.0 — 2026-09-09
 
 First release published to PyPI, as `data-gantry`.
