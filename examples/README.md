@@ -16,6 +16,7 @@ psql "$GANTRY_DATABASE_URL" -f examples/seed.sql
 | Let an agent build a feature table a model will train on | [`materialize_and_verify.py`](materialize_and_verify.py) | a file on disk |
 | Survive an agent writing a query that never finishes | [`long_running_query.py`](long_running_query.py) | PostgreSQL |
 | Have an agent build a rollup that is checked before anyone reads it | [`warehouse_rollup.py`](warehouse_rollup.py) | Flink + PostgreSQL |
+| Govern a MongoDB pipeline the same way | [`mongodb_rollup.py`](mongodb_rollup.py) | MongoDB |
 | Run a nightly job unattended and know it did something | [`batch_flink.py`](batch_flink.py) | Flink + PostgreSQL |
 | Run a continuous job, and know whether it is healthy | [`streaming_flink.py`](streaming_flink.py) | Flink + PostgreSQL |
 
