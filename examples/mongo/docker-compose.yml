@@ -1,0 +1,18 @@
+# Just MongoDB, for the MongoDB examples (mongodb_rollup.py,
+# mongodb_policy_demo.py). Nothing else in examples/ needs this stack.
+#
+#   docker compose -f examples/mongo/docker-compose.yml up -d --wait
+#   python examples/mongodb_policy_demo.py
+
+name: gantry-mongo-example
+
+services:
+  mongo:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 2s
+      timeout: 3s
+      retries: 30

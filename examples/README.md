@@ -17,6 +17,7 @@ psql "$GANTRY_DATABASE_URL" -f examples/seed.sql
 | Survive an agent writing a query that never finishes | [`long_running_query.py`](long_running_query.py) | PostgreSQL |
 | Have an agent build a rollup that is checked before anyone reads it | [`warehouse_rollup.py`](warehouse_rollup.py) | Flink + PostgreSQL |
 | Govern a MongoDB pipeline the same way | [`mongodb_rollup.py`](mongodb_rollup.py) | MongoDB |
+| Watch every MongoDB policy limit get hit on purpose | [`mongodb_policy_demo.py`](mongodb_policy_demo.py) | MongoDB |
 | Run a nightly job unattended and know it did something | [`batch_flink.py`](batch_flink.py) | Flink + PostgreSQL |
 | Run a continuous job, and know whether it is healthy | [`streaming_flink.py`](streaming_flink.py) | Flink + PostgreSQL |
 
@@ -56,6 +57,23 @@ usable* are different questions. A `CREATE TABLE AS` that matched no rows
 succeeds. A streaming job that has restarted forty times is `RUNNING`. Gantry's
 job is the second question — see `materialize_and_verify.py` for the clearest
 case of the two disagreeing.
+
+## `mongodb_policy_demo.py`
+
+Nine pipelines against a real MongoDB, run one after another, each hitting a different limit on
+purpose: a read within its document cap, a read that gets truncated at 50 of 5,000 matching
+documents, a read outside the collections it was granted, a write attempted through a read-only
+tool, a materialization that is accepted and verified, the same materialization rejected on rerun
+because `$out` is create-only, a rollup rejected at verification for having too many groups, a
+rollup rejected at verification for missing a required field, and a materialization rejected for
+writing somewhere it was never granted. It ends with a colored summary table tallying how many of
+the nine were accepted, capped, rejected by policy, or rejected at verification.
+
+```bash
+pip install "data-gantry[mongodb]"
+docker compose -f examples/mongo/docker-compose.yml up -d --wait
+python examples/mongodb_policy_demo.py
+```
 
 ## Which provider?
 
