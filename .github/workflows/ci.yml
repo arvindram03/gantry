@@ -3,6 +3,12 @@ name: ci
 on:
   push:
   pull_request:
+  workflow_dispatch:
+  schedule:
+    # Every Monday at 06:00 UTC. The Flink live tests bring up a heavier
+    # compose stack than a service container, so they run on their own
+    # schedule rather than on every push.
+    - cron: "0 6 * * 1"
 
 permissions:
   contents: read
@@ -32,14 +38,69 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.12", "3.13"]
+    # A real PostgreSQL for tests/test_postgres_live.py — the one place the
+    # adapter runs against an actual `information_schema`, not a stub. Cheap
+    # enough as a service container to run on every push, unlike Flink.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: gantry
+          POSTGRES_PASSWORD: gantry
+          POSTGRES_DB: gantry
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
-      - run: uv sync
+      - run: uv sync --extra postgres
+      - run: psql "$GANTRY_TEST_POSTGRES_URL" -f examples/seed.sql
+        env:
+          GANTRY_TEST_POSTGRES_URL: postgresql://gantry:gantry@localhost:5432/gantry
       # mypy no longer pins python_version, so it type-checks under the
       # semantics of whichever interpreter is running rather than always 3.12.
       - run: uv run mypy gantry tests
-      - run: uv run pytest --cov=gantry --cov-report=term-missing
+      # test_flink_live.py has no Flink here — it belongs to the flink-live
+      # job below, on its own schedule. GANTRY_REQUIRE_LIVE turns a
+      # postgres-unreachable skip into a failure, so a broken fixture (or a
+      # service container that silently failed to start) cannot pass as a
+      # green skip.
+      - run: uv run pytest --cov=gantry --cov-report=term-missing --ignore=tests/test_flink_live.py
+        env:
+          GANTRY_REQUIRE_LIVE: "1"
+          GANTRY_TEST_POSTGRES_URL: postgresql://gantry:gantry@localhost:5432/gantry
+
+  # Heavier than a service container — a full JobManager/TaskManager/SQL
+  # Gateway stack, built from examples/flink/. On demand or weekly rather
+  # than on every push, per the plan in issue #10.
+  flink-live:
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv sync
+      - run: docker compose -f examples/stack/docker-compose.yml up -d --wait
+      - run: psql "$GANTRY_TEST_POSTGRES_URL" -f examples/seed.sql
+        env:
+          GANTRY_TEST_POSTGRES_URL: postgresql://gantry:gantry@localhost:5432/gantry
+      # GANTRY_REQUIRE_LIVE turns a gateway/catalog-unreachable skip into a
+      # failure — the exact failure mode test_flink_live.py's own docstring
+      # already records having happened once (a NameError read as "no
+      # catalogs" and skipped the whole file).
+      - run: uv run pytest tests/test_flink_live.py -q
+        env:
+          GANTRY_REQUIRE_LIVE: "1"
+      - if: always()
+        run: docker compose -f examples/stack/docker-compose.yml down -v

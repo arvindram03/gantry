@@ -11,9 +11,11 @@ test passed.
 Skipped unless a gateway is reachable, so a clone without one still passes.
 Bring one up with:
 
-    docker compose -f examples/flink/docker-compose.yml up -d
+    docker compose -f examples/stack/docker-compose.yml up -d --wait
 
-Set GANTRY_TEST_FLINK_GATEWAY / GANTRY_TEST_FLINK_JOBMANAGER to point elsewhere.
+Set GANTRY_TEST_FLINK_GATEWAY / GANTRY_TEST_FLINK_JOBMANAGER to point
+elsewhere. Set GANTRY_REQUIRE_LIVE=1 in a job that is supposed to have a
+gateway up, so an unreachable one fails loudly instead of skipping.
 """
 
 from __future__ import annotations
@@ -28,6 +30,8 @@ import gantry
 import pytest
 from gantry.batch import BatchConnection
 from gantry.flink.operation import FlinkBatchJob
+
+from _live import require_live_or_skip
 
 GATEWAY = os.environ.get("GANTRY_TEST_FLINK_GATEWAY", "http://localhost:8083")
 JOBMANAGER = os.environ.get("GANTRY_TEST_FLINK_JOBMANAGER", "http://localhost:8081")
@@ -100,9 +104,9 @@ def _catalogs() -> set[str]:
 @pytest.fixture
 def flink() -> BatchConnection:
     if not _reachable(f"{GATEWAY}/info") or not _reachable(f"{JOBMANAGER}/overview"):
-        pytest.skip(f"no Flink at {GATEWAY} / {JOBMANAGER}")
+        require_live_or_skip(f"no Flink at {GATEWAY} / {JOBMANAGER}")
     if CATALOG not in _catalogs():
-        pytest.skip(f"catalog {CATALOG!r} is not registered on the gateway")
+        require_live_or_skip(f"catalog {CATALOG!r} is not registered on the gateway")
     return gantry.batch.connect(
         "flink",
         endpoint=GATEWAY,

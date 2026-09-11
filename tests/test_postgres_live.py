@@ -9,7 +9,8 @@ column does not exist, and nothing noticed because nothing ran it.
 Skipped unless a database is reachable, so a clone without one still passes.
 Point it somewhere with `GANTRY_TEST_POSTGRES_URL` — including at Neon or
 Supabase, where the same tests are a useful check that the provider preset and
-TLS settings are right.
+TLS settings are right. Set `GANTRY_REQUIRE_LIVE=1` in a job that is supposed
+to have a database up, so an unreachable one fails loudly instead of skipping.
 """
 
 from __future__ import annotations
@@ -18,6 +19,8 @@ import os
 
 import gantry
 import pytest
+
+from _live import require_live_or_skip
 
 URL = os.environ.get("GANTRY_TEST_POSTGRES_URL", "postgresql://gantry:gantry@localhost:5432/gantry")
 PROVIDER = os.environ.get("GANTRY_TEST_POSTGRES_PROVIDER", "postgres")
@@ -49,7 +52,7 @@ async def _reachable() -> bool:
 async def db() -> gantry.sql.SQLConnection:
     connection = _connect()
     if not await _reachable():
-        pytest.skip(f"no PostgreSQL at {URL.rsplit('@', 1)[-1]}")
+        require_live_or_skip(f"no PostgreSQL at {URL.rsplit('@', 1)[-1]}")
     return connection
 
 
