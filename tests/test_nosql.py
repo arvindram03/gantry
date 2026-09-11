@@ -560,3 +560,19 @@ def test_mongo_adapter_reports_a_clear_error_without_pymongo(
 
     with pytest.raises(ImportError, match='pip install "data-gantry\\[mongodb\\]"'):
         MongoAdapter(_nosql_target())
+
+
+def test_mongodb_provider_config_is_validated_before_driver_creation() -> None:
+    from gantry.nosql.providers import register_builtin_providers
+    from gantry.nosql.registry import resolve_provider
+
+    register_builtin_providers()
+    provider = resolve_provider("mongodb")
+
+    with pytest.raises(ValueError, match="requires uri"):
+        provider.validate_config({"database": "d"})
+    with pytest.raises(ValueError, match="requires database"):
+        provider.validate_config({"uri": "mongodb://localhost"})
+    with pytest.raises(ValueError, match="unknown MongoDB provider option"):
+        provider.validate_config({"uri": "mongodb://localhost", "database": "d", "typo": True})
+    provider.validate_config({"uri": "mongodb://localhost", "database": "d"})
