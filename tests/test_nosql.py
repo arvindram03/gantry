@@ -576,3 +576,51 @@ def test_mongodb_provider_config_is_validated_before_driver_creation() -> None:
     with pytest.raises(ValueError, match="unknown MongoDB provider option"):
         provider.validate_config({"uri": "mongodb://localhost", "database": "d", "typo": True})
     provider.validate_config({"uri": "mongodb://localhost", "database": "d"})
+
+
+async def test_connect_query_runs_lifecycle_and_bounds_inline_documents() -> None:
+    from gantry.nosql.api import connect
+    from gantry.nosql.registry import register
+
+    adapter = StubMongoAdapter()
+    register("test-nosql", adapter=adapter, replace=True)
+    db = connect("test-nosql", uri="mongodb://localhost", database="d")
+    query = db.query(collections=["orders"], max_documents=1)
+
+    result = await query("orders", {"status": "open"})
+
+    assert result.status is ResultStatus.ACCEPTED
+    assert result.inline is not None
+    assert len(result.inline.documents) <= 1
+    assert result.inline.truncated is True
+    assert adapter.submitted_collection == "orders"
+    assert adapter.policy is not None
+    assert adapter.policy.max_documents == 1
+
+
+async def test_connect_rejects_writes_under_a_read_only_query_policy() -> None:
+    from gantry.nosql.api import connect
+    from gantry.nosql.registry import register
+
+    adapter = StubMongoAdapter()
+    register("test-nosql-write", adapter=adapter, replace=True)
+    db = connect("test-nosql-write", uri="mongodb://localhost", database="d")
+
+    result = await db.query()("orders", [{"$match": {}}, {"$out": "reporting.rollup"}])
+
+    assert result.status is ResultStatus.REJECTED
+    assert result.failure is not None
+    assert "read-only" in result.failure.message
+    assert adapter.submissions == 0
+
+
+def test_connect_provider_config_is_validated_before_driver_creation() -> None:
+    from gantry.nosql.api import connect
+    from gantry.nosql.providers import register_builtin_providers
+
+    register_builtin_providers()
+
+    with pytest.raises(ValueError, match="requires uri"):
+        connect("mongodb", database="d")
+    with pytest.raises(ValueError, match="unknown NoSQL provider"):
+        connect("missing")
