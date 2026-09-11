@@ -368,3 +368,64 @@ def test_verification_checks_against_a_collection_snapshot() -> None:
         document_count(min=10, max=1)
     with pytest.raises(ValueError, match="required fields must not be empty"):
         required_fields([])
+
+
+from gantry.context import Context
+from gantry.nosql.query import NoSQLQuery
+from gantry.nosql.result import NoSQLResult
+from gantry.result import ResultStatus
+
+
+class _FakeConnection:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, object, NoSQLPolicy]] = []
+
+    async def _query(
+        self,
+        collection: str,
+        pipeline: Pipeline,
+        *,
+        policy: NoSQLPolicy,
+        context: Context | None = None,
+        verify: tuple[object, ...] = (),
+    ) -> NoSQLResult:
+        self.calls.append((collection, pipeline, policy))
+        return NoSQLResult(ResultStatus.ACCEPTED)
+
+
+async def test_query_calls_connection_with_collection_and_pipeline() -> None:
+    connection = _FakeConnection()
+    policy = NoSQLPolicy(max_documents=5)
+    query = NoSQLQuery(connection, policy, ())  # type: ignore[arg-type]
+
+    result = await query("orders", {"status": "open"})
+
+    assert result.ok
+    assert connection.calls == [("orders", {"status": "open"}, policy)]
+
+
+async def test_query_tool_exposes_collection_and_pipeline_only() -> None:
+    connection = _FakeConnection()
+    policy = NoSQLPolicy()
+    query = NoSQLQuery(connection, policy, ())  # type: ignore[arg-type]
+    tool = query.tool()
+
+    result = await tool.invoke(collection="orders", pipeline={"status": "open"})
+
+    assert tool.input_schema == {
+        "type": "object",
+        "properties": {
+            "collection": {"type": "string"},
+            "pipeline": {
+                "type": ["object", "array"],
+                "description": "A MongoDB filter document or aggregation pipeline stages",
+            },
+        },
+        "required": ["collection", "pipeline"],
+        "additionalProperties": False,
+    }
+    assert result.ok
+    with pytest.raises(TypeError, match="collection must be a string"):
+        await tool.invoke(pipeline={})
+    with pytest.raises(ValueError, match="unexpected query tool arguments"):
+        await tool.invoke(collection="orders", pipeline={}, policy="untrusted")
