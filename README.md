@@ -33,13 +33,13 @@ import gantry
 db = gantry.sql.connect("postgres", url=os.environ["DATABASE_URL"])
 
 query = db.query(
-    read_only=True,           # writes are refused, not filtered
-    schemas=["analytics"],    # nothing outside analytics
-    max_rows=100,             # bounded result
-    timeout=30,               # bounded runtime
+    read_only=True,  # writes are refused, not filtered
+    schemas=["analytics"],  # nothing outside analytics
+    max_rows=100,  # bounded result
+    timeout=30,  # bounded runtime
 )
 
-tools = [query.tool()]        # ← hand this to your agent
+tools = [query.tool()]  # ← hand this to your agent
 ```
 
 That's the whole integration. `query.tool()` is framework-neutral — a name, a JSON
@@ -50,7 +50,7 @@ tool = query.tool()
 
 # Anthropic, OpenAI, LangChain, or your own loop:
 schema = {
-    "name": tool.name,                  # "query_sql"
+    "name": tool.name,  # "query_sql"
     "description": tool.description,
     "input_schema": tool.input_schema,  # one property: sql
 }
@@ -58,8 +58,8 @@ schema = {
 # When the model calls it:
 result = await tool.invoke({"sql": "SELECT plan, COUNT(*) ..."})
 
-result.status        # ACCEPTED
-result.inline.rows   # (('free', 1250), ('team', 1250), ...)
+result.status  # ACCEPTED
+result.inline.rows  # (('free', 1250), ('team', 1250), ...)
 ```
 
 ## What the agent cannot do
@@ -72,7 +72,7 @@ refuses to be created at all unless the policy is read-only.
 And it cannot have a wrong answer accepted just because the engine returned success.
 
 ```python
-result.status is gantry.ResultStatus.ACCEPTED   # ran *and* passed verification
+result.status is gantry.ResultStatus.ACCEPTED  # ran *and* passed verification
 ```
 
 A statement that runs perfectly and produces the wrong table comes back
