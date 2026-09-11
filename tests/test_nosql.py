@@ -636,3 +636,10 @@ def test_nosql_package_exports_the_public_surface() -> None:
     assert nosql.NoSQLTarget is not None
     assert nosql.CollectionSnapshot is not None
     assert nosql.destination_exists is not None
+
+
+def test_gantry_top_level_exposes_the_nosql_module() -> None:
+    import gantry
+
+    assert gantry.nosql is not None
+    assert "nosql" in gantry.__all__
