@@ -175,12 +175,13 @@ class MongoAdapter:
         stages = normalize_pipeline(pipeline)
         pymongo_errors = importlib.import_module("pymongo.errors")
         max_time_ms = max(int(policy.timeout_seconds * 1000), 1)
-        try:
+
+        async def _run() -> Any:
             cursor = await self._database[collection].aggregate(list(stages), maxTimeMS=max_time_ms)
-            documents = await asyncio.wait_for(
-                cursor.to_list(length=policy.max_documents + 1),
-                timeout=policy.timeout_seconds,
-            )
+            return await cursor.to_list(length=policy.max_documents + 1)
+
+        try:
+            documents = await asyncio.wait_for(_run(), timeout=policy.timeout_seconds)
         except (TimeoutError, pymongo_errors.ExecutionTimeout):
             return ExecutionResult.failed(
                 handle, Failure(FailureKind.TIMEOUT, True, "MongoDB aggregation timed out")
