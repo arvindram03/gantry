@@ -429,3 +429,114 @@ async def test_query_tool_exposes_collection_and_pipeline_only() -> None:
         await tool.invoke(pipeline={})
     with pytest.raises(ValueError, match="unexpected query tool arguments"):
         await tool.invoke(collection="orders", pipeline={}, policy="untrusted")
+
+
+from gantry.nosql.materialization import (
+    MaterializationPolicy,
+    NoSQLMaterializer,
+)
+
+
+class _FakeMaterializeConnection:
+    def __init__(
+        self, *, capabilities: NoSQLCapabilities, snapshot: CollectionSnapshot | None
+    ) -> None:
+        self._capabilities = capabilities
+        self._snapshot = snapshot
+        self.submit_calls: list[tuple[str, object, NoSQLPolicy | None]] = []
+
+    def capabilities(self) -> NoSQLCapabilities:
+        return self._capabilities
+
+    async def submit(
+        self,
+        collection: str,
+        pipeline: Pipeline,
+        *,
+        policy: NoSQLPolicy | None = None,
+        context: Context | None = None,
+    ) -> ExecutionHandle:
+        self.submit_calls.append((collection, pipeline, policy))
+        return ExecutionHandle("mat-run", "nosql", "mongodb", "native-mat")
+
+    async def wait(
+        self, handle: ExecutionHandle, *, poll_interval_seconds: float = 0.05
+    ) -> NoSQLResult:
+        return NoSQLResult(
+            ResultStatus.ACCEPTED,
+            handle=handle,
+            outputs=(OutputRef(OutputKind.TABLE, "mongodb://reporting.rollup"),),
+        )
+
+    async def status(self, handle: ExecutionHandle) -> object:
+        raise NotImplementedError
+
+    async def cancel(self, handle: ExecutionHandle, *, mode: str = "default") -> object:
+        raise NotImplementedError
+
+    async def _inspect_collection(
+        self, reference: CollectionRef, *, include_document_count: bool = False
+    ) -> CollectionSnapshot | None:
+        return self._snapshot
+
+
+def _full_capabilities() -> NoSQLCapabilities:
+    return NoSQLCapabilities(
+        cancellation=True,
+        read_only_session=True,
+        operation_timeout=True,
+        document_limit=True,
+        query_metrics=True,
+        result_reference=True,
+        out_merge_writes=True,
+        destination_introspection=True,
+        materialization_reference=True,
+    )
+
+
+async def test_materializer_rejects_out_when_destination_already_exists() -> None:
+    connection = _FakeMaterializeConnection(
+        capabilities=_full_capabilities(),
+        snapshot=CollectionSnapshot("reporting.rollup"),
+    )
+    policy = MaterializationPolicy(sources=["orders"], destinations=["reporting.rollup"])
+    materializer = NoSQLMaterializer(connection, policy, ())  # type: ignore[arg-type]
+
+    result = await materializer("orders", [{"$match": {}}, {"$out": "reporting.rollup"}])
+
+    assert result.status is ResultStatus.REJECTED
+    assert result.failure is not None
+    assert result.failure.kind is FailureKind.DESTINATION_EXISTS
+
+
+async def test_materializer_allows_merge_into_an_existing_destination() -> None:
+    connection = _FakeMaterializeConnection(
+        capabilities=_full_capabilities(),
+        snapshot=CollectionSnapshot("reporting.rollup", {"document_count": 3}),
+    )
+    policy = MaterializationPolicy(sources=["orders"], destinations=["reporting.rollup"])
+    materializer = NoSQLMaterializer(
+        connection, policy, (destination_exists(), document_count(min=1))
+    )  # type: ignore[arg-type]
+
+    result = await materializer(
+        "orders", [{"$match": {}}, {"$merge": {"into": "reporting.rollup", "whenMatched": "merge"}}]
+    )
+
+    assert result.ok
+    assert connection.submit_calls[0][0] == "orders"
+    assert result.uri == "mongodb://reporting.rollup"
+
+
+async def test_materializer_rejects_sources_outside_policy() -> None:
+    connection = _FakeMaterializeConnection(capabilities=_full_capabilities(), snapshot=None)
+    policy = MaterializationPolicy(sources=["orders"], destinations=["reporting.rollup"])
+    materializer = NoSQLMaterializer(connection, policy, ())  # type: ignore[arg-type]
+
+    result = await materializer(
+        "secrets", [{"$match": {}}, {"$out": "reporting.rollup"}]
+    )
+
+    assert result.status is ResultStatus.REJECTED
+    assert result.failure is not None
+    assert result.failure.kind is FailureKind.SOURCE_NOT_ALLOWED
