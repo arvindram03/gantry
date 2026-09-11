@@ -129,3 +129,38 @@ def test_classify_pipeline_recognizes_out_and_merge_and_rejects_bad_stages() -> 
         classify_pipeline("orders", [{"$match": {}, "$project": {}}])
     with pytest.raises(ValueError, match="collection name must not be empty"):
         classify_pipeline("  ", [{"$match": {}}])
+
+
+from gantry.nosql.enforcement import policy_errors
+
+
+def test_policy_errors_flags_denied_collections_and_missing_capabilities() -> None:
+    classification = classify_pipeline(
+        "orders", [{"$match": {}}, {"$lookup": {"from": "secrets", "as": "s"}}]
+    )
+    policy = NoSQLPolicy(
+        read_only=True,
+        allowed_collections=["orders"],
+        denied_collections=["secrets"],
+        max_bytes_scanned=10,
+    )
+    capabilities = NoSQLCapabilities()
+
+    errors = policy_errors(classification, policy, capabilities)
+
+    assert "collection is not allowed: secrets" in errors
+    assert "collection is denied: secrets" in errors
+    assert "adapter cannot enforce a read-only session" in errors
+    assert "adapter cannot enforce the document limit" in errors
+    assert "adapter cannot enforce or monitor the operation timeout" in errors
+    assert "adapter cannot enforce maximum bytes scanned" in errors
+
+
+def test_policy_errors_flags_write_under_read_only_policy() -> None:
+    classification = classify_pipeline("orders", [{"$out": "reporting.rollup"}])
+    policy = NoSQLPolicy(read_only=True)
+    capabilities = NoSQLCapabilities(read_only_session=True, document_limit=True, operation_timeout=True)
+
+    errors = policy_errors(classification, policy, capabilities)
+
+    assert any("not allowed by read-only policy" in error for error in errors)
