@@ -121,6 +121,7 @@ generated from the adapter source and lists which backend enforces what.
 | **Apache Flink** | Batch and streaming jobs, durable handles, cancellation |
 | **BigQuery** \* | Governed queries, output references, materialization |
 | **Snowflake** \* | Governed queries, reconnectable jobs |
+| **MongoDB** | Governed queries/pipelines, bounded results, `$out`/`$merge` materialization |
 
 \* The adapter ships and declares its capabilities, but has not yet been exercised
 against a live account. Everything else is tested against a real engine on every change.
