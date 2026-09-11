@@ -24,7 +24,10 @@ The distribution is `data-gantry`; the import is `gantry`.
 
 ---
 
-## A governed agent tool in 10 lines
+## Give an agent read-only SQL on one schema — in 10 lines
+
+The agent ends up with exactly one tool: ask the `analytics` schema a question in
+SQL. Read-only, at most 100 rows, at most 30 seconds — and nothing else.
 
 ```python
 import os
