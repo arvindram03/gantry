@@ -67,20 +67,40 @@ result.inline.rows  # (('free', 1250), ('team', 1250), ...)
 
 ## What the agent cannot do
 
-It sees one string field. It cannot widen the schema allow-list, raise the row cap,
-extend the timeout, reach the connection, or swap credentials — those live in your
-code, not in the tool schema. It cannot turn a read into a write: `query.tool()`
-refuses to be created at all unless the policy is read-only.
+The agent sees one string field. It cannot:
 
-And it cannot have a wrong answer accepted just because the engine returned success.
+- **widen its own policy** — raise the row cap, extend the timeout, or add a schema
+- **reach the connection or the credentials** — those stay in your code, never in the tool schema
+- **turn a read into a write** — `query.tool()` refuses to be created unless the policy is read-only
+- **smuggle in a second statement** — a multi-statement submission is refused as a batch
+- **be trusted because the engine said yes** — a run that produced the wrong table comes back `VERIFICATION_FAILED`, not success
 
-```python
-result.status is gantry.ResultStatus.ACCEPTED  # ran *and* passed verification
-```
+"It ran" and "it can be believed" are different questions, and only the first is the
+engine's to answer. `result.status is gantry.ResultStatus.ACCEPTED` means both.
 
-A statement that runs perfectly and produces the wrong table comes back
-`VERIFICATION_FAILED`, not success. "It ran" and "it can be believed" are
-different questions, and only the first one is the engine's to answer.
+## What you can enforce
+
+Everything below is set once, in your code, on `db.query(...)`:
+
+| Policy | Default | What it does |
+| --- | --- | --- |
+| `read_only` | `True` | Refuses anything that is not a read |
+| `schemas` | all | Allow-list of schemas the SQL may touch |
+| `tables` | all | Allow-list of tables, qualified or bare |
+| `denied_tables` | none | Deny-list; wins over any allow-list |
+| `max_rows` | `1000` | Caps the result, and reports it as truncated |
+| `timeout` | `30s` | Caps runtime |
+| `max_bytes_scanned` | off | Refused before running, from the engine's own estimate |
+| `max_cost_usd` | off | Refused before running, on engines that price a query |
+| `allow_multiple_statements` | `False` | Whether a batch is a batch or a refusal |
+| `verify` | none | Checks that must pass before the result is accepted |
+
+Schema, table and statement rules are enforced by Gantry. The bounds are enforced by
+the engine — and a bound the adapter cannot apply is **refused rather than ignored**,
+so `max_bytes_scanned` on a backend that cannot estimate bytes fails closed instead
+of silently passing. The
+[capability matrix](https://arvindram03.github.io/gantry/api/capabilities/) is
+generated from the adapter source and lists which backend enforces what.
 
 ## Supported systems
 
