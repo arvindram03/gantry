@@ -149,9 +149,25 @@ until the destination has been checked.
 
 ## Not in your data path
 
-Gantry governs the statement and reads back references — it never streams your rows
-through itself. A 40-minute Flink job is a durable handle you can poll, reconnect to
-from another process, and cancel; not a tool call you have to hold open.
+Gantry governs the statement. It does not become a hop your data has to travel
+through, or a service you have to operate.
+
+- **Bulk output never passes through Gantry.** The engine writes where it was told to,
+  and you get an `OutputRef` — a URI to the result. Rows are carried back inline only
+  up to the `max_rows` you set, so what crosses the boundary is a bounded sample you
+  asked for rather than the whole result set.
+- **There is no server.** It is a library in your process. Nothing to deploy, no proxy
+  in front of the database, no broker between the agent and the engine.
+- **Credentials stay in your code.** What Gantry hands the engine adapter deliberately
+  excludes provider configuration and credentials; what it hands the agent is a JSON
+  schema with one string field.
+- **Long jobs are handles, not held-open calls.** `submit()` returns an
+  `ExecutionHandle` carrying the engine's own job id. Any process holding those four
+  fields can poll it, read its metrics, and cancel it — no local run record, no live
+  connection to whichever process started it.
+
+That last one is the difference between a tool call and a job. A forty-minute Flink
+job does not need the agent, or the process that launched it, to still be alive.
 
 ---
 
