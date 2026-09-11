@@ -164,3 +164,147 @@ def test_policy_errors_flags_write_under_read_only_policy() -> None:
     errors = policy_errors(classification, policy, capabilities)
 
     assert any("not allowed by read-only policy" in error for error in errors)
+
+
+from gantry import (
+    Context,
+    Execution,
+    ExecutionHandle,
+    ExecutionResult,
+    ExecutionState,
+    ExecutionTarget,
+    Failure,
+    FailureKind,
+    OutputKind,
+    OutputRef,
+)
+from gantry.artifact import Artifact
+from gantry.nosql.adapter import NoSQLAdapter
+from gantry.nosql.bridge import NoSQLExecutionAdapter
+from gantry.nosql.output import InlineDocuments
+from gantry.nosql.pipeline import Pipeline
+from gantry.nosql.target import NoSQLTarget
+
+
+class StubMongoAdapter:
+    def __init__(self, *, read_only_session: bool = True) -> None:
+        self._capabilities = NoSQLCapabilities(
+            cancellation=True,
+            read_only_session=read_only_session,
+            operation_timeout=True,
+            document_limit=True,
+            query_metrics=True,
+            result_reference=True,
+            out_merge_writes=True,
+            destination_introspection=True,
+            materialization_reference=True,
+        )
+        self.handle: ExecutionHandle | None = None
+        self.policy: NoSQLPolicy | None = None
+        self.submitted_collection: str | None = None
+        self.submissions = 0
+        self.collections: dict[str, dict[str, object]] = {}
+
+    def capabilities(self) -> NoSQLCapabilities:
+        return self._capabilities
+
+    async def validate(
+        self,
+        pipeline: Pipeline,
+        target: NoSQLTarget,
+        context: Context,
+        policy: NoSQLPolicy,
+    ) -> object:
+        from gantry import ValidationResult
+
+        return ValidationResult.accepted(metadata={"provider": target.provider})
+
+    async def submit(
+        self,
+        pipeline: Pipeline,
+        target: NoSQLTarget,
+        context: Context,
+    ) -> ExecutionHandle:
+        self.submissions += 1
+        policy_value = context.metadata.get("gantry.nosql.policy")
+        assert isinstance(policy_value, NoSQLPolicy)
+        self.policy = policy_value
+        collection_value = context.metadata.get("gantry.nosql.collection")
+        assert isinstance(collection_value, str)
+        self.submitted_collection = collection_value
+        self.handle = ExecutionHandle("nosql-run", "nosql", target.provider, "native-op")
+        return self.handle
+
+    async def status(self, handle: ExecutionHandle) -> Execution:
+        return Execution(handle, ExecutionState.SUCCEEDED)
+
+    async def result(self, handle: ExecutionHandle) -> ExecutionResult:
+        inline = InlineDocuments(({"_id": 1}, {"_id": 2}))
+        return ExecutionResult.succeeded(
+            handle,
+            outputs=(OutputRef(OutputKind.INLINE, "inline://nosql-run", {"inline": inline}),),
+        )
+
+    async def cancel(self, handle: ExecutionHandle, mode: str = "default") -> Execution:
+        return Execution(
+            handle,
+            ExecutionState.CANCELLED,
+            failure=Failure(FailureKind.CANCELLED, False, f"cancelled ({mode})"),
+        )
+
+
+def _nosql_target() -> NoSQLTarget:
+    return NoSQLTarget("mongodb", "pymongo", {"uri": "mongodb://localhost", "database": "d"})
+
+
+async def test_bridge_validates_pipeline_and_injects_collection_and_policy() -> None:
+    adapter = StubMongoAdapter()
+    target = _nosql_target()
+    policy = NoSQLPolicy(allowed_collections=["orders"])
+    bridge = NoSQLExecutionAdapter(adapter, target, policy)
+    artifact = Artifact({"status": "open"}, "nosql")
+    execution_target = ExecutionTarget(target.provider, {})
+    context = Context(metadata={"gantry.nosql.collection": "orders"})
+
+    validation = await bridge.validate(
+        artifact=artifact, target=execution_target, context=context, policy=policy
+    )
+    handle = await bridge.submit(artifact=artifact, target=execution_target, context=context)
+
+    assert validation.ok
+    assert adapter.submitted_collection == "orders"
+    assert adapter.policy is policy
+    assert handle is adapter.handle
+
+
+async def test_bridge_rejects_when_collection_is_missing_from_context() -> None:
+    adapter = StubMongoAdapter()
+    target = _nosql_target()
+    policy = NoSQLPolicy()
+    bridge = NoSQLExecutionAdapter(adapter, target, policy)
+    artifact = Artifact({"status": "open"}, "nosql")
+    execution_target = ExecutionTarget(target.provider, {})
+
+    validation = await bridge.validate(
+        artifact=artifact, target=execution_target, context=Context(), policy=policy
+    )
+
+    assert not validation.ok
+    assert any("collection" in error for error in validation.errors)
+
+
+async def test_bridge_rejects_unclassifiable_pipeline() -> None:
+    adapter = StubMongoAdapter()
+    target = _nosql_target()
+    policy = NoSQLPolicy()
+    bridge = NoSQLExecutionAdapter(adapter, target, policy)
+    artifact = Artifact([{"$graphLookup": {}}], "nosql")
+    execution_target = ExecutionTarget(target.provider, {})
+    context = Context(metadata={"gantry.nosql.collection": "orders"})
+
+    validation = await bridge.validate(
+        artifact=artifact, target=execution_target, context=context, policy=policy
+    )
+
+    assert not validation.ok
+    assert any("pipeline classification failed" in error for error in validation.errors)
