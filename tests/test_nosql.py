@@ -338,3 +338,33 @@ def test_register_wraps_a_ready_adapter_instance() -> None:
     resolved = resolve_provider("test-mongo-instance")
 
     assert resolved.adapter_factory(_nosql_target()) is adapter
+
+
+from gantry.nosql.verify import (
+    CollectionSnapshot,
+    destination_exists,
+    document_count,
+    required_fields,
+)
+
+
+def test_verification_checks_against_a_collection_snapshot() -> None:
+    snapshot = CollectionSnapshot("orders", {"document_count": 5}, ("status", "amount"))
+
+    exists = destination_exists().evaluate(snapshot)
+    missing = destination_exists().evaluate(None)
+    count_ok = document_count(min=1, max=10).evaluate(snapshot)
+    count_bad = document_count(min=100).evaluate(snapshot)
+    fields_ok = required_fields(["status"]).evaluate(snapshot)
+    fields_missing = required_fields(["region"]).evaluate(snapshot)
+
+    assert exists.ok and not missing.ok
+    assert count_ok.ok and not count_bad.ok
+    assert fields_ok.ok
+    assert not fields_missing.ok
+    assert "region" in (fields_missing.message or "")
+
+    with pytest.raises(ValueError, match="minimum must not exceed maximum"):
+        document_count(min=10, max=1)
+    with pytest.raises(ValueError, match="required fields must not be empty"):
+        required_fields([])
