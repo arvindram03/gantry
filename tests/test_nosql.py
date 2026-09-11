@@ -33,3 +33,30 @@ def test_policy_normalizes_collection_names_and_validates_types() -> None:
         NoSQLPolicy(max_bytes_scanned=-1)
     with pytest.raises(ValueError, match="max cost"):
         NoSQLPolicy(max_cost_usd=-1)
+
+
+from gantry.nosql.capabilities import NoSQLCapabilities
+
+
+def test_capabilities_map_to_core_contract_and_policy_requirements() -> None:
+    capabilities = NoSQLCapabilities(
+        cancellation=True,
+        read_only_session=True,
+        operation_timeout=True,
+        cost_limit=True,
+        query_metrics=True,
+        result_reference=True,
+    )
+    policy = NoSQLPolicy(read_only=True, timeout_seconds=15, max_bytes_scanned=100)
+
+    core = capabilities.core_capabilities()
+    requirements = capabilities.policy_requirements(policy)
+
+    assert core.cancellation is True
+    assert core.read_only_execution is True
+    assert core.metrics is True
+    assert requirements.read_only is True
+    assert requirements.allow_writes is False
+    assert requirements.max_runtime_seconds == 15
+    assert requirements.require_reconnect is False
+    assert requirements.require_metrics is True
