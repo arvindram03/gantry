@@ -63,12 +63,25 @@ _FROM_TERMINATORS = frozenset(
 
 
 class MaterializationOperation(StrEnum):
+    """The two operations v0 materialization allows.
+
+    Both create; neither replaces. A destination that already exists is a
+    refusal rather than an overwrite.
+    """
+
     CREATE_TABLE_AS = "CREATE_TABLE_AS"
     CREATE_VIEW_AS = "CREATE_VIEW_AS"
 
 
 @dataclass(frozen=True, slots=True)
 class TableRef:
+    """A table name parsed out of a materialization, with its parts kept.
+
+    `qualified_name` joins whichever of catalog, schema and name are present.
+    Materialization requires a schema on the destination, so that an agent
+    cannot write to whatever the session's search path happens to be.
+    """
+
     name: str
     schema: str | None = None
     catalog: str | None = None
@@ -88,6 +101,13 @@ class TableRef:
 
 @dataclass(frozen=True, slots=True)
 class MaterializationProposal:
+    """Caller-proposed SQL before anything has been checked about it.
+
+    Construction only rejects a non-string or blank submission; the naming is
+    the point — what arrives here is a proposal, and it is a plan only after
+    `parse_materialization` has accepted it.
+    """
+
     sql: str
 
     def __post_init__(self) -> None:
@@ -99,6 +119,13 @@ class MaterializationProposal:
 
 @dataclass(frozen=True, slots=True)
 class MaterializationPlan:
+    """What a proposal turned out to be: one create, its destination, sources.
+
+    Returned by `parse_materialization` and checked against
+    `MaterializationPolicy`. `sources` is what the body reads, excluding CTE
+    names, so the policy matches real tables rather than local aliases.
+    """
+
     operation: MaterializationOperation
     sources: tuple[TableRef, ...]
     destination: TableRef
@@ -107,6 +134,14 @@ class MaterializationPlan:
 
 @dataclass(frozen=True, slots=True)
 class MaterializationCapabilities:
+    """What an adapter can enforce for materialization specifically.
+
+    Separate from `SQLCapabilities` because materialization needs guarantees a
+    query does not: `destination_introspection` is what makes create-only
+    checkable, and without it the destination cannot be verified after the job
+    runs. All default to false.
+    """
+
     create_table_as: bool = False
     create_view_as: bool = False
     durable_jobs: bool = False
@@ -118,6 +153,14 @@ class MaterializationCapabilities:
 
 @runtime_checkable
 class MaterializationAdapter(Protocol):
+    """Additional adapter operation required only for materialization.
+
+    `inspect_table` is how create-only is enforced and how the destination is
+    verified afterwards: returning `None` for a table that does not exist is
+    what distinguishes "not created" from "created empty". An adapter without
+    this cannot materialize.
+    """
+
     """Additional adapter operation required only for materialization."""
 
     async def inspect_table(
@@ -131,6 +174,14 @@ class MaterializationAdapter(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class MaterializationPolicy:
+    """Where a materialization may read from and write to.
+
+    `destinations` must be non-empty — there is no default place to write — and
+    patterns are `fnmatch`-style, lower-cased at construction. `create_only` is
+    fixed at `True` in v0 and passing anything else raises, so replacement
+    cannot be enabled by a config change before the semantics exist.
+    """
+
     sources: Collection[str]
     destinations: Collection[str]
     create_only: bool = True
@@ -174,6 +225,13 @@ class MaterializationPolicy:
 
 @dataclass(frozen=True, slots=True)
 class MaterializationResult:
+    """The outcome of a materialization: the destination, and whether to trust it.
+
+    `ok` is `ACCEPTED` only, which requires verification to have passed — a
+    `CREATE TABLE AS` that ran and produced the wrong table is not accepted.
+    `uri` names the destination when one was created.
+    """
+
     status: ResultStatus
     output: OutputRef | None = None
     execution: Execution | None = None
@@ -196,6 +254,14 @@ class MaterializationResult:
 
 
 class MaterializationError(Exception):
+    """Raised when a proposal is refused, carrying why and at what stage.
+
+    `failure` is the normalized reason and `status` the outcome it maps to,
+    defaulting to `REJECTED` — the common case, where nothing ran. It is an
+    exception rather than a returned value because a refused proposal has no
+    result to describe.
+    """
+
     def __init__(self, failure: Failure, status: ResultStatus = ResultStatus.REJECTED) -> None:
         self.failure = failure
         self.status = status

@@ -15,6 +15,15 @@ from gantry.target import ExecutionTarget
 
 
 class ExecutionAdapter(Protocol):
+    """The contract an engine backend implements to be governed by Gantry.
+
+    Six methods: declare what you can enforce (`capabilities`), ask the engine
+    to check a statement (`validate`), start it (`submit`), report on it
+    (`status`), collect it (`result`), and stop it (`cancel`). Gantry stays out
+    of the data path — `result` returns references to where the engine wrote,
+    not the rows.
+    """
+
     def capabilities(self) -> AdapterCapabilities: ...
 
     async def validate(

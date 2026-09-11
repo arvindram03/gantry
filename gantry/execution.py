@@ -16,6 +16,13 @@ from gantry.output import OutputRef
 
 @dataclass(frozen=True, slots=True)
 class ValidationResult:
+    """What the engine's own planner said about a statement before running it.
+
+    This is native validation — `EXPLAIN` or the engine's validate endpoint —
+    not Gantry's policy check. `errors` makes a statement inadmissible;
+    `warnings` do not. Build one with `accepted()` or `rejected()`.
+    """
+
     ok: bool
     errors: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
@@ -36,6 +43,13 @@ class ValidationResult:
 
 
 class ExecutionState(StrEnum):
+    """Gantry's normalized job states, mapped from each engine's own.
+
+    `UNKNOWN` is a real state, not an error case: it means Gantry could not
+    establish what happened, which a caller must treat differently from a known
+    failure because the work may still be running.
+    """
+
     PENDING = "PENDING"
     SUBMITTED = "SUBMITTED"
     RUNNING = "RUNNING"

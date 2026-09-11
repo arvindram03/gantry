@@ -24,11 +24,31 @@ a tool.
 
 ## Materialization
 
+Create-only: one `CREATE TABLE AS` or `CREATE VIEW AS`, to a schema-qualified
+destination that does not already exist.
+
 ::: gantry.sql.SQLMaterializer
 
 ::: gantry.sql.MaterializationPolicy
 
 ::: gantry.sql.MaterializationResult
+
+::: gantry.sql.MaterializationError
+
+### Parsing a proposal
+
+What turns proposed SQL into something checkable. Call these directly to
+inspect what a statement would do before submitting it.
+
+::: gantry.sql.parse_materialization
+
+::: gantry.sql.MaterializationProposal
+
+::: gantry.sql.MaterializationPlan
+
+::: gantry.sql.MaterializationOperation
+
+::: gantry.sql.TableRef
 
 ## Schema and classification
 
@@ -42,6 +62,10 @@ a tool.
 
 ::: gantry.sql.SQLOperation
 
+::: gantry.sql.SQLObjectRef
+
+::: gantry.sql.ParsedSQL
+
 ::: gantry.sql.ExplainResult
 
 ## Extending
@@ -53,3 +77,22 @@ a tool.
 ::: gantry.sql.SQLAdapter
 
 ::: gantry.sql.SQLCapabilities
+
+::: gantry.sql.MaterializationAdapter
+
+::: gantry.sql.MaterializationCapabilities
+
+::: gantry.sql.SQLTarget
+
+::: gantry.sql.register
+
+### Dialects
+
+A dialect decides how a submission is split and classified. It never rewrites
+SQL — what the caller wrote is what the engine receives.
+
+::: gantry.sql.SQLDialect
+
+::: gantry.sql.ConservativeDialect
+
+::: gantry.sql.register_dialect

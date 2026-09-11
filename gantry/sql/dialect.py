@@ -28,6 +28,15 @@ _OPERATIONS = {
 
 
 class SQLDialect(Protocol):
+    """How one SQL dialect is split and classified for policy checks.
+
+    Three methods, none of which rewrite SQL: `parse` splits a submission into
+    statements, `classify` says what the single statement does, and
+    `referenced_objects` lists the tables it names. Register an implementation
+    with `register_dialect`; `ConservativeDialect` is the deny-by-default
+    fallback.
+    """
+
     def parse(self, sql: str) -> ParsedSQL: ...
 
     def classify(self, sql: str) -> SQLClassification: ...

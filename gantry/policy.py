@@ -8,6 +8,15 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True, slots=True)
 class PolicyRequirements:
+    """What the application demands of an execution, independent of engine.
+
+    Written by application code, never by the agent. The `require_*` fields
+    name a capability the adapter must have for the work to be admitted at all.
+    Construction rejects a self-contradictory policy (`read_only` with
+    `allow_writes`) and non-positive limits, so an impossible policy fails where
+    it is written rather than at admission.
+    """
+
     read_only: bool = False
     allow_writes: bool = False
     max_runtime_seconds: float | None = None

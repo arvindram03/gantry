@@ -16,6 +16,14 @@ from gantry.target import ExecutionTarget
 
 @dataclass(frozen=True, slots=True)
 class RunRecord:
+    """Everything needed to resume governing a run in another process.
+
+    Persisted at submission. It keeps the artifact, policy and admission
+    decision beside the handle, because reconnecting to a job is not enough:
+    deciding whether to accept its result requires knowing what was promised
+    when it was admitted.
+    """
+
     handle: ExecutionHandle
     artifact: Artifact
     target: ExecutionTarget
@@ -25,6 +33,12 @@ class RunRecord:
 
 
 class ExecutionStore(Protocol):
+    """Persistence for `RunRecord`s, keyed by `gantry_id`.
+
+    Implement this to let handles outlive the process that created them. The
+    default is `MemoryExecutionStore`, which does not.
+    """
+
     async def put(self, record: RunRecord) -> None: ...
 
     async def get(self, gantry_id: str) -> RunRecord | None: ...

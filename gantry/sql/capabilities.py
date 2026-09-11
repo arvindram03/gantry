@@ -10,6 +10,16 @@ from gantry.sql.policy import SQLPolicy
 
 @dataclass(frozen=True, slots=True)
 class SQLCapabilities:
+    """What one SQL adapter can enforce, declared per provider.
+
+    The source of truth behind the published
+    [capability matrix](../api/capabilities.md): `core_capabilities()` projects
+    these onto the engine-neutral `AdapterCapabilities` that admission checks,
+    and `policy_requirements()` derives what a given `SQLPolicy` demands. Note
+    `write_execution` defaults to true while everything else defaults to false —
+    a new adapter is assumed able to write and assumed unable to bound.
+    """
+
     describe_schema: bool = False
     explain: bool = False
     dry_run: bool = False

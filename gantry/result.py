@@ -16,6 +16,13 @@ from gantry.verifier import VerificationResult
 
 
 class ResultStatus(StrEnum):
+    """The five ways work ends, separating "ran" from "can be believed".
+
+    `REJECTED` never reached the engine. `FAILED` and `CANCELLED` ran and did
+    not finish. `VERIFICATION_FAILED` finished and is not trustworthy.
+    `UNKNOWN` means Gantry cannot say, which is not the same as failure.
+    """
+
     ACCEPTED = "ACCEPTED"
     REJECTED = "REJECTED"
     FAILED = "FAILED"
@@ -26,6 +33,14 @@ class ResultStatus(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class Result:
+    """The terminal outcome of governed work: status, outputs, and evidence.
+
+    Check `is_accepted` rather than the absence of a failure — an engine
+    success whose verification failed is not accepted. `admission` and
+    `verification` are kept so the result carries its own justification: what
+    was allowed, and what was checked afterwards.
+    """
+
     status: ResultStatus
     handle: ExecutionHandle | None = None
     execution: Execution | None = None

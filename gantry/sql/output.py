@@ -6,6 +6,13 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True, slots=True)
 class InlineRows:
+    """Rows returned with the result, already bounded by the policy.
+
+    `truncated` says the engine had more rows than `max_rows` allowed, so a
+    caller can tell a complete small answer from a clipped large one.
+    Construction rejects rows whose width does not match `columns`.
+    """
+
     columns: tuple[str, ...]
     rows: tuple[tuple[object, ...], ...]
     truncated: bool = False

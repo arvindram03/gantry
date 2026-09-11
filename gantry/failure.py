@@ -9,6 +9,16 @@ from enum import StrEnum
 
 
 class FailureKind(StrEnum):
+    """A portable reason an execution did not produce a trustworthy result.
+
+    Normalized across engines so a caller can branch on the kind rather than
+    parse an engine's message. The distinctions that matter most are refusals
+    before execution (`POLICY_REJECTED`,
+    `UNSUPPORTED_POLICY_REQUIREMENT`), failures during it (`ENGINE_ERROR`,
+    `TIMEOUT`), and a run that finished but cannot be believed
+    (`VERIFICATION_FAILED`).
+    """
+
     VALIDATION_ERROR = "VALIDATION_ERROR"
     POLICY_REJECTED = "POLICY_REJECTED"
     UNSUPPORTED_POLICY_REQUIREMENT = "UNSUPPORTED_POLICY_REQUIREMENT"
@@ -37,6 +47,13 @@ class FailureKind(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class Failure:
+    """One normalized failure, keeping the engine's own words alongside.
+
+    `kind` and `retryable` are for code to act on; `message` is for a human.
+    `native_code`, `native_message` and `native` preserve what the engine
+    actually said, so normalizing never loses the detail needed to debug.
+    """
+
     kind: FailureKind
     retryable: bool
     message: str

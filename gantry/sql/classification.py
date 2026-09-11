@@ -6,6 +6,14 @@ from enum import StrEnum
 
 
 class SQLOperation(StrEnum):
+    """What a statement does, at the granularity policy decisions need.
+
+    `MULTI_STATEMENT` is its own operation rather than a list, because a batch
+    is refused as a batch unless the policy allows several statements.
+    `UNKNOWN` is deny-by-default: an unclassifiable statement is not a
+    `SELECT`.
+    """
+
     SELECT = "SELECT"
     INSERT = "INSERT"
     UPDATE = "UPDATE"
@@ -18,6 +26,14 @@ class SQLOperation(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class SQLObjectRef:
+    """A possibly-qualified reference to a table as it appeared in the SQL.
+
+    `schema` and `catalog` are `None` when the statement did not qualify the
+    name; `qualified_name` joins whichever parts are present. Policy matching
+    compares against these names, so an unqualified reference is matched as
+    written rather than silently resolved.
+    """
+
     name: str
     schema: str | None = None
     catalog: str | None = None
@@ -29,11 +45,26 @@ class SQLObjectRef:
 
 @dataclass(frozen=True, slots=True)
 class ParsedSQL:
+    """The statements a dialect found in one submitted string.
+
+    Splitting is the step that makes "one statement" checkable. Anything that
+    yields more than one statement is a multi-statement submission, whatever it
+    looked like to the caller.
+    """
+
     statements: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class SQLClassification:
+    """The structure a policy check runs against, never a transpilation.
+
+    `read_only` is the field most decisions turn on, and it is deliberately
+    conservative: a statement must be recognizably read-only to be treated as
+    such. `tables` is everything referenced, `write_targets` only what is
+    written, so a policy can allow reading a table it forbids writing.
+    """
+
     operation: SQLOperation
     read_only: bool
     tables: tuple[SQLObjectRef, ...] = ()

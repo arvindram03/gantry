@@ -10,6 +10,14 @@ from datetime import UTC, datetime
 
 @dataclass(frozen=True, slots=True)
 class ExecutionHandle:
+    """A durable reference to one engine job, safe to store and return to.
+
+    `gantry_id` identifies the run to Gantry and `native_id` identifies it to
+    the engine; keeping both is what makes reconnection possible after the
+    submitting process is gone. All four identifying fields must be non-empty
+    and `submitted_at` must be timezone-aware, enforced at construction.
+    """
+
     gantry_id: str
     engine: str
     target: str

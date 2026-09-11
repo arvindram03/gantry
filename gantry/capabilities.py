@@ -8,6 +8,14 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True, slots=True)
 class AdapterCapabilities:
+    """What an adapter can actually enforce, declared rather than assumed.
+
+    Admission compares this against `PolicyRequirements`: a requirement with no
+    matching capability is refused, because a bound the engine never applies is
+    worse than no bound. Every field defaults to false, so a new adapter is
+    trusted with nothing until it says otherwise.
+    """
+
     reconnect: bool = False
     cancellation: bool = False
     runtime_limit: bool = False

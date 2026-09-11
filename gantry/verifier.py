@@ -14,6 +14,12 @@ from gantry.execution import Execution, ExecutionResult
 
 @dataclass(frozen=True, slots=True)
 class CheckResult:
+    """One verification check and what it observed.
+
+    `expected` and `actual` are recorded even when the check passes, so an
+    accepted result still carries the evidence for why it was accepted.
+    """
+
     name: str
     ok: bool
     expected: object | None = None
@@ -24,6 +30,13 @@ class CheckResult:
 
 @dataclass(frozen=True, slots=True)
 class VerificationResult:
+    """Whether the result may be believed, with the checks that decided it.
+
+    A failing verification turns an engine success into
+    `ResultStatus.VERIFICATION_FAILED`: the job ran, and the answer is still
+    not usable. Build one with `passed()` or `failed()`.
+    """
+
     ok: bool
     checks: tuple[CheckResult, ...] = ()
     metadata: Mapping[str, object] = field(default_factory=dict)
@@ -56,6 +69,13 @@ class VerificationResult:
 
 
 class Verifier(Protocol):
+    """A check run after the engine succeeds, deciding whether to accept.
+
+    Implement `verify` and pass instances to `wait` or `run`. It receives what
+    was proposed (`artifact`, `context`) and what happened (`execution`,
+    `result`), so it can compare the two rather than trusting either.
+    """
+
     async def verify(
         self,
         *,

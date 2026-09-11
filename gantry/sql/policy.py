@@ -7,6 +7,19 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True, slots=True)
 class SQLPolicy:
+    """The bounds application code puts around agent-written SQL.
+
+    Defaults are the safe end: read-only, 1,000 rows, 30 seconds, one
+    statement. An empty `allowed_schemas`/`allowed_tables` means no allow-list
+    is applied, while `denied_tables` always wins. Names are lower-cased and
+    frozen at construction, and a malformed policy raises there rather than at
+    submission — passing a bare string where a collection belongs is a
+    `TypeError`, not a policy that matches one table.
+
+    Declaring a field is not the same as it being enforced: a bound is admitted
+    only when the adapter can apply it.
+    """
+
     read_only: bool = True
     allowed_schemas: Collection[str] = frozenset()
     allowed_tables: Collection[str] = frozenset()

@@ -14,6 +14,15 @@ from gantry.sql.target import SQLTarget
 
 
 class SQLAdapter(Protocol):
+    """The contract a SQL backend implements to be governed by Gantry.
+
+    Declare what you can enforce (`capabilities`), expose the schema
+    (`describe`), ask the engine to check and estimate a statement (`validate`,
+    `explain`), then run and track it (`submit`, `status`, `result`, `cancel`).
+    A capability you do not declare is a bound Gantry will refuse to promise,
+    so under-declaring is safe and over-declaring is not.
+    """
+
     def capabilities(self) -> SQLCapabilities: ...
 
     async def describe(self, target: SQLTarget) -> DatabaseSchema: ...

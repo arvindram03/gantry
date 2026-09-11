@@ -13,6 +13,14 @@ from gantry.policy import PolicyRequirements
 
 @dataclass(frozen=True, slots=True)
 class AdmissionDecision:
+    """The outcome of `admit`: whether this artifact may be submitted.
+
+    `reasons` carries every refusal, not just the first, so a caller sees all
+    of what would have to change. `capabilities` is kept because later stages
+    need to know what was promised — `wait` uses it to decide whether Gantry
+    must enforce a runtime limit the engine cannot.
+    """
+
     allowed: bool
     validation: ValidationResult
     capabilities: AdapterCapabilities

@@ -9,6 +9,14 @@ from gantry.sql.classification import SQLObjectRef
 
 @dataclass(frozen=True, slots=True)
 class ExplainResult:
+    """What the engine's planner estimated, before anything ran.
+
+    `supported` is false when the engine cannot explain the statement, which is
+    distinct from an estimate of zero: a byte-scanned bound cannot be enforced
+    on an estimate that does not exist. Every estimate is optional for the same
+    reason.
+    """
+
     supported: bool
     estimated_rows: int | None = None
     estimated_bytes: int | None = None

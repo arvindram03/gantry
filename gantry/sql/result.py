@@ -14,6 +14,13 @@ from gantry.verifier import VerificationResult
 
 @dataclass(frozen=True, slots=True)
 class SQLResult:
+    """The outcome of a governed SQL call: rows, references, and evidence.
+
+    Check `ok` rather than the absence of a failure. `inline` holds rows that
+    came back with the result; `uri` is the first engine-owned output that is
+    not inline, for results too large to pass through Gantry.
+    """
+
     status: ResultStatus
     handle: ExecutionHandle | None = None
     inline: InlineRows | None = None

@@ -7,6 +7,13 @@ from dataclasses import dataclass, field
 
 @dataclass(frozen=True, slots=True)
 class SQLTarget:
+    """A resolved connection target: the provider, its dialect, and its config.
+
+    Built by `connect` from a registered provider. It holds credentials, so it
+    stays in application code — what reaches the engine adapter is this, and
+    what reaches the agent is only the tool schema.
+    """
+
     provider: str
     dialect: str
     driver: str
