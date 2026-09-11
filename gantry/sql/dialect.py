@@ -17,6 +17,7 @@ _OBJECT = re.compile(
     re.IGNORECASE,
 )
 _FUNCTION = re.compile(r"\b([A-Za-z_][A-Za-z0-9_$]*)\s*\(")
+_DOLLAR_QUOTE = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$")
 _DDL = {"CREATE", "ALTER", "DROP", "TRUNCATE", "GRANT", "REVOKE", "COMMENT"}
 _OPERATIONS = {
     "SELECT": SQLOperation.SELECT,
@@ -145,6 +146,17 @@ def _split_statements(sql: str) -> tuple[str, ...]:
         elif char == "/" and index + 1 < len(sql) and sql[index + 1] == "*":
             end = sql.find("*/", index + 2)
             index = len(sql) if end == -1 else end + 1
+        elif char == "$" and _starts_token(sql, index):
+            match = _DOLLAR_QUOTE.match(sql, index)
+            if match is not None:
+                # A dollar-quoted body is opaque: `$$a; b$$` is one string, not
+                # two statements. Tags close only on an exact match, and an
+                # unterminated one runs to the end the way an unterminated block
+                # comment does — the statement is malformed either way, and
+                # swallowing the rest refuses it rather than splitting it.
+                tag = match.group(0)
+                end = sql.find(tag, match.end())
+                index = len(sql) if end == -1 else end + len(tag) - 1
         elif char == ";":
             parts.append(sql[start:index])
             start = index + 1
@@ -168,10 +180,23 @@ def _has_escape_prefix(sql: str, index: int) -> bool:
     """
     if index == 0 or sql[index - 1] not in {"E", "e"}:
         return False
-    before = index - 2
-    if before < 0:
+    return _starts_token(sql, index - 1)
+
+
+def _starts_token(sql: str, index: int) -> bool:
+    """Whether the character at `index` can begin a token.
+
+    PostgreSQL identifiers may contain `$` and letters after the first
+    character, so `my$tab$le` is a single legal identifier and `tableE'x'` is an
+    identifier followed by a plain string. Constructs that can only *begin* a
+    token — dollar-quoting, an `E''` prefix — are not one when the preceding
+    character continues an identifier. Without this, `my$tab$le; DROP TABLE
+    victim` reads as one read-only SELECT while the engine runs two statements.
+    """
+    if index == 0:
         return True
-    return not (sql[before].isalnum() or sql[before] in {"_", "$"})
+    previous = sql[index - 1]
+    return not (previous.isalnum() or previous in {"_", "$"})
 
 
 def _unquote(identifier: str) -> str:

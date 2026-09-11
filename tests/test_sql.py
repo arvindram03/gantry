@@ -282,6 +282,48 @@ def test_conservative_dialect_honours_backslash_escapes_only_in_e_strings() -> N
     assert dialect.classify(r"SELECT * FROM tableE'x\'; DROP TABLE t'").statement_count == 2
 
 
+def test_conservative_dialect_treats_dollar_quoted_bodies_as_opaque() -> None:
+    """A `$$...$$` body is one string, and `$` mid-identifier does not open one.
+
+    Checked against PostgreSQL 16. The adversarial case below is the reason for
+    the token-boundary guard: `my$tab$le` is a single legal identifier there,
+    and `SELECT * FROM my$tab$le; DROP TABLE victim` really does execute both
+    statements — the table is gone afterwards. A splitter that reads `$tab$` as
+    a dollar quote reports one read-only SELECT for that string.
+    """
+    dialect = ConservativeDialect()
+
+    # The semicolons are inside the body, so this is one statement.
+    assert dialect.classify("SELECT $$a; b$$ AS x").statement_count == 1
+    assert dialect.classify("SELECT $tag$a; b$tag$ AS x").statement_count == 1
+
+    body = dialect.classify(
+        "CREATE FUNCTION f() RETURNS int AS $$ BEGIN; RETURN 1; END; $$ LANGUAGE plpgsql"
+    )
+    assert body.statement_count == 1
+    assert body.operation is SQLOperation.DDL
+
+    # A tag closes only on an exact match, so the inner `$b$` pair and its
+    # semicolon stay inside the outer body.
+    assert dialect.classify("SELECT $a$ x $b$ y; z $b$ w $a$").statement_count == 1
+
+    # The guard: `$` after an identifier character belongs to the identifier.
+    smuggled = dialect.classify("SELECT * FROM my$tab$le; DROP TABLE victim")
+    assert smuggled.operation is SQLOperation.MULTI_STATEMENT
+    assert smuggled.statement_count == 2
+    assert not smuggled.read_only
+
+    # Positional parameters are not tags — the grammar needs a letter or `_`.
+    assert dialect.classify("SELECT * FROM t WHERE a = $1; DROP TABLE victim").statement_count == 2
+
+    # An unterminated tag runs to the end rather than splitting, the way an
+    # unterminated block comment does. PostgreSQL rejects the string outright.
+    assert dialect.classify("SELECT $$oops; DROP TABLE victim").statement_count == 1
+
+    # A genuine batch still splits.
+    assert dialect.classify("SELECT $$a$$; SELECT $$b$$").statement_count == 2
+
+
 def test_policy_normalizes_allow_lists_and_checks_explain_limits() -> None:
     policy = SQLPolicy(
         allowed_schemas=["Analytics"],

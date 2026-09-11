@@ -36,6 +36,12 @@ Notable changes. Dates are release dates; the format follows
 
 ### Fixed
 
+- The statement splitter treats PostgreSQL dollar-quoted strings as opaque, so
+  a `;` inside a `$$...$$` or `$tag$...$tag$` body no longer splits one
+  statement into several and gets it refused as a batch (#7). Dollar-quoting is
+  recognised only where a token can begin: `my$tab$le` is a single legal
+  identifier in PostgreSQL, so `SELECT * FROM my$tab$le; DROP TABLE victim`
+  stays two statements rather than reading as one read-only `SELECT`.
 - The statement splitter honours backslash escapes inside PostgreSQL `E''`
   strings, so `E'O\'Brien; x'` is one statement rather than two. Backslashes
   stay literal in ordinary strings, matching `standard_conforming_strings`, and
