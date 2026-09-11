@@ -1,640 +1,142 @@
+<img src="https://raw.githubusercontent.com/arvindram03/gantry/main/docs/assets/gantry-logo-512.jpg" alt="Gantry" width="110" align="right" />
+
 # Gantry
 
-**A trust boundary for agents working with real data.**
+**Let the agent write the SQL. Keep the authority to run it.**
 
-Agents can generate SQL, transformations, and data jobs.
+[![PyPI](https://img.shields.io/pypi/v/data-gantry?color=2f6feb)](https://pypi.org/project/data-gantry/)
+[![Python](https://img.shields.io/pypi/pyversions/data-gantry)](https://pypi.org/project/data-gantry/)
+[![Docs](https://img.shields.io/badge/docs-gantry-2f6feb)](https://arvindram03.github.io/gantry/)
+[![CI](https://github.com/arvindram03/gantry/actions/workflows/ci.yml/badge.svg)](https://github.com/arvindram03/gantry/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](https://github.com/arvindram03/gantry/blob/main/LICENSE)
 
-But generating work and having the authority to execute it should be two different things.
+Gantry is the layer between your agent and your database. Your application holds the
+credentials and writes the policy. The agent gets a tool whose only input is `sql`.
 
-> **Agent output is a proposal, not an instruction.**
-
-Gantry sits between agents and data systems. It decides whether proposed work is allowed, executes it under trusted constraints, observes what happens, and gives the caller a structured result.
-
-```text
-                         trusted configuration
-                                │
-                                ▼
-Agent ──── proposal ────────> Gantry ─────────> Data system
-                                │
-                           admission
-                           enforcement
-                           execution
-                           observation
-                           verification
-                                │
-                                ▼
-                              Result
-```
-
-## Start with SQL
-
-SQL is the simplest way to use Gantry today.
+Every statement is classified, checked against the policy, validated by the engine,
+bounded, executed, and **verified** before its result is marked accepted.
 
 ```bash
 pip install data-gantry
 ```
 
-> **The distribution is `data-gantry`; the import is `gantry`.** The name
-> `gantry` on PyPI belongs to an unrelated project, so the package installs
-> under `data-gantry` and imports as `gantry`:
->
-> ```python
-> import gantry
-> ```
+The distribution is `data-gantry`; the import is `gantry`.
 
+---
+
+## A governed agent tool in 10 lines
 
 ```python
 import os
-
 import gantry
 
-db = gantry.sql.connect(
-    "postgres",
-    url=os.environ["DATABASE_URL"],
-)
+db = gantry.sql.connect("postgres", url=os.environ["DATABASE_URL"])
 
 query = db.query(
-    read_only=True,
-    schemas=["analytics"],
-    max_rows=100,
-    timeout=30,
-)
-```
-
-Call the configured operation directly from application code:
-
-```python
-result = await query(
-    """
-    SELECT plan, COUNT(*) AS customers
-    FROM analytics.customers
-    GROUP BY plan
-    """
-)
-```
-
-Engines that expose output references, such as BigQuery, can keep the result in the engine and
-return its URI:
-
-```python
-warehouse = gantry.sql.connect("bigquery", project="acme")
-warehouse_query = warehouse.query(max_rows=100)
-
-uri = (await warehouse_query("SELECT * FROM analytics.customers")).uri
-```
-
-`uri` is `None` when the provider returns only bounded inline rows, as PostgreSQL typically does.
-The full query outcome still exposes `inline`, `outputs`, status, metrics, and normalized failures.
-
-Or expose its narrower tool form to an agent:
-
-```python
-tools = [query.tool()]
-```
-
-The application keeps `db` and `query`. The agent sees only a `query_sql` tool with one input:
-`sql`. It cannot change schemas, row limits, timeouts, or credentials.
-
-The agent can decide:
-
-```sql
-SELECT plan, COUNT(*)
-FROM analytics.customers
-GROUP BY plan;
-```
-
-It cannot decide that it suddenly needs write access, another schema, different credentials, or a disabled safety check.
-
-The authority stays outside the agent.
-
----
-
-## Why Gantry?
-
-Connecting an agent to a database is easy.
-
-The harder problem starts after that.
-
-An agent may decide to:
-
-```sql
-DELETE FROM customers;
-```
-
-scan several terabytes in a warehouse,
-
-access data it was never supposed to see,
-
-or submit a long-running transformation that fails after twenty minutes.
-
-Prompting the model to "be careful" is not an execution boundary.
-
-Gantry separates:
-
-```text
-Agent
-  owns
-  └── what work to propose
-
-Gantry
-  owns
-  ├── whether the work is admissible
-  ├── under what constraints it executes
-  ├── how execution is observed
-  └── whether the outcome is accepted
-
-Data system
-  owns
-  └── actually executing the data workload
-```
-
-The agent proposes.
-
-Gantry decides whether the proposal gets authority.
-
----
-
-## Policies are not agent instructions
-
-Gantry policies are configured by the application or operator, not generated by the agent performing the work.
-
-```python
-query = db.query(
-    read_only=True,
-    schemas=["analytics"],
-    max_rows=1000,
-    timeout=30,
-)
-```
-
-The agent receives only `query.tool()`.
-
-It does **not** receive:
-
-```text
-database credentials
-unrestricted connections
-policy mutation APIs
-admin APIs
-ways to disable verification
-```
-
-So this:
-
-```sql
-SELECT *
-FROM analytics.customers
-LIMIT 20;
-```
-
-can execute.
-
-While this:
-
-```sql
-DELETE FROM analytics.customers;
-```
-
-is rejected before execution.
-
-```text
-REJECTED
-
-DELETE is not allowed by read-only policy.
-```
-
----
-
-## Create derived data
-
-Use a materializer when a caller needs to create a new table from approved sources. This is a
-separate operation from querying; it does not turn the read tool into a general write connection.
-
-```python
-warehouse = gantry.sql.connect(
-    "bigquery",
-    project="acme",
+    read_only=True,           # writes are refused, not filtered
+    schemas=["analytics"],    # nothing outside analytics
+    max_rows=100,             # bounded result
+    timeout=30,               # bounded runtime
 )
 
-materialize = warehouse.materialize(
-    sources=["raw.*"],
-    destinations=["agent_scratch.*"],
-    max_bytes_scanned=10_000_000_000,
-    timeout=300,
-    verify=[
-        gantry.verify.destination_exists(),
-        gantry.verify.row_count(min=1),
-        gantry.verify.required_columns(["customer_id", "outstanding_balance"]),
-    ],
-)
+tools = [query.tool()]        # ← hand this to your agent
 ```
 
-`db.materialize(...)` requires the application to configure write authority before any SQL is
-supplied. Call the resulting operation directly:
+That's the whole integration. `query.tool()` is framework-neutral — a name, a JSON
+schema, and an async handler — so it drops into any agent loop:
 
 ```python
-uri = (
-    await materialize(
-        """
-        CREATE TABLE agent_scratch.high_risk_customers AS
-        SELECT customer_id, SUM(balance) AS outstanding_balance
-        FROM raw.invoices
-        WHERE status = 'unpaid'
-        GROUP BY customer_id
-        """
-    )
-).uri
+tool = query.tool()
 
-print(uri)  # bigquery://acme/agent_scratch/high_risk_customers
+# Anthropic, OpenAI, LangChain, or your own loop:
+schema = {
+    "name": tool.name,                  # "query_sql"
+    "description": tool.description,
+    "input_schema": tool.input_schema,  # one property: sql
+}
+
+# When the model calls it:
+result = await tool.invoke({"sql": "SELECT plan, COUNT(*) ..."})
+
+result.status        # ACCEPTED
+result.inline.rows   # (('free', 1250), ('team', 1250), ...)
 ```
 
-`uri` is `None` when no destination was created. Keep the full returned outcome when application
-code needs structured rejection or verification details.
+## What the agent cannot do
 
-Or give both governed operations to an agent:
+It sees one string field. It cannot widen the schema allow-list, raise the row cap,
+extend the timeout, reach the connection, or swap credentials — those live in your
+code, not in the tool schema. It cannot turn a read into a write: `query.tool()`
+refuses to be created at all unless the policy is read-only.
+
+And it cannot have a wrong answer accepted just because the engine returned success.
 
 ```python
-tools = [
-    query.tool(),
-    materialize.tool(),
-]
+result.status is gantry.ResultStatus.ACCEPTED   # ran *and* passed verification
 ```
 
-Each tool accepts only `{"sql": "..."}`. The agent chooses native SQL; trusted code retains source
-scope, destination scope, execution limits, credentials, and verification.
-
-The result returned by `tool.invoke(...)` exposes the same URI:
-
-```python
-query_uri = (
-    await query.tool().invoke(
-        sql="SELECT * FROM analytics.customers",
-    )
-).uri
-
-materialized_uri = (
-    await materialize.tool().invoke(
-        sql="CREATE TABLE agent_scratch.customers AS SELECT * FROM raw.customers",
-    )
-).uri
-```
-
-An agent framework returns these URI values to the model as normal tool output. A query URI is
-`None` when the provider returns only bounded inline rows.
-
-> **Configure once. Call directly or expose as a tool.**
-
-The engine moves the data directly. Gantry returns an output reference, not the materialized rows.
-Existing destinations, disallowed sources, replacement statements, unsupported limits, and failed
-verification are reported without silently weakening the configuration.
-
-For a reconnectable engine, submission and observation can be separated:
-
-```python
-handle = await materialize.submit(sql)
-
-# A recreated materializer can reconnect with the durable handle.
-result = await materialize.wait(handle)
-```
-
-See [SQL materialization](docs/materialization.md) for the complete v0 contract.
-
----
-
-## Defense in depth
-
-Gantry is not a replacement for database permissions, IAM, network policy, or the security controls of the underlying system.
-
-It coordinates them.
-
-```text
-Agent
-  │
-  ▼
-Gantry policy
-  │
-  ▼
-Scoped credentials / IAM
-  │
-  ▼
-Native database controls
-  │
-  ▼
-Execution engine
-```
-
-Use read-only database roles, scoped service accounts, authorized datasets, statement timeouts, resource quotas, and network restrictions wherever the underlying system supports them.
-
-If Gantry cannot satisfy a required policy, execution should fail closed.
-
-```text
-Policy requires cost limit
-          │
-          ▼
-Adapter cannot enforce cost limit
-          │
-          ▼
-       REJECTED
-```
-
-No silent downgrade.
-
----
-
-## One model across data systems
-
-The proposal changes depending on the engine.
-
-The trust boundary does not.
-
-### Postgres
-
-```text
-Agent
-  │ SQL
-  ▼
-Gantry
-  │ admit
-  ▼
-Postgres
-  │
-  ▼
-Rows
-```
-
-### BigQuery
-
-```text
-Agent
-  │ SQL
-  ▼
-Gantry
-  │ admit + cost constraints
-  ▼
-BigQuery
-  │
-  ▼
-Query Job
-  │
-  ▼
-Output Reference
-```
-
-### Flink SQL
-
-Choose the execution model first, then use Flink as the engine. The SQL remains native Flink SQL.
-
-```python
-batch = gantry.batch.connect("flink", endpoint=FLINK_ENDPOINT)
-daily_orders = batch.job(
-    inputs=["raw.orders"],
-    outputs=["analytics.daily_orders"],
-    checks=[gantry.verify.output_exists(), gantry.verify.row_count(min=1)],
-)
-
-result = await daily_orders("""
-INSERT INTO analytics.daily_orders
-SELECT CAST(order_time AS DATE), COUNT(*)
-FROM raw.orders
-GROUP BY CAST(order_time AS DATE)
-""")
-```
-
-Long-running streams use the same configure-once shape, but acceptance means healthy and running
-rather than finished:
-
-```python
-stream = gantry.stream.connect("flink", endpoint=FLINK_ENDPOINT)
-clean_events = stream.job(
-    inputs=["raw.events"],
-    outputs=["clean.events"],
-    checks=[
-        gantry.verify.running(),
-        gantry.verify.restart_count(max=3),
-        gantry.verify.watermark_lag(max_seconds=60),
-    ],
-)
-
-result = await clean_events("""
-INSERT INTO clean.events
-SELECT * FROM raw.events WHERE event_type IS NOT NULL
-""")
-
-tools = [clean_events.tool()]  # the agent sees only {"sql": "..."}
-```
-
-A database query may finish in milliseconds.
-
-A warehouse query may become an asynchronous job.
-
-A Flink SQL statement may create a stream that runs indefinitely.
-
-Gantry provides a common execution boundary without pretending those systems have the same computation model.
-
----
-
-## Native SQL stays native
-
-Gantry is not a SQL abstraction layer.
-
-```text
-Postgres SQL   ──────> Postgres
-BigQuery SQL   ──────> BigQuery
-Snowflake SQL  ──────> Snowflake
-Flink SQL      ──────> Flink
-```
-
-No Gantry query language.
-
-No requirement to rewrite your workloads into a common DSL.
-
-The engine still owns computation.
-
-Gantry owns the boundary around execution.
-
----
-
-## Gantry is not in your data path
-
-Large datasets should not flow through Gantry.
-
-```text
-Agent
-       │
-       │ proposal
-       ▼
-    Gantry
-       │
-       │ execution request
-       ▼
-Data System ───────────────> Data System
-       │
-       │ reference / bounded result
-       ▼
-    Gantry
-       │
-       ▼
-     Agent
-```
-
-Small, explicitly bounded query results can be returned inline.
-
-Large results remain in the underlying data system and are returned as references.
-
-> **References by default. Inline data only when explicitly bounded.**
-
-Gantry is a control plane, not a data plane.
-
----
-
-## From SQL to data jobs
-
-SQL is the first execution surface because it gives agents immediate access to useful data systems.
-
-But the execution model is intentionally broader.
-
-```text
-                    Gantry
-
-Agent proposal ──> admission
-                       │
-                       ▼
-                    execute
-                       │
-             ┌─────────┼─────────┐
-             ▼         ▼         ▼
-          Postgres  BigQuery   Flink
-             │         │         │
-             ▼         ▼         ▼
-           rows      job/ref    stream
-             │         │         │
-             └─────────┼─────────┘
-                       ▼
-                    observe
-                       │
-                       ▼
-                    verify
-                       │
-                       ▼
-                     result
-```
-
-The goal is not to standardize how data is computed.
-
-The goal is to standardize the contract around agent-generated execution.
-
----
-
-## Core principle
-
-Gantry follows one rule:
-
-> **The agent owns adaptation. Gantry owns acceptance.**
-
-Agents are good at deciding what work might solve a problem.
-
-Infrastructure is good at enforcing permissions, limits, execution semantics, and guarantees.
-
-Gantry keeps those responsibilities separate.
-
----
+A statement that runs perfectly and produces the wrong table comes back
+`VERIFICATION_FAILED`, not success. "It ran" and "it can be believed" are
+different questions, and only the first one is the engine's to answer.
 
 ## Supported systems
 
-| System | Current Gantry operation |
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-4169E1?style=for-the-badge&logo=postgresql&logoColor=white)](https://arvindram03.github.io/gantry/sql/)
+[![Neon](https://img.shields.io/badge/Neon-00E599?style=for-the-badge&logo=neon&logoColor=black)](https://arvindram03.github.io/gantry/sql/)
+[![Supabase](https://img.shields.io/badge/Supabase-3FCF8E?style=for-the-badge&logo=supabase&logoColor=black)](https://arvindram03.github.io/gantry/sql/)
+[![DuckDB](https://img.shields.io/badge/DuckDB-FFF000?style=for-the-badge&logo=duckdb&logoColor=black)](https://arvindram03.github.io/gantry/sql/)
+[![Apache Flink](https://img.shields.io/badge/Apache%20Flink-E6526F?style=for-the-badge&logo=apacheflink&logoColor=white)](https://arvindram03.github.io/gantry/flink/)
+[![BigQuery](https://img.shields.io/badge/BigQuery-669DF6?style=for-the-badge&logo=googlebigquery&logoColor=white)](https://arvindram03.github.io/gantry/sql/)
+[![Snowflake](https://img.shields.io/badge/Snowflake-29B5E8?style=for-the-badge&logo=snowflake&logoColor=white)](https://arvindram03.github.io/gantry/sql/)
+
+| | What Gantry does there |
 | --- | --- |
-| PostgreSQL, Supabase, Neon | Governed queries and bounded inline results |
-| BigQuery | Governed queries, output references, and SQL materialization |
-| Snowflake | Governed queries and reconnectable query jobs |
-| DuckDB | Governed queries and process-local SQL materialization |
-| Flink SQL | Governed batch and stream jobs with durable handles, verification, and cancellation |
+| **PostgreSQL**, Neon, Supabase | Governed queries, bounded inline results |
+| **DuckDB** | Governed queries, local materialization |
+| **Apache Flink** | Batch and streaming jobs, durable handles, cancellation |
+| **BigQuery** \* | Governed queries, output references, materialization |
+| **Snowflake** \* | Governed queries, reconnectable jobs |
 
-SQL materialization v0 is enabled for BigQuery and DuckDB. Other providers fail closed if that
-operation is requested; see the [provider support matrix](docs/materialization.md#provider-support).
+\* The adapter ships and declares its capabilities, but has not yet been exercised
+against a live account. Everything else is tested against a real engine on every change.
 
-More execution targets can implement the same Gantry execution contract without forcing their computation model into a common abstraction.
+A policy is only admitted when the adapter can actually enforce it — asking for
+`read_only=True` on a backend that cannot hold a read-only session is refused rather
+than quietly trusted. The [capability matrix](https://arvindram03.github.io/gantry/api/capabilities/)
+is generated from the adapter source, so it cannot drift from what the code does.
+
+## Letting an agent write
+
+Reads are the easy half. When an agent needs to produce data, Gantry gives it a
+create-only path — one `CREATE TABLE AS`, to a destination you named, that must not
+already exist:
+
+```python
+build = db.materialize(
+    sources=["analytics.*"],
+    destinations=["reporting.*"],
+    verify=[gantry.verify.row_count(max=1_000_000)],
+)
+
+tools = [query.tool(), build.tool()]
+```
+
+No `DROP`, no `REPLACE`, no writing outside `reporting`, and no accepted result
+until the destination has been checked.
+
+## Not in your data path
+
+Gantry governs the statement and reads back references — it never streams your rows
+through itself. A 40-minute Flink job is a durable handle you can poll, reconnect to
+from another process, and cancel; not a tool call you have to hold open.
 
 ---
 
-## What Gantry owns
+## Next
 
-```text
-admission
-policy enforcement
-execution identity
-submission
-status
-cancellation
-failure normalization
-bounded results
-output references
-observation
-verification
-accepted results
-```
+- **[Documentation](https://arvindram03.github.io/gantry/)** — guides and the full API reference
+- **[Examples](https://github.com/arvindram03/gantry/tree/main/examples)** — seven runnable scenarios, indexed by what you are trying to do
+- **[Capability matrix](https://arvindram03.github.io/gantry/api/capabilities/)** — what each backend enforces
+- **[Security](https://github.com/arvindram03/gantry/blob/main/SECURITY.md)** — what Gantry does and does not protect
 
-## What Gantry does not own
-
-```text
-agent planning
-prompting
-code generation
-SQL dialects
-query planning
-data transformation semantics
-distributed execution
-stream processing
-storage
-database permissions
-IAM
-data transport
-```
-
-If an existing system already knows how to perform the work, Gantry should use it.
-
----
-
-## Try it
-
-Seven runnable examples, indexed by what you are trying to do, in
-[`examples/`](examples/). The quickest needs nothing but a Python environment:
-
-```bash
-pip install "data-gantry[duckdb]"
-python examples/local_duckdb.py
-```
-
-For the rest, one stack brings up PostgreSQL, Flink, and the catalog they read
-through:
-
-```bash
-docker compose -f examples/stack/docker-compose.yml up -d --wait
-psql postgresql://gantry:gantry@localhost:5432/gantry -f examples/seed.sql
-python examples/warehouse_rollup.py
-```
-
-`warehouse_rollup.py` is the one to read if you want the point rather than the
-API: an agent writes a rollup over 200,000 orders, and of its four attempts one
-is accepted, one runs perfectly and produces a table nobody should read, one
-writes where it was not asked to, and one is refused by the planner.
-
-## Documentation
-
-The rendered site, including the generated API reference, is at
-**<https://arvindram03.github.io/gantry/>**.
-
-- [API reference](https://arvindram03.github.io/gantry/api/) — public symbols,
-  signatures, and returned types, generated from the source
-- [SQL providers](docs/sql.md)
-- [SQL materialization](docs/materialization.md)
-- [Safety and policies](docs/policy.md)
-- [Flink SQL](docs/flink.md)
-- [Custom SQL adapters](docs/adapters.md)
-
----
-
-## License
-
-Gantry is licensed under the Apache License 2.0.
-
-See [LICENSE](./LICENSE).
+Gantry is Apache 2.0 licensed. See [LICENSE](https://github.com/arvindram03/gantry/blob/main/LICENSE).
