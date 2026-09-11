@@ -1,9 +1,47 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
+
 import pytest
+from gantry import (
+    Artifact,
+    Context,
+    Execution,
+    ExecutionHandle,
+    ExecutionResult,
+    ExecutionState,
+    ExecutionTarget,
+    Failure,
+    FailureKind,
+    OutputKind,
+    OutputRef,
+    ResultStatus,
+    ValidationResult,
+)
+from gantry.nosql.bridge import NoSQLExecutionAdapter
+from gantry.nosql.capabilities import NoSQLCapabilities
+from gantry.nosql.enforcement import policy_errors
+from gantry.nosql.materialization import MaterializationPolicy, NoSQLMaterializer
+from gantry.nosql.output import InlineDocuments
+from gantry.nosql.pipeline import (
+    CollectionRef,
+    Pipeline,
+    PipelineOperation,
+    classify_pipeline,
+    normalize_pipeline,
+)
 from gantry.nosql.policy import NoSQLPolicy
+from gantry.nosql.query import NoSQLQuery
+from gantry.nosql.registry import providers, register, register_provider, resolve_provider
+from gantry.nosql.result import NoSQLResult
 from gantry.nosql.target import NoSQLTarget
+from gantry.nosql.verify import (
+    CollectionSnapshot,
+    destination_exists,
+    document_count,
+    required_fields,
+)
 
 
 def test_target_rejects_empty_provider_or_driver() -> None:
@@ -35,9 +73,6 @@ def test_policy_normalizes_collection_names_and_validates_types() -> None:
         NoSQLPolicy(max_cost_usd=-1)
 
 
-from gantry.nosql.capabilities import NoSQLCapabilities
-
-
 def test_capabilities_map_to_core_contract_and_policy_requirements() -> None:
     capabilities = NoSQLCapabilities(
         cancellation=True,
@@ -62,22 +97,11 @@ def test_capabilities_map_to_core_contract_and_policy_requirements() -> None:
     assert requirements.require_metrics is True
 
 
-from gantry.nosql.output import InlineDocuments
-
-
 def test_inline_documents_holds_heterogeneous_documents() -> None:
     inline = InlineDocuments(({"a": 1}, {"a": 1, "b": 2}), truncated=True)
 
     assert inline.documents == ({"a": 1}, {"a": 1, "b": 2})
     assert inline.truncated is True
-
-
-from gantry.nosql.pipeline import (
-    CollectionRef,
-    PipelineOperation,
-    classify_pipeline,
-    normalize_pipeline,
-)
 
 
 def test_normalize_pipeline_wraps_a_plain_filter_dict() -> None:
@@ -122,16 +146,11 @@ def test_classify_pipeline_recognizes_out_and_merge_and_rejects_bad_stages() -> 
     with pytest.raises(ValueError, match="must be the last stage"):
         classify_pipeline("orders", [{"$out": "x"}, {"$match": {}}])
     with pytest.raises(ValueError, match="whenMatched"):
-        classify_pipeline(
-            "orders", [{"$merge": {"into": "x", "whenMatched": "keepExisting"}}]
-        )
+        classify_pipeline("orders", [{"$merge": {"into": "x", "whenMatched": "keepExisting"}}])
     with pytest.raises(ValueError, match="exactly one operator"):
         classify_pipeline("orders", [{"$match": {}, "$project": {}}])
     with pytest.raises(ValueError, match="collection name must not be empty"):
         classify_pipeline("  ", [{"$match": {}}])
-
-
-from gantry.nosql.enforcement import policy_errors
 
 
 def test_policy_errors_flags_denied_collections_and_missing_capabilities() -> None:
@@ -159,31 +178,13 @@ def test_policy_errors_flags_denied_collections_and_missing_capabilities() -> No
 def test_policy_errors_flags_write_under_read_only_policy() -> None:
     classification = classify_pipeline("orders", [{"$out": "reporting.rollup"}])
     policy = NoSQLPolicy(read_only=True)
-    capabilities = NoSQLCapabilities(read_only_session=True, document_limit=True, operation_timeout=True)
+    capabilities = NoSQLCapabilities(
+        read_only_session=True, document_limit=True, operation_timeout=True
+    )
 
     errors = policy_errors(classification, policy, capabilities)
 
     assert any("not allowed by read-only policy" in error for error in errors)
-
-
-from gantry import (
-    Context,
-    Execution,
-    ExecutionHandle,
-    ExecutionResult,
-    ExecutionState,
-    ExecutionTarget,
-    Failure,
-    FailureKind,
-    OutputKind,
-    OutputRef,
-)
-from gantry.artifact import Artifact
-from gantry.nosql.adapter import NoSQLAdapter
-from gantry.nosql.bridge import NoSQLExecutionAdapter
-from gantry.nosql.output import InlineDocuments
-from gantry.nosql.pipeline import Pipeline
-from gantry.nosql.target import NoSQLTarget
 
 
 class StubMongoAdapter:
@@ -214,9 +215,7 @@ class StubMongoAdapter:
         target: NoSQLTarget,
         context: Context,
         policy: NoSQLPolicy,
-    ) -> object:
-        from gantry import ValidationResult
-
+    ) -> ValidationResult:
         return ValidationResult.accepted(metadata={"provider": target.provider})
 
     async def submit(
@@ -310,9 +309,6 @@ async def test_bridge_rejects_unclassifiable_pipeline() -> None:
     assert any("pipeline classification failed" in error for error in validation.errors)
 
 
-from gantry.nosql.registry import providers, register, register_provider, resolve_provider
-
-
 def test_registry_registers_and_resolves_providers() -> None:
     register_provider(
         "test-mongo",
@@ -328,7 +324,9 @@ def test_registry_registers_and_resolves_providers() -> None:
     with pytest.raises(ValueError, match="unknown NoSQL provider"):
         resolve_provider("missing")
     with pytest.raises(ValueError, match="already registered"):
-        register_provider("test-mongo", driver="pymongo", adapter_factory=lambda target: StubMongoAdapter())
+        register_provider(
+            "test-mongo", driver="pymongo", adapter_factory=lambda target: StubMongoAdapter()
+        )
 
 
 def test_register_wraps_a_ready_adapter_instance() -> None:
@@ -338,14 +336,6 @@ def test_register_wraps_a_ready_adapter_instance() -> None:
     resolved = resolve_provider("test-mongo-instance")
 
     assert resolved.adapter_factory(_nosql_target()) is adapter
-
-
-from gantry.nosql.verify import (
-    CollectionSnapshot,
-    destination_exists,
-    document_count,
-    required_fields,
-)
 
 
 def test_verification_checks_against_a_collection_snapshot() -> None:
@@ -368,12 +358,6 @@ def test_verification_checks_against_a_collection_snapshot() -> None:
         document_count(min=10, max=1)
     with pytest.raises(ValueError, match="required fields must not be empty"):
         required_fields([])
-
-
-from gantry.context import Context
-from gantry.nosql.query import NoSQLQuery
-from gantry.nosql.result import NoSQLResult
-from gantry.result import ResultStatus
 
 
 class _FakeConnection:
@@ -429,12 +413,6 @@ async def test_query_tool_exposes_collection_and_pipeline_only() -> None:
         await tool.invoke(pipeline={})
     with pytest.raises(ValueError, match="unexpected query tool arguments"):
         await tool.invoke(collection="orders", pipeline={}, policy="untrusted")
-
-
-from gantry.nosql.materialization import (
-    MaterializationPolicy,
-    NoSQLMaterializer,
-)
 
 
 class _FakeMaterializeConnection:
@@ -500,7 +478,7 @@ async def test_materializer_rejects_out_when_destination_already_exists() -> Non
         snapshot=CollectionSnapshot("reporting.rollup"),
     )
     policy = MaterializationPolicy(sources=["orders"], destinations=["reporting.rollup"])
-    materializer = NoSQLMaterializer(connection, policy, ())  # type: ignore[arg-type]
+    materializer = NoSQLMaterializer(connection, policy, ())
 
     result = await materializer("orders", [{"$match": {}}, {"$out": "reporting.rollup"}])
 
@@ -517,7 +495,7 @@ async def test_materializer_allows_merge_into_an_existing_destination() -> None:
     policy = MaterializationPolicy(sources=["orders"], destinations=["reporting.rollup"])
     materializer = NoSQLMaterializer(
         connection, policy, (destination_exists(), document_count(min=1))
-    )  # type: ignore[arg-type]
+    )
 
     result = await materializer(
         "orders", [{"$match": {}}, {"$merge": {"into": "reporting.rollup", "whenMatched": "merge"}}]
@@ -531,11 +509,9 @@ async def test_materializer_allows_merge_into_an_existing_destination() -> None:
 async def test_materializer_rejects_sources_outside_policy() -> None:
     connection = _FakeMaterializeConnection(capabilities=_full_capabilities(), snapshot=None)
     policy = MaterializationPolicy(sources=["orders"], destinations=["reporting.rollup"])
-    materializer = NoSQLMaterializer(connection, policy, ())  # type: ignore[arg-type]
+    materializer = NoSQLMaterializer(connection, policy, ())
 
-    result = await materializer(
-        "secrets", [{"$match": {}}, {"$out": "reporting.rollup"}]
-    )
+    result = await materializer("secrets", [{"$match": {}}, {"$out": "reporting.rollup"}])
 
     assert result.status is ResultStatus.REJECTED
     assert result.failure is not None
@@ -549,10 +525,16 @@ def test_mongo_adapter_reports_a_clear_error_without_pymongo(
 
     real_import = builtins.__import__
 
-    def _blocked_import(name: str, *args: object, **kwargs: object) -> object:
+    def _blocked_import(
+        name: str,
+        import_globals: Mapping[str, object] | None = None,
+        import_locals: Mapping[str, object] | None = None,
+        fromlist: Sequence[str] = (),
+        level: int = 0,
+    ) -> object:
         if name == "pymongo":
             raise ImportError("no module named pymongo")
-        return real_import(name, *args, **kwargs)
+        return real_import(name, import_globals, import_locals, fromlist, level)
 
     monkeypatch.setattr(builtins, "__import__", _blocked_import)
 

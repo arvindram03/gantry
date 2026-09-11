@@ -71,7 +71,9 @@ class DocumentCount:
         if ok and self.maximum is not None:
             ok = actual <= self.maximum
         expected = {"min": self.minimum, "max": self.maximum}
-        message = None if ok else f"destination document count {actual} is outside the accepted range"
+        message = (
+            None if ok else f"destination document count {actual} is outside the accepted range"
+        )
         return CheckResult("document_count", ok, expected, actual, message)
 
 

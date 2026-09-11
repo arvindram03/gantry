@@ -54,7 +54,7 @@ class NoSQLExecutionAdapter:
             native_value: object = await self.adapter.validate(
                 pipeline, self.target, context, self.policy
             )
-        except Exception as error:  # noqa: BLE001
+        except Exception as error:
             errors.append(f"NoSQL validation raised {type(error).__name__}: {error}")
             native_value = ValidationResult.rejected()
         if not isinstance(native_value, ValidationResult):

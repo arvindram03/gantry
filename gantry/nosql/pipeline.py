@@ -39,7 +39,7 @@ class PipelineClassification:
 
 
 def normalize_pipeline(pipeline: Pipeline) -> tuple[Mapping[str, object], ...]:
-    if isinstance(pipeline, (str, bytes)):
+    if isinstance(pipeline, (str, bytes)):  # type: ignore[unreachable]
         raise TypeError("pipeline must be a mapping filter or a sequence of stage mappings")
     if isinstance(pipeline, Mapping):
         return ({"$match": dict(pipeline)},)
