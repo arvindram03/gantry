@@ -308,3 +308,33 @@ async def test_bridge_rejects_unclassifiable_pipeline() -> None:
 
     assert not validation.ok
     assert any("pipeline classification failed" in error for error in validation.errors)
+
+
+from gantry.nosql.registry import providers, register, register_provider, resolve_provider
+
+
+def test_registry_registers_and_resolves_providers() -> None:
+    register_provider(
+        "test-mongo",
+        driver="pymongo",
+        adapter_factory=lambda target: StubMongoAdapter(),
+        replace=True,
+    )
+
+    resolved = resolve_provider("test-mongo")
+
+    assert resolved.name == "test-mongo"
+    assert "test-mongo" in providers()
+    with pytest.raises(ValueError, match="unknown NoSQL provider"):
+        resolve_provider("missing")
+    with pytest.raises(ValueError, match="already registered"):
+        register_provider("test-mongo", driver="pymongo", adapter_factory=lambda target: StubMongoAdapter())
+
+
+def test_register_wraps_a_ready_adapter_instance() -> None:
+    adapter = StubMongoAdapter()
+    register("test-mongo-instance", adapter=adapter, replace=True)
+
+    resolved = resolve_provider("test-mongo-instance")
+
+    assert resolved.adapter_factory(_nosql_target()) is adapter
