@@ -88,7 +88,9 @@ class MongoAdapter:
             metadata["document_count"] = await self._database[
                 reference.name
             ].estimated_document_count()
-        cursor = self._database[reference.name].aggregate([{"$sample": {"size": _SAMPLE_SIZE}}])
+        cursor = await self._database[reference.name].aggregate(
+            [{"$sample": {"size": _SAMPLE_SIZE}}]
+        )
         sample = await cursor.to_list(length=_SAMPLE_SIZE)
         fields: set[str] = set()
         for document in sample:
@@ -172,7 +174,7 @@ class MongoAdapter:
         started = asyncio.get_running_loop().time()
         stages = normalize_pipeline(pipeline)
         try:
-            cursor = self._database[collection].aggregate(list(stages))
+            cursor = await self._database[collection].aggregate(list(stages))
             documents = await asyncio.wait_for(
                 cursor.to_list(length=policy.max_documents + 1),
                 timeout=policy.timeout_seconds,
