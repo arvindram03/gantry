@@ -60,3 +60,13 @@ def test_capabilities_map_to_core_contract_and_policy_requirements() -> None:
     assert requirements.max_runtime_seconds == 15
     assert requirements.require_reconnect is False
     assert requirements.require_metrics is True
+
+
+from gantry.nosql.output import InlineDocuments
+
+
+def test_inline_documents_holds_heterogeneous_documents() -> None:
+    inline = InlineDocuments(({"a": 1}, {"a": 1, "b": 2}), truncated=True)
+
+    assert inline.documents == ({"a": 1}, {"a": 1, "b": 2})
+    assert inline.truncated is True
