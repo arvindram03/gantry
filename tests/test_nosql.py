@@ -70,3 +70,62 @@ def test_inline_documents_holds_heterogeneous_documents() -> None:
 
     assert inline.documents == ({"a": 1}, {"a": 1, "b": 2})
     assert inline.truncated is True
+
+
+from gantry.nosql.pipeline import (
+    CollectionRef,
+    PipelineOperation,
+    classify_pipeline,
+    normalize_pipeline,
+)
+
+
+def test_normalize_pipeline_wraps_a_plain_filter_dict() -> None:
+    stages = normalize_pipeline({"status": "open"})
+
+    assert stages == ({"$match": {"status": "open"}},)
+
+    with pytest.raises(TypeError, match="mapping filter"):
+        normalize_pipeline("not a pipeline")  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="every pipeline stage must be a mapping"):
+        normalize_pipeline([{"$match": {}}, "not a stage"])  # type: ignore[list-item]
+
+
+def test_classify_pipeline_reads_lookup_and_reports_read_only() -> None:
+    classification = classify_pipeline(
+        "orders",
+        [{"$match": {"status": "open"}}, {"$lookup": {"from": "customers", "as": "c"}}],
+    )
+
+    assert classification.operation is PipelineOperation.READ
+    assert classification.read_only is True
+    assert CollectionRef("orders") in classification.collections
+    assert CollectionRef("customers") in classification.collections
+    assert classification.write_destination is None
+
+
+def test_classify_pipeline_recognizes_out_and_merge_and_rejects_bad_stages() -> None:
+    out = classify_pipeline("orders", [{"$match": {}}, {"$out": "reporting.rollup"}])
+    merge = classify_pipeline(
+        "orders",
+        [{"$match": {}}, {"$merge": {"into": "reporting.rollup", "whenMatched": "merge"}}],
+    )
+
+    assert out.operation is PipelineOperation.WRITE
+    assert out.read_only is False
+    assert out.write_destination == CollectionRef("reporting.rollup")
+    assert out.write_stage == "$out"
+    assert merge.write_destination == CollectionRef("reporting.rollup")
+
+    with pytest.raises(ValueError, match="unsupported pipeline stage"):
+        classify_pipeline("orders", [{"$graphLookup": {}}])
+    with pytest.raises(ValueError, match="must be the last stage"):
+        classify_pipeline("orders", [{"$out": "x"}, {"$match": {}}])
+    with pytest.raises(ValueError, match="whenMatched"):
+        classify_pipeline(
+            "orders", [{"$merge": {"into": "x", "whenMatched": "keepExisting"}}]
+        )
+    with pytest.raises(ValueError, match="exactly one operator"):
+        classify_pipeline("orders", [{"$match": {}, "$project": {}}])
+    with pytest.raises(ValueError, match="collection name must not be empty"):
+        classify_pipeline("  ", [{"$match": {}}])
