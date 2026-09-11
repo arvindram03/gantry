@@ -49,7 +49,9 @@ def normalize_pipeline(pipeline: Pipeline) -> tuple[Mapping[str, object], ...]:
     return stages
 
 
-def classify_pipeline(collection: str, pipeline: Pipeline) -> PipelineClassification:
+def classify_pipeline(
+    collection: str, pipeline: Pipeline, *, database: str | None = None
+) -> PipelineClassification:
     if not collection.strip():
         raise ValueError("collection name must not be empty")
     stages = normalize_pipeline(pipeline)
@@ -65,13 +67,13 @@ def classify_pipeline(collection: str, pipeline: Pipeline) -> PipelineClassifica
             if index != len(stages) - 1:
                 raise ValueError(f"write stage {operator} must be the last stage in the pipeline")
             write_stage = operator
-            write_destination = _write_destination(operator, body)
+            write_destination = _write_destination(operator, body, database=database)
             collections[write_destination.name.lower()] = write_destination
         elif operator not in _READ_STAGES:
             raise ValueError(f"unsupported pipeline stage: {operator}")
         elif operator == "$lookup":
-            reference = _lookup_reference(body)
-            collections[reference.name.lower()] = reference
+            for reference in _lookup_references(body):
+                collections[reference.name.lower()] = reference
 
     operation = PipelineOperation.WRITE if write_stage is not None else PipelineOperation.READ
     return PipelineClassification(
@@ -84,20 +86,46 @@ def classify_pipeline(collection: str, pipeline: Pipeline) -> PipelineClassifica
     )
 
 
-def _lookup_reference(body: object) -> CollectionRef:
+def _lookup_references(body: object) -> tuple[CollectionRef, ...]:
     if not isinstance(body, Mapping) or "from" not in body:
         raise ValueError("$lookup stage must be a mapping with a 'from' collection")
     from_value = body["from"]
     if not isinstance(from_value, str):
         raise TypeError("$lookup 'from' must be a collection name")
-    return CollectionRef(from_value)
+    references = (CollectionRef(from_value),)
+    sub_pipeline = body.get("pipeline")
+    if sub_pipeline is None:
+        return references
+    return references + _sub_pipeline_references(sub_pipeline)
 
 
-def _write_destination(operator: str, body: object) -> CollectionRef:
+def _sub_pipeline_references(pipeline: object) -> tuple[CollectionRef, ...]:
+    if isinstance(pipeline, (str, bytes)) or not isinstance(pipeline, Sequence):
+        raise TypeError("$lookup 'pipeline' must be a sequence of stage mappings")
+    references: list[CollectionRef] = []
+    for stage in pipeline:
+        if not isinstance(stage, Mapping) or len(stage) != 1:
+            raise ValueError("every $lookup sub-pipeline stage must have exactly one operator")
+        operator, stage_body = next(iter(stage.items()))
+        if operator not in _READ_STAGES:
+            raise ValueError(f"unsupported $lookup sub-pipeline stage: {operator}")
+        if operator == "$lookup":
+            references.extend(_lookup_references(stage_body))
+    return tuple(references)
+
+
+def _write_destination(
+    operator: str, body: object, *, database: str | None = None
+) -> CollectionRef:
     if operator == "$out":
         if isinstance(body, str):
             return CollectionRef(body)
         if isinstance(body, Mapping) and isinstance(body.get("coll"), str):
+            out_db = body.get("db")
+            if out_db is not None and out_db != database:
+                raise ValueError(
+                    f"$out must target the connection's own database, got db={out_db!r}"
+                )
             return CollectionRef(body["coll"])
         raise ValueError("$out must be a collection name or a mapping with 'coll'")
     if isinstance(body, str):

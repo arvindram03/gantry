@@ -29,6 +29,7 @@ from gantry.output import OutputKind, OutputRef
 from gantry.result import Result
 from gantry.runtime import ControlPlane
 from gantry.target import ExecutionTarget
+from gantry.verifier import Verifier
 
 
 class NoSQLConnection:
@@ -60,7 +61,7 @@ class NoSQLConnection:
         timeout: float = 30,
         max_bytes_scanned: int | None = None,
         max_cost_usd: float | None = None,
-        verify: Sequence[DocumentCheck] = (),
+        verify: Sequence[Verifier] = (),
     ) -> NoSQLQuery:
         """Configure a governed query operation."""
 
@@ -103,11 +104,13 @@ class NoSQLConnection:
         *,
         policy: NoSQLPolicy,
         context: Context | None = None,
-        verify: Sequence[DocumentCheck] = (),
+        verify: Sequence[Verifier] = (),
     ) -> NoSQLResult:
         """Execute a pipeline for a configured query operation."""
 
-        return await self.execute(collection, pipeline, policy=policy, context=context)
+        return await self.execute(
+            collection, pipeline, policy=policy, context=context, verify=verify
+        )
 
     async def submit(
         self,
@@ -134,7 +137,7 @@ class NoSQLConnection:
         *,
         policy: NoSQLPolicy | None = None,
         context: Context | None = None,
-        verify: Sequence[DocumentCheck] = (),
+        verify: Sequence[Verifier] = (),
         poll_interval_seconds: float = 0.05,
     ) -> NoSQLResult:
         active_policy = policy or NoSQLPolicy()
@@ -145,6 +148,7 @@ class NoSQLConnection:
             target=self._execution_target(),
             context=nosql_context,
             policy=bridge.adapter.capabilities().policy_requirements(active_policy),
+            verify=verify,
             poll_interval_seconds=poll_interval_seconds,
         )
         return _from_engine_result(result, active_policy.max_documents)

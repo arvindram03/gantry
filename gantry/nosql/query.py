@@ -9,8 +9,8 @@ from gantry.context import Context
 from gantry.nosql.pipeline import Pipeline
 from gantry.nosql.policy import NoSQLPolicy
 from gantry.nosql.result import NoSQLResult
-from gantry.nosql.verify import DocumentCheck
 from gantry.tool import Tool
+from gantry.verifier import Verifier
 
 
 class _QueryConnection(Protocol):
@@ -21,7 +21,7 @@ class _QueryConnection(Protocol):
         *,
         policy: NoSQLPolicy,
         context: Context | None = None,
-        verify: Sequence[DocumentCheck] = (),
+        verify: Sequence[Verifier] = (),
     ) -> NoSQLResult: ...
 
 
@@ -29,7 +29,7 @@ class _QueryConnection(Protocol):
 class NoSQLQuery:
     _connection: _QueryConnection
     _policy: NoSQLPolicy
-    _verify: Sequence[DocumentCheck]
+    _verify: Sequence[Verifier]
 
     async def __call__(
         self,

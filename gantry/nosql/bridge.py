@@ -44,8 +44,11 @@ class NoSQLExecutionAdapter:
         collection = context.metadata.get("gantry.nosql.collection")
         if not isinstance(collection, str) or not collection.strip():
             return ValidationResult.rejected("NoSQL execution requires a target collection")
+        database = self.target.config.get("database")
         try:
-            classification = classify_pipeline(collection, pipeline)
+            classification = classify_pipeline(
+                collection, pipeline, database=database if isinstance(database, str) else None
+            )
         except (TypeError, ValueError) as error:
             return ValidationResult.rejected(f"pipeline classification failed: {error}")
         capabilities = self.adapter.capabilities()
