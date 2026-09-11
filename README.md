@@ -147,10 +147,11 @@ tools = [query.tool(), build.tool()]
 No `DROP`, no `REPLACE`, no writing outside `reporting`, and no accepted result
 until the destination has been checked.
 
-## Not in your data path
+## It's a library, not a proxy — your data doesn't route through it
 
-Gantry governs the statement. It does not become a hop your data has to travel
-through, or a service you have to operate.
+You add an import, not a service. Gantry decides whether a statement may run and
+whether its result can be believed — it is not a stop on the route your data takes
+to get where it is going.
 
 - **Bulk output never passes through Gantry.** The engine writes where it was told to,
   and you get an `OutputRef` — a URI to the result. Rows are carried back inline only
