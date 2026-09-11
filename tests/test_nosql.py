@@ -624,3 +624,15 @@ def test_connect_provider_config_is_validated_before_driver_creation() -> None:
         connect("mongodb", database="d")
     with pytest.raises(ValueError, match="unknown NoSQL provider"):
         connect("missing")
+
+
+def test_nosql_package_exports_the_public_surface() -> None:
+    import gantry.nosql as nosql
+
+    assert {"mongodb"} <= set(nosql.providers())
+    assert nosql.NoSQLConnection is not None
+    assert nosql.NoSQLPolicy is not None
+    assert nosql.NoSQLCapabilities is not None
+    assert nosql.NoSQLTarget is not None
+    assert nosql.CollectionSnapshot is not None
+    assert nosql.destination_exists is not None
