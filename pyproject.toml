@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "Apache-2.0" }
 dependencies = []
-keywords = ["sql", "agents", "llm", "governance", "flink", "duckdb", "postgres", "mysql"]
+keywords = ["sql", "agents", "llm", "governance", "flink", "duckdb", "postgres", "mysql", "mongodb"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
