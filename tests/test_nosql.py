@@ -540,3 +540,23 @@ async def test_materializer_rejects_sources_outside_policy() -> None:
     assert result.status is ResultStatus.REJECTED
     assert result.failure is not None
     assert result.failure.kind is FailureKind.SOURCE_NOT_ALLOWED
+
+
+def test_mongo_adapter_reports_a_clear_error_without_pymongo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _blocked_import(name: str, *args: object, **kwargs: object) -> object:
+        if name == "pymongo":
+            raise ImportError("no module named pymongo")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _blocked_import)
+
+    from gantry.nosql.adapters.mongodb import MongoAdapter
+
+    with pytest.raises(ImportError, match='pip install "data-gantry\\[mongodb\\]"'):
+        MongoAdapter(_nosql_target())
