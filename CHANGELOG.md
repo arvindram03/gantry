@@ -7,6 +7,33 @@ Notable changes. Dates are release dates; the format follows
 
 ### Added
 
+- **Verification evidence.** Every governed run now carries a serializable
+  record of what Gantry observed while deciding: `result.evidence`. Three
+  sources kept apart because they are trusted differently — the engine's
+  account of its own execution, measurements Gantry took at the destination,
+  and what the control plane was configured to require. `EvidenceBundle`,
+  `Observation` and `ObservationSource` are on the top-level namespace.
+- **Durable run records.** `gantry.runs.record(result.evidence)` persists a
+  run; `gantry.runs.get(run_id)` reads it back in another process, and
+  `run.render()` lays it out for a person. SQLite-backed by default, in memory
+  until a caller configures a store, because writing a file into someone's
+  working directory on import is not a default worth having.
+- `gantry.verify.null_rate(column=..., max=...)`, measured at the destination
+  by the provider. This is the check `row_count` cannot stand in for: a query
+  that runs, produces the expected number of rows, and joins wrongly, so the
+  column everything downstream keys on is null in most of them.
+- `CheckResult.source` and `CheckResult.supported`, so a check says where its
+  observation came from and whether it could be evaluated at all.
+
+### Changed
+
+- A check the provider cannot evaluate now fails as
+  `FailureKind.UNSUPPORTED_VERIFICATION` rather than an ordinary verification
+  failure. Both reject — an unmeasured bound is not a bound — but "I could not
+  measure this" is a gap in the provider and "I measured it and it was wrong"
+  is a problem with the data, and they call for different fixes.
+- `VerificationResult` exposes `failed_checks` and `unsupported_checks`.
+
 - **Materialization for PostgreSQL, Neon and Supabase.** `db.materialize(...)`
   was refused on those providers with "adapter does not support CREATE TABLE
   AS" — not because PostgreSQL lacked anything, but because the adapter never

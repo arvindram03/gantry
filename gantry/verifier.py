@@ -26,6 +26,22 @@ class CheckResult:
     actual: object | None = None
     message: str | None = None
     metadata: Mapping[str, object] = field(default_factory=dict)
+    supported: bool = True
+    """Whether the provider could evaluate this check at all.
+
+    A check that could not be evaluated fails, because a bound nobody measured
+    is not a bound. But "the destination had no rows" and "I could not count
+    the rows" are different facts, and collapsing them hides the second — which
+    is a gap in the provider, not in the data.
+    """
+
+    source: str | None = None
+    """Where the observation behind this check came from — `postgres`, `flink`.
+
+    A check that passed against the engine's own account of itself is weaker
+    evidence than one measured at the destination, and a reader cannot tell
+    which they have unless the result says.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +56,22 @@ class VerificationResult:
     ok: bool
     checks: tuple[CheckResult, ...] = ()
     metadata: Mapping[str, object] = field(default_factory=dict)
+
+    @property
+    def failed_checks(self) -> tuple[CheckResult, ...]:
+        """The checks that decided against acceptance, for a caller to act on."""
+        return tuple(check for check in self.checks if not check.ok)
+
+    @property
+    def unsupported_checks(self) -> tuple[CheckResult, ...]:
+        """Checks the provider could not evaluate.
+
+        Separate from `failed_checks` because the remedy is different: a failed
+        check means fix the data or the query, an unsupported one means this
+        provider cannot answer the question and something has to change about
+        the policy or the backend.
+        """
+        return tuple(check for check in self.checks if not check.supported)
 
     @classmethod
     def passed(cls, *checks: CheckResult) -> VerificationResult:

@@ -292,6 +292,14 @@ class SQLConnection:
             include_row_count=include_row_count,
         )
 
+    def _materialization_adapter(self) -> SQLAdapter:
+        """The native adapter, for observations beyond `inspect_table`.
+
+        Kept private: an agent tool must not reach the driver, and this is the
+        only reason anything outside the connection needs it.
+        """
+        return self._adapter
+
     def _bridge(self, policy: SQLPolicy) -> SQLExecutionAdapter:
         return SQLExecutionAdapter(self._adapter, self._dialect, self._target, policy)
 

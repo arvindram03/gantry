@@ -6,9 +6,10 @@ from __future__ import annotations
 import asyncio
 import importlib
 import re
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from datetime import UTC, datetime
+from decimal import Decimal
 from types import ModuleType
 from typing import Protocol, cast
 from urllib.parse import urlsplit
@@ -195,6 +196,48 @@ class PostgresAdapter:
         finally:
             await connection.close()
         return Table(reference.name, schema, catalog, columns, kind=kind, metadata=metadata)
+
+    async def column_null_rates(
+        self,
+        reference: TableRef,
+        target: SQLTarget,
+        columns: Sequence[str],
+    ) -> Mapping[str, float]:
+        """Measure how often each column is null, in one pass over the table.
+
+        One aggregate per column in a single statement rather than a query
+        each: the scan is the expensive part, and doing it once bounds what
+        verification costs on a large destination.
+        """
+        if not columns:
+            return {}
+        schema = reference.schema or "public"
+        projections = ", ".join(
+            f"AVG(CASE WHEN {_quoted(column)} IS NULL THEN 1.0 ELSE 0.0 END)" for column in columns
+        )
+        connection = await self._open()
+        try:
+            rows = await connection.fetch(
+                f"SELECT {projections} FROM {_quoted(schema)}.{_quoted(reference.name)}"
+            )
+        finally:
+            await connection.close()
+        if not rows:
+            return {}
+        # An empty table has no rows to be null in, and AVG returns NULL. Zero
+        # would claim a measurement that was not taken, so it is left out and
+        # the check reports itself unsupported.
+        rates: dict[str, float] = {}
+        for column, value in zip(columns, rows[0], strict=False):
+            # AVG over numeric comes back as Decimal from asyncpg, not float.
+            # Excluding it produced an empty measurement, which read downstream
+            # as "this provider cannot measure null rates" — a wrong answer that
+            # still failed closed, and so was easy to miss.
+            if isinstance(value, Decimal) or (
+                isinstance(value, (int, float)) and not isinstance(value, bool)
+            ):
+                rates[column] = float(value)
+        return rates
 
     async def validate(
         self,
