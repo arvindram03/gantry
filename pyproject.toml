@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "Apache-2.0" }
 dependencies = []
-keywords = ["sql", "agents", "llm", "governance", "flink", "duckdb", "postgres", "mysql"]
+keywords = ["sql", "agents", "llm", "governance", "flink", "duckdb", "postgres", "mysql", "mongodb"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -32,6 +32,7 @@ duckdb = ["duckdb>=1.1"]
 mysql = ["aiomysql>=0.2"]
 bigquery = ["google-cloud-bigquery>=3.25"]
 snowflake = ["snowflake-connector-python>=3.12"]
+mongodb = ["pymongo>=4.9"]
 all-sql = [
     "aiomysql>=0.2",
     "asyncpg>=0.30",

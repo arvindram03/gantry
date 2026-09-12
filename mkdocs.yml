@@ -51,6 +51,7 @@ nav:
   - Home: index.md
   - Guides:
       - SQL: sql.md
+      - NoSQL: nosql.md
       - Policies: policy.md
       - Materialization: materialization.md
       - Flink backends: flink.md
