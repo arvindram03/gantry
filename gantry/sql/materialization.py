@@ -17,11 +17,14 @@ from gantry.execution import Execution
 from gantry.failure import Failure, FailureKind
 from gantry.handle import ExecutionHandle
 from gantry.output import OutputKind, OutputRef
+from gantry.policy.evaluator import evaluate
+from gantry.policy.request import PolicyRequest
 from gantry.result import ResultStatus
 from gantry.runs.lifecycle import RunRecorder
 from gantry.runs.model import OperationKind, ResourceRef, Run
 from gantry.runs.status import RunStatus
 from gantry.runtime import SubmissionError
+from gantry.sql.inspection import materialize_request
 from gantry.sql.policy import SQLPolicy
 from gantry.sql.schema import Table
 from gantry.sql.target import SQLTarget
@@ -586,6 +589,24 @@ class SQLMaterializer:
             proposal=body,
             agent_verification=tuple(type(check).__name__ for check in verify),
         )
+
+        # Authority first, and from the parsed plan rather than the proposal's
+        # own description of itself. A refusal here means nothing was submitted.
+        try:
+            request = self._policy_request(proposal)
+        except MaterializationError as error:
+            return recorder.rejected(
+                (error.failure.message,), status=RunStatus.POLICY_REJECTED
+            ).with_failure(error.failure)
+        except (TypeError, ValueError) as error:
+            return _refuse(recorder, error, RunStatus.POLICY_REJECTED)
+        decision = None
+        if self._connection.policy is not None:
+            decision = evaluate(self._connection.policy, request)
+            if not decision.allowed:
+                return recorder.policy_rejected(decision, request)
+        recorder.admitted(request=request, decision=decision)
+
         try:
             handle = await self.submit(proposal, verify=verify)
         except VerificationUnsupported as error:
@@ -602,12 +623,6 @@ class SQLMaterializer:
             return _refuse(recorder, error, RunStatus.POLICY_REJECTED)
 
         plan = self._plans.get(handle.gantry_id)
-        recorder.admitted(
-            inputs=tuple(
-                ResourceRef(system=self._connection.provider, resource=source.qualified_name)
-                for source in (plan.sources if plan is not None else ())
-            )
-        )
         recorder.running(handle)
         result = await self.wait(handle, poll_interval_seconds=0.05)
         if result.status is ResultStatus.VERIFICATION_UNSUPPORTED:
@@ -827,6 +842,21 @@ class SQLMaterializer:
         except Exception:
             return table
         return replace(table, metadata={**table.metadata, "null_rates": dict(rates)})
+
+    def _policy_request(self, proposal: str | MaterializationProposal) -> PolicyRequest:
+        """The normalized request for one materialization proposal.
+
+        Parsing is what determines the destination, so a proposal that will not
+        parse has no determinable effect — reported as unresolved rather than
+        guessed at.
+        """
+        plan = self.inspect(proposal)
+        return materialize_request(
+            provider=self._connection.provider,
+            sources=[source.qualified_name for source in plan.sources],
+            destination=plan.destination.qualified_name,
+            policy=self._sql_policy(),
+        )
 
     def _sql_policy(self) -> SQLPolicy:
         return SQLPolicy(

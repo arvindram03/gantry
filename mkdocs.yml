@@ -59,6 +59,7 @@ nav:
   - API reference:
       - Overview: api/index.md
       - SQL: api/sql.md
+      - Policy: api/policy.md
       - Results and outputs: api/results.md
       - Evidence and runs: api/evidence.md
       - Runs: api/runs.md

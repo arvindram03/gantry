@@ -71,6 +71,7 @@ class ActorRef:
 UNKNOWN_ACTOR = ActorRef()
 
 _current: ContextVar[ActorRef] = ContextVar("gantry_actor", default=UNKNOWN_ACTOR)
+_environment: ContextVar[str | None] = ContextVar("gantry_environment", default=None)
 
 
 def actor(
@@ -90,17 +91,32 @@ def actor(
 
 
 @contextmanager
-def context(*, actor: ActorRef) -> Iterator[ActorRef]:
-    """Attribute every run inside the block to one actor.
+def context(*, actor: ActorRef | None = None, environment: str | None = None) -> Iterator[ActorRef]:
+    """Establish the trusted context every run inside the block is judged in.
 
-    A context variable rather than a global: concurrent requests in one process
-    each keep their own caller, which a module-level assignment would not.
+    Both facts come from the host application and neither is reachable from a
+    proposal: an agent that could name its own actor could name someone else's,
+    and one that could name its own environment could call production staging.
+
+    Context variables rather than globals: concurrent requests in one process
+    each keep their own caller and environment, which a module-level assignment
+    would not.
     """
-    token = _current.set(actor)
+    if actor is None and environment is None:
+        raise ValueError("a trusted context must set an actor, an environment, or both")
+    if environment is not None and not environment.strip():
+        raise ValueError("environment must not be empty when given")
+    actor_token = None if actor is None else _current.set(actor)
+    environment_token = (
+        None if environment is None else _environment.set(environment.strip().lower())
+    )
     try:
-        yield actor
+        yield actor or _current.get()
     finally:
-        _current.reset(token)
+        if environment_token is not None:
+            _environment.reset(environment_token)
+        if actor_token is not None:
+            _current.reset(actor_token)
 
 
 def current_actor() -> ActorRef:
@@ -108,4 +124,21 @@ def current_actor() -> ActorRef:
     return _current.get()
 
 
-__all__ = ["UNKNOWN_ACTOR", "ActorRef", "ActorType", "actor", "context", "current_actor"]
+def current_environment() -> str | None:
+    """The environment label in scope, or `None` when the application set none.
+
+    `None` is not `dev`. A library that assumed a default would let a policy
+    scoped to `prod` quietly stop applying in the one place it was written for.
+    """
+    return _environment.get()
+
+
+__all__ = [
+    "UNKNOWN_ACTOR",
+    "ActorRef",
+    "ActorType",
+    "actor",
+    "context",
+    "current_actor",
+    "current_environment",
+]

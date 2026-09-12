@@ -18,8 +18,10 @@ from datetime import UTC, datetime
 
 from gantry.actor import ActorRef, current_actor
 from gantry.evidence import EvidenceBundle
-from gantry.failure import Failure
+from gantry.failure import Failure, FailureKind
 from gantry.handle import ExecutionHandle
+from gantry.policy.decision import PolicyDecision
+from gantry.policy.request import PolicyRequest
 from gantry.result import ResultStatus
 from gantry.runs.model import (
     AdmissionRecord,
@@ -84,6 +86,8 @@ class RunRecorder:
         status: RunStatus,
         verification: VerificationResult | None = None,
         evidence: EvidenceBundle | None = None,
+        decision: PolicyDecision | None = None,
+        request: PolicyRequest | None = None,
     ) -> Run:
         """Refused: by policy, by a contradictory contract, or by a check.
 
@@ -94,16 +98,49 @@ class RunRecorder:
         """
         return self._save(
             status,
-            admission=AdmissionRecord(allowed=False, reasons=tuple(reasons)),
+            admission=admission_record(False, reasons=reasons, decision=decision, request=request),
             **({"verification": verification} if verification is not None else {}),
             **({"evidence": evidence} if evidence is not None else {}),
         )
 
-    def admitted(self, *, inputs: Sequence[ResourceRef] = ()) -> Run:
+    def policy_rejected(self, decision: PolicyDecision, request: PolicyRequest) -> Run:
+        """Refused by policy. Nothing external happens after this.
+
+        The one exit shared by every provider, so that a denial looks the same
+        whichever engine was about to be asked — the structured decision on the
+        run, a `POLICY_REJECTED` failure on the returned object, and no
+        submission.
+        """
+        reasons = decision.messages() or ("the policy allows nothing for this request",)
+        return self.rejected(
+            reasons,
+            status=RunStatus.POLICY_REJECTED,
+            decision=decision,
+            request=request,
+        ).with_failure(Failure(FailureKind.POLICY_REJECTED, False, "; ".join(reasons)))
+
+    def admitted(
+        self,
+        *,
+        inputs: Sequence[ResourceRef] = (),
+        decision: PolicyDecision | None = None,
+        request: PolicyRequest | None = None,
+    ) -> Run:
+        """Authorized. Records which policy said so, not only that something did.
+
+        An allow that keeps no trace is indistinguishable later from an
+        operation nobody checked, so the policy name, its version and the rules
+        that matched are written here even when the answer was yes.
+
+        Inputs are recorded; outputs are not. A destination that was authorized
+        is not a destination that exists, and `run.outputs` means what the run
+        produced. What it intended to produce is in the admission request,
+        where it cannot be mistaken for a table someone can go and read.
+        """
         return self._save(
             self.run.status,
-            admission=AdmissionRecord(allowed=True),
-            inputs=tuple(inputs),
+            admission=admission_record(True, decision=decision, request=request),
+            inputs=tuple(inputs) or (() if request is None else tuple(request.inputs)),
         )
 
     def running(self, handle: ExecutionHandle | None) -> Run:
@@ -214,6 +251,8 @@ def run_from_evidence(
     result_ref: QueryResultRef | None = None,
     metrics: Mapping[str, object] | None = None,
     failure: Failure | None = None,
+    decision: PolicyDecision | None = None,
+    request: PolicyRequest | None = None,
 ) -> Run | None:
     """Record a terminal run for an operation that reports once, at the end.
 
@@ -239,6 +278,11 @@ def run_from_evidence(
         else None,
         inputs=tuple(ResourceRef(system=engine, resource=name) for name in evidence.inputs),
     )
+    if request is not None:
+        # The policy decision that let this run happen. Recorded even though the
+        # run is written once, because "allowed by nothing in particular" and
+        # "allowed by data-agents v3" are different facts about the same run.
+        recorder.admitted(request=request, decision=decision)
     if status is ResultStatus.VERIFICATION_UNSUPPORTED:
         return recorder.rejected(
             ("a required check could not be evaluated",),
@@ -267,3 +311,28 @@ def run_from_evidence(
 
 
 __all__ = ["RunRecorder", "run_from_evidence"]
+
+
+def admission_record(
+    allowed: bool,
+    *,
+    reasons: Sequence[str] = (),
+    decision: PolicyDecision | None = None,
+    request: PolicyRequest | None = None,
+) -> AdmissionRecord:
+    """One admission record, whether a reusable policy decided or not.
+
+    Operations configured only with their own constraints produce a record with
+    no policy name — which is the truth about them, and reads differently from
+    a policy that allowed the work.
+    """
+    combined = tuple(dict.fromkeys((*reasons, *(decision.messages() if decision else ()))))
+    return AdmissionRecord(
+        allowed=allowed,
+        reasons=combined,
+        policy=None if decision is None else decision.policy,
+        policy_hash=None if decision is None else decision.policy_version,
+        matched_rules=() if decision is None else decision.matched_rules,
+        codes=() if decision is None else decision.codes,
+        request=None if request is None else request.as_dict(),
+    )

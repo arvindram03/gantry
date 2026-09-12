@@ -149,18 +149,38 @@ class QueryResultRef:
 
 @dataclass(frozen=True, slots=True)
 class AdmissionRecord:
-    """Gantry's authority decision, and what it rested on."""
+    """Gantry's authority decision, and what it rested on.
+
+    `policy` and `policy_hash` name the exact configuration that decided, so a
+    run stays explainable after the policy changes: v0 never re-evaluates work
+    that was already admitted, and a record that pointed at "the policy" rather
+    than at one version of it would quietly start lying the next time someone
+    edited a rule.
+
+    `request` is the normalized question — actor, operation, engine, inputs,
+    outputs, environment — as provider inspection derived it, not as the
+    proposal described itself. `codes` are the machine-readable reasons;
+    `reasons` the same thing in a sentence.
+    """
 
     allowed: bool
     reasons: tuple[str, ...] = ()
+    policy: str | None = None
     policy_hash: str | None = None
+    matched_rules: tuple[str, ...] = ()
+    codes: tuple[str, ...] = ()
+    request: Mapping[str, object] | None = None
     decided_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     def as_dict(self) -> dict[str, object]:
         return {
             "allowed": self.allowed,
             "reasons": list(self.reasons),
+            "policy": self.policy,
             "policy_hash": self.policy_hash,
+            "matched_rules": list(self.matched_rules),
+            "codes": list(self.codes),
+            "request": None if self.request is None else dict(self.request),
             "decided_at": self.decided_at.isoformat(),
         }
 
@@ -406,10 +426,7 @@ def render(run: Run) -> str:
         lines.extend(["Result", f"  {run.result_ref.rows} rows{suffix}", ""])
 
     if run.admission is not None:
-        mark = "✓ allowed" if run.admission.allowed else "✗ refused"
-        lines.extend(["Admission", f"  {mark}"])
-        lines.extend(f"      {reason}" for reason in run.admission.reasons)
-        lines.append("")
+        lines.extend(["Admission", *_admission_lines(run.admission), ""])
 
     if run.execution is not None:
         lines.extend(["Execution", f"  {run.execution.status}"])
@@ -441,6 +458,44 @@ def render(run: Run) -> str:
 
     lines.extend(["Decision", f"  {run.status.value}"])
     return "\n".join(lines)
+
+
+def _admission_lines(admission: AdmissionRecord) -> list[str]:
+    """The admission block: which policy, which resources, which codes.
+
+    Resource-by-resource, because that is the granularity the decision was made
+    at. A reader looking at a refusal wants to know which table was the problem,
+    not that one of six was.
+    """
+    lines = [f"  {'✓ allowed' if admission.allowed else '✗ refused'}"]
+    if admission.policy is not None:
+        lines.append(f"  policy: {admission.policy}")
+    request = admission.request or {}
+    refused = {str(reason) for reason in admission.reasons}
+    denied_resources = {
+        resource for resource in _resource_names(request) if _named_in(resource, refused)
+    }
+    for verb, key in (("read", "inputs"), ("write", "outputs")):
+        for resource in _sequence_of_str(request.get(key)):
+            mark = "✗" if resource in denied_resources else "✓"
+            lines.append(f"    {mark} {verb} {resource}")
+    lines.extend(f"    {code}" for code in admission.codes)
+    lines.extend(f"      {reason}" for reason in admission.reasons)
+    return lines
+
+
+def _resource_names(request: Mapping[str, object]) -> tuple[str, ...]:
+    return (*_sequence_of_str(request.get("inputs")), *_sequence_of_str(request.get("outputs")))
+
+
+def _sequence_of_str(value: object) -> tuple[str, ...]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return ()
+    return tuple(str(item) for item in value)
+
+
+def _named_in(resource: str, reasons: set[str]) -> bool:
+    return any(resource in reason for reason in reasons)
 
 
 def _scalar(value: object) -> str:

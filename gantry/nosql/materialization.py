@@ -15,11 +15,15 @@ from gantry.failure import Failure, FailureKind
 from gantry.handle import ExecutionHandle
 from gantry.metrics import ExecutionMetrics
 from gantry.nosql.capabilities import NoSQLCapabilities
+from gantry.nosql.inspection import materialize_request
 from gantry.nosql.pipeline import CollectionRef, Pipeline, classify_pipeline
 from gantry.nosql.policy import NoSQLPolicy
 from gantry.nosql.result import NoSQLResult
 from gantry.nosql.verify import CollectionSnapshot, DocumentCheck
 from gantry.output import OutputKind, OutputRef
+from gantry.policy.evaluator import evaluate
+from gantry.policy.model import Policy
+from gantry.policy.request import PolicyRequest
 from gantry.result import ResultStatus
 from gantry.runs.model import Run
 from gantry.runs.status import RunStatus
@@ -151,6 +155,15 @@ class MaterializationError(Exception):
 
 class _MaterializerConnection(Protocol):
     def capabilities(self) -> NoSQLCapabilities: ...
+
+    @property
+    def provider(self) -> str: ...
+
+    @property
+    def policy(self) -> Policy | None: ...
+
+    @property
+    def database(self) -> str | None: ...
 
     async def submit(
         self,
@@ -391,6 +404,26 @@ class NoSQLMaterializer:
         *,
         verify: Sequence[DocumentCheck] = (),
     ) -> Run:
+        # Authority first, from the classified pipeline. A refusal here means
+        # nothing was submitted to MongoDB.
+        try:
+            request = self._policy_request(collection, pipeline)
+        except (TypeError, ValueError) as error:
+            return _refuse(error, RunStatus.POLICY_REJECTED)
+        except MaterializationError as error:
+            return _refuse(error.failure.message, RunStatus.POLICY_REJECTED, error.failure)
+        decision = None
+        if self._connection.policy is not None:
+            decision = evaluate(self._connection.policy, request)
+            if not decision.allowed:
+                from gantry.runs.lifecycle import RunRecorder
+                from gantry.runs.model import OperationKind
+
+                recorder = RunRecorder(
+                    kind=OperationKind.MATERIALIZE, engine="mongodb", provider="mongodb"
+                )
+                return recorder.policy_rejected(decision, request)
+
         try:
             handle = await self.submit(collection, pipeline, verify=verify)
         except VerificationUnsupported as error:
@@ -425,6 +458,22 @@ class NoSQLMaterializer:
         except VerificationInputError as error:
             return _refuse(error, RunStatus.POLICY_REJECTED)
         return await self(collection, pipeline, verify=checks)  # type: ignore[arg-type]
+
+    def _policy_request(self, collection: str, pipeline: Pipeline) -> PolicyRequest:
+        """The normalized request for one materialization, from its plan.
+
+        `inspect` is what determines the destination and the collections a
+        `$lookup` reaches, so a pipeline it refuses has no determinable effect
+        and is refused here too.
+        """
+        plan = self.inspect(collection, pipeline)
+        return materialize_request(
+            provider=self._connection.provider,
+            database=self._connection.database,
+            sources=plan.sources,
+            destination=plan.destination,
+            policy=self._nosql_policy(),
+        )
 
     async def _admit(self, plan: MaterializationPlan) -> None:
         capabilities = self._connection.capabilities()

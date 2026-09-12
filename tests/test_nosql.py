@@ -421,14 +421,31 @@ async def test_query_tool_exposes_collection_and_pipeline_only() -> None:
 
 class _FakeMaterializeConnection:
     def __init__(
-        self, *, capabilities: NoSQLCapabilities, snapshot: CollectionSnapshot | None
+        self,
+        *,
+        capabilities: NoSQLCapabilities,
+        snapshot: CollectionSnapshot | None,
+        policy: gantry.Policy | None = None,
     ) -> None:
         self._capabilities = capabilities
         self._snapshot = snapshot
+        self._policy = policy
         self.submit_calls: list[tuple[str, object, NoSQLPolicy | None]] = []
 
     def capabilities(self) -> NoSQLCapabilities:
         return self._capabilities
+
+    @property
+    def provider(self) -> str:
+        return "mongodb"
+
+    @property
+    def policy(self) -> gantry.Policy | None:
+        return self._policy
+
+    @property
+    def database(self) -> str | None:
+        return "analytics"
 
     async def submit(
         self,

@@ -460,3 +460,94 @@ async def test_a_run_is_readable_from_another_process_with_only_its_id(
     finally:
         reader.close()
     await _raw_execute("DROP TABLE IF EXISTS reporting.evidence_probe")
+
+
+async def _tables(schema: str) -> set[str]:
+    """What PostgreSQL itself says exists, through a connection Gantry never saw."""
+    import importlib
+
+    asyncpg = importlib.import_module("asyncpg")
+    connection = await asyncpg.connect(URL, timeout=5)
+    try:
+        rows = await connection.fetch(
+            "SELECT tablename FROM pg_tables WHERE schemaname = $1", schema
+        )
+    finally:
+        await connection.close()
+    return {str(row["tablename"]) for row in rows}
+
+
+async def test_a_policy_refusal_never_reaches_postgres() -> None:
+    """A denied materialization leaves no table, and a denied read runs nothing.
+
+    Asserted against `pg_tables` rather than against the run: the run could be
+    wrong about this in a way no assertion on the run would catch, and the
+    table either exists in the database or it does not.
+    """
+    from gantry.actor import actor, context
+
+    pytest.importorskip("asyncpg")
+    if not await _reachable():
+        require_live_or_skip(f"no PostgreSQL at {URL}")
+    await _raw_execute(
+        "CREATE SCHEMA IF NOT EXISTS policy_raw",
+        "CREATE SCHEMA IF NOT EXISTS policy_scratch",
+        "CREATE SCHEMA IF NOT EXISTS policy_prod",
+        "DROP TABLE IF EXISTS policy_raw.invoices",
+        "DROP TABLE IF EXISTS policy_scratch.totals",
+        "DROP TABLE IF EXISTS policy_prod.totals",
+        "CREATE TABLE policy_raw.invoices (customer_id int, balance int)",
+        "INSERT INTO policy_raw.invoices VALUES (1, 10), (2, 20)",
+    )
+
+    policy = gantry.Policy(
+        name="agent-materialization",
+        rules=[
+            gantry.allow.query(actors=["etl-agent"], sources=["policy_raw.*"]),
+            gantry.allow.materialize(
+                actors=["etl-agent"],
+                sources=["policy_raw.*"],
+                destinations=["policy_scratch.*"],
+            ),
+            gantry.deny.materialize(destinations=["policy_prod.*"]),
+        ],
+    )
+    db = gantry.sql.connect(PROVIDER, url=URL, policy=policy)
+    query = db.query(schemas=["policy_raw", "policy_prod"], max_rows=10, timeout=15)
+    materialize = db.materialize(
+        sources=["policy_raw.*"],
+        destinations=["policy_scratch.*", "policy_prod.*"],
+        timeout=60,
+    )
+    body = (
+        "SELECT customer_id, SUM(balance) AS balance FROM policy_raw.invoices GROUP BY customer_id"
+    )
+
+    with context(actor=actor("agent", "etl-agent"), environment="prod"):
+        read = await query("SELECT customer_id FROM policy_raw.invoices")
+        allowed = await materialize(f"CREATE TABLE policy_scratch.totals AS {body}")
+        refused = await materialize(f"CREATE TABLE policy_prod.totals AS {body}")
+    with context(actor=actor("agent", "rogue-agent")):
+        wrong_actor = await query("SELECT customer_id FROM policy_raw.invoices")
+
+    # The engine's own state first: it is the claim the rest of the run only
+    # describes, and a record can be wrong about it in a way no assertion on the
+    # record would catch.
+    assert await _tables("policy_scratch") == {"totals"}
+    assert await _tables("policy_prod") == set(), "a denied write must leave nothing behind"
+
+    assert read.status is RunStatus.ACCEPTED
+    assert read.admission is not None
+    assert read.admission.policy == "agent-materialization"
+    assert read.admission.policy_hash == policy.version
+
+    assert allowed.status is RunStatus.ACCEPTED
+    assert refused.status is RunStatus.POLICY_REJECTED
+    assert refused.execution is None
+    assert refused.admission is not None
+    assert refused.admission.codes == ("DESTINATION_DENIED",)
+
+    assert wrong_actor.status is RunStatus.POLICY_REJECTED
+    assert wrong_actor.execution is None
+    assert wrong_actor.admission is not None
+    assert wrong_actor.admission.codes == ("ACTOR_DENIED",)

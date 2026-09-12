@@ -8,6 +8,7 @@ from collections.abc import Collection, Mapping, Sequence
 from gantry.flink.api import FlinkRuntime, connect_runtime
 from gantry.flink.operation import FlinkStreamJob
 from gantry.flink.verification import FlinkHealthCheck
+from gantry.policy.model import Policy
 from gantry.stream.capabilities import StreamCapabilities
 
 
@@ -57,9 +58,12 @@ def connect(
     *,
     endpoint: str,
     config: Mapping[str, object] | None = None,
+    policy: Policy | None = None,
     **options: object,
 ) -> StreamConnection:
     normalized = provider.strip().lower()
     if normalized != "flink":
         raise ValueError(f"unsupported stream provider: {provider}")
-    return StreamConnection(normalized, connect_runtime(endpoint, config=config, **options))
+    return StreamConnection(
+        normalized, connect_runtime(endpoint, config=config, policy=policy, **options)
+    )

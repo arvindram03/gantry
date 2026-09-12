@@ -17,6 +17,7 @@ from gantry.handle import ExecutionHandle
 from gantry.nosql.adapter import NoSQLAdapter
 from gantry.nosql.bridge import NoSQLExecutionAdapter
 from gantry.nosql.capabilities import NoSQLCapabilities
+from gantry.nosql.inspection import query_request
 from gantry.nosql.materialization import (
     MaterializationAdapter,
     MaterializationPolicy,
@@ -31,6 +32,8 @@ from gantry.nosql.result import NoSQLResult
 from gantry.nosql.target import NoSQLTarget
 from gantry.nosql.verify import CollectionSnapshot, DocumentCheck
 from gantry.output import OutputKind, OutputRef
+from gantry.policy.evaluator import evaluate
+from gantry.policy.model import Policy
 from gantry.result import Result, ResultStatus
 from gantry.runs.model import Run
 from gantry.runs.status import RunStatus
@@ -47,14 +50,32 @@ class NoSQLConnection:
     cannot accidentally expose credentials or a raw database handle.
     """
 
-    def __init__(self, target: NoSQLTarget, adapter: NoSQLAdapter) -> None:
+    def __init__(
+        self, target: NoSQLTarget, adapter: NoSQLAdapter, policy: Policy | None = None
+    ) -> None:
         self._target = target
         self._adapter = adapter
+        self._policy = policy
         self._plane = ControlPlane()
 
     @property
     def provider(self) -> str:
         return self._target.provider
+
+    @property
+    def policy(self) -> Policy | None:
+        """The reusable policy this connection admits against, if any."""
+        return self._policy
+
+    @property
+    def database(self) -> str | None:
+        """The database every collection on this connection belongs to.
+
+        Policy names a MongoDB resource `database.collection`, so the half the
+        connection knows has to come from here rather than from the proposal.
+        """
+        database = self._target.config.get("database")
+        return database if isinstance(database, str) and database.strip() else None
 
     def capabilities(self) -> NoSQLCapabilities:
         return self._adapter.capabilities()
@@ -130,6 +151,29 @@ class NoSQLConnection:
 
         verifiers = tuple(check for check in trusted_verify if isinstance(check, Verifier))
         trusted_checks = tuple(check for check in trusted_verify if not isinstance(check, Verifier))
+
+        # Authority, before the pipeline reaches the driver. `$lookup` and
+        # `$out` are resolved out of the pipeline, so a stage that reads or
+        # writes somewhere unauthorized is refused rather than executed.
+        request = query_request(
+            collection,
+            pipeline,
+            provider=self.provider,
+            database=self.database,
+            policy=policy,
+        )
+        decision = None
+        if self._policy is not None:
+            decision = evaluate(self._policy, request)
+            if not decision.allowed:
+                from gantry.runs.lifecycle import RunRecorder
+                from gantry.runs.model import OperationKind
+
+                recorder = RunRecorder(
+                    kind=OperationKind.QUERY, engine="mongodb", provider=self.provider
+                )
+                return recorder.policy_rejected(decision, request)
+
         raw = await self._execute_result(
             collection, pipeline, policy=policy, context=context, verify=verifiers
         )
@@ -166,6 +210,8 @@ class NoSQLConnection:
             verification=response.verification,
             handle=response.handle,
             inline=response.inline,
+            decision=decision,
+            request=request,
             result_ref=None
             if response.inline is None
             else QueryResultRef(
@@ -490,10 +536,16 @@ def _query_evidence(
     )
 
 
-def connect(provider: str, **config: object) -> NoSQLConnection:
-    """Resolve a provider preset and create a governed NoSQL connection."""
+def connect(provider: str, *, policy: Policy | None = None, **config: object) -> NoSQLConnection:
+    """Resolve a provider preset and create a governed NoSQL connection.
 
+    `policy` attaches a reusable policy to everything this connection runs, on
+    top of the per-operation constraints.
+    """
+
+    if policy is not None and not isinstance(policy, Policy):
+        raise TypeError("policy must be a gantry.Policy")
     entry = resolve_provider(provider)
     entry.validate_config(config)
     target = NoSQLTarget(provider, entry.driver, config)
-    return NoSQLConnection(target, entry.adapter_factory(target))
+    return NoSQLConnection(target, entry.adapter_factory(target), policy=policy)

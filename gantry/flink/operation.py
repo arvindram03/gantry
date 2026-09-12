@@ -17,9 +17,12 @@ from gantry.failure import Failure, FailureKind
 from gantry.flink.api import FlinkRuntime
 from gantry.flink.artifact import FlinkMode, FlinkSQLArtifact
 from gantry.flink.execution import FlinkResult, StreamingHealth
+from gantry.flink.inspection import job_request
 from gantry.flink.metrics import FlinkMetrics
 from gantry.flink.verification import FlinkHealthCheck
 from gantry.handle import ExecutionHandle
+from gantry.policy.evaluator import evaluate
+from gantry.policy.request import PolicyRequest
 from gantry.result import ResultStatus
 from gantry.runs.lifecycle import RunRecorder
 from gantry.runs.model import OperationKind, ResourceRef, Run
@@ -243,6 +246,25 @@ class FlinkJob:
             proposal=sql if isinstance(sql, str) else None,
             agent_verification=tuple(type(check).__name__ for check in verify),
         )
+        # Authority before submission. A Flink job that has been submitted is
+        # already running somewhere, so this is the last point at which a
+        # refusal costs nothing.
+        try:
+            request = self._policy_request(sql)
+        except (FlinkJobError, TypeError, ValueError) as error:
+            failure = error.failure if isinstance(error, FlinkJobError) else None
+            if failure is not None:
+                return recorder.rejected(
+                    (failure.message,), status=RunStatus.POLICY_REJECTED
+                ).with_failure(failure)
+            return _refuse(recorder, error, RunStatus.POLICY_REJECTED)
+        decision = None
+        if self._runtime.policy is not None:
+            decision = evaluate(self._runtime.policy, request)
+            if not decision.allowed:
+                return recorder.policy_rejected(decision, request)
+        recorder.admitted(request=request, decision=decision)
+
         try:
             handle = await self.submit(sql, context=context, verify=verify)
         except VerificationUnsupported as error:
@@ -338,6 +360,20 @@ class FlinkJob:
             for check in self._checks
         ):
             raise TypeError("batch checks must be Flink job or output checks")
+
+    def _policy_request(self, sql: str) -> PolicyRequest:
+        """The normalized request for one Flink job, from its parsed plan."""
+        plan = self.inspect(sql)
+        return job_request(
+            kind=OperationKind.STREAM if self._kind is FlinkJobKind.STREAM else OperationKind.BATCH,
+            inputs=plan.inputs,
+            output=plan.output,
+            catalog=self._runtime.default_catalog,
+            database=self._runtime.default_database,
+            constraints=(
+                {} if self._timeout is None else {"timeout_seconds": float(self._timeout)}
+            ),
+        )
 
     def _admit(self, plan: FlinkJobPlan) -> None:
         if (

@@ -21,6 +21,7 @@ from gantry.flink.verification import FlinkHealthCheck, JobRunning, verify_healt
 from gantry.handle import ExecutionHandle
 from gantry.output import OutputRef
 from gantry.policy import PolicyRequirements
+from gantry.policy.model import Policy
 from gantry.result import ResultStatus
 from gantry.runtime import ControlPlane, SubmissionError
 from gantry.sql.schema import Table
@@ -31,15 +32,34 @@ from gantry.verifier import VerificationResult
 class FlinkRuntime:
     """Internal credential-isolating runtime for an existing Flink cluster."""
 
-    def __init__(self, target: FlinkTarget, adapter: FlinkAdapter | None = None) -> None:
+    def __init__(
+        self,
+        target: FlinkTarget,
+        adapter: FlinkAdapter | None = None,
+        policy: Policy | None = None,
+    ) -> None:
         self._target = target
         self._adapter = adapter or FlinkAdapter(target)
+        self._policy = policy
         self._plane = ControlPlane(store=MemoryExecutionStore())
         self._plane.register_adapter(target.name, self._adapter)
 
     @property
     def target_name(self) -> str:
         return self._target.name
+
+    @property
+    def policy(self) -> Policy | None:
+        """The reusable policy every job on this connection is admitted against."""
+        return self._policy
+
+    @property
+    def default_catalog(self) -> str | None:
+        return _config_name(self._target, "default_catalog")
+
+    @property
+    def default_database(self) -> str | None:
+        return _config_name(self._target, "default_database")
 
     def capabilities(self) -> AdapterCapabilities:
         return self._adapter.capabilities()
@@ -287,6 +307,7 @@ def connect_runtime(
     endpoint: str,
     *,
     config: Mapping[str, object] | None = None,
+    policy: Policy | None = None,
     **options: object,
 ) -> FlinkRuntime:
     """Build the internal runtime shared by batch and stream surfaces."""
@@ -296,7 +317,15 @@ def connect_runtime(
     if overlap:
         raise ValueError(f"duplicate Flink configuration fields: {', '.join(sorted(overlap))}")
     values.update(options)
-    return FlinkRuntime(FlinkTarget(endpoint, values))
+    if policy is not None and not isinstance(policy, Policy):
+        raise TypeError("policy must be a gantry.Policy")
+    return FlinkRuntime(FlinkTarget(endpoint, values), policy=policy)
+
+
+def _config_name(target: FlinkTarget, key: str) -> str | None:
+    """One configured default, or `None` when the connection declared none."""
+    value = target.config.get(key)
+    return value.strip() if isinstance(value, str) and value.strip() else None
 
 
 def _coerce_artifact(value: FlinkSQLArtifact | str) -> FlinkSQLArtifact:

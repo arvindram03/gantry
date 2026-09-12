@@ -286,3 +286,73 @@ async def test_running_job_metrics_reach_the_health_checks(
         "a running job must report a restart count; Flink served the metrics "
         "and None here means the health path is reading the wrong object"
     )
+
+
+def _job_ids() -> set[str]:
+    """Which jobs the cluster knows about, straight from the JobManager."""
+    with urllib.request.urlopen(f"{JOBMANAGER}/jobs", timeout=10) as response:
+        payload = json.load(response)
+    return {str(job["id"]) for job in payload.get("jobs", ())}
+
+
+async def test_policy_refuses_a_stream_before_the_cluster_ever_sees_it(
+    flink: BatchConnection,
+) -> None:
+    """A submitted Flink job is already running somewhere.
+
+    This is the operation where admission matters most and where a run record
+    proves least, so the check is against the JobManager's own job list: the
+    refused sink must add no job to the cluster, and the authorized one must.
+    """
+    from gantry.actor import actor, context
+    from gantry.runs.status import RunStatus
+
+    policy = gantry.Policy(
+        name="stream-authority",
+        rules=[
+            # A JDBC catalog exposes a PostgreSQL table as one identifier with a
+            # dot in it, so these are the names as the SQL writes them.
+            gantry.allow.stream(
+                sources=[f"{DATABASE_SCHEMA}.orders"],
+                destinations=[f"{REPORTING_SCHEMA}.orders_replica"],
+            )
+        ],
+    )
+    stream = gantry.stream.connect(
+        "flink",
+        endpoint=GATEWAY,
+        jobmanager_endpoint=JOBMANAGER,
+        default_catalog=CATALOG,
+        default_database=DATABASE,
+        submission_timeout=180.0,
+        request_timeout=180.0,
+        policy=policy,
+    )
+    job = stream.job(
+        inputs=[f"{DATABASE_SCHEMA}.orders"],
+        outputs=[f"{REPORTING_SCHEMA}.orders_replica", f"{DATABASE_SCHEMA}.orders"],
+        checks=[gantry.verify.running()],
+        timeout=180,
+    )
+    select = f"SELECT order_id, customer_id, region, amount FROM `{DATABASE_SCHEMA}.orders`"
+
+    before = _job_ids()
+    with context(actor=actor("agent", "etl-agent"), environment="prod"):
+        # The sink is a table the job is configured to write but policy does not
+        # authorize, so the operation's own allow-list cannot be what stops it.
+        refused = await job(f"INSERT INTO `{DATABASE_SCHEMA}.orders` {select}")
+    after_refusal = _job_ids()
+    with context(actor=actor("agent", "etl-agent"), environment="prod"):
+        allowed = await job(f"INSERT INTO {SINK} {select}")
+    after_submission = _job_ids()
+
+    assert after_refusal == before, "a refused job must not reach the cluster"
+    assert after_submission - before, "an authorized job must still be submitted"
+
+    assert refused.status is RunStatus.POLICY_REJECTED
+    assert refused.execution is None
+    assert refused.admission is not None
+    assert refused.admission.codes == ("NO_MATCHING_ALLOW",)
+    assert allowed.admission is not None
+    assert allowed.admission.policy == "stream-authority"
+    assert allowed.admission.policy_hash == policy.version

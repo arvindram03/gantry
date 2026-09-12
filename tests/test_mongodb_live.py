@@ -297,3 +297,116 @@ async def test_required_fields_verification_fails_when_a_field_is_missing(
     assert not check.ok
     assert check.message is not None
     assert "nonexistent_field" in check.message
+
+
+async def test_policy_refuses_a_lookup_into_an_unauthorized_collection() -> None:
+    """`$lookup` reaches a collection the pipeline never names at the top level.
+
+    Authorizing only the collection the caller passed would leave the joined one
+    unchecked, which is the whole reason resources come from inspection rather
+    than from the proposal's own account of itself.
+    """
+    import importlib
+
+    from gantry.actor import actor, context
+    from gantry.runs.status import RunStatus
+
+    pytest.importorskip("pymongo")
+    if not await _reachable():
+        pytest.skip(f"no MongoDB at {URI}")
+    pymongo = importlib.import_module("pymongo")
+    client = pymongo.AsyncMongoClient(URI)
+    await client[DATABASE]["customers"].delete_many({})
+    await client[DATABASE]["customers"].insert_one({"region": "us", "name": "acme"})
+    await client.close()
+
+    policy = gantry.Policy(
+        name="orders-only",
+        rules=[gantry.allow.query(sources=[f"{DATABASE}.orders"])],
+    )
+    db = gantry.nosql.connect("mongodb", uri=URI, database=DATABASE, policy=policy)
+    query = db.query(read_only=True, collections=["orders", "customers"], max_documents=10)
+
+    with context(actor=actor("agent", "research-agent")):
+        refused = await query(
+            "orders",
+            [
+                {"$match": {"status": "open"}},
+                {
+                    "$lookup": {
+                        "from": "customers",
+                        "localField": "region",
+                        "foreignField": "region",
+                        "as": "customer",
+                    }
+                },
+            ],
+        )
+        allowed = await query("orders", [{"$match": {"status": "open"}}])
+
+    assert refused.status is RunStatus.POLICY_REJECTED
+    assert refused.execution is None
+    assert refused.documents == ()
+    assert refused.admission is not None
+    assert refused.admission.codes == ("NO_MATCHING_ALLOW",)
+    assert f"{DATABASE}.customers" in str(refused.admission.reasons)
+    assert allowed.status is RunStatus.ACCEPTED
+
+
+async def test_policy_refuses_an_out_and_mongodb_keeps_no_collection() -> None:
+    """Ask MongoDB afterwards which collections exist.
+
+    The allowed write lands and the denied one does not, which is what separates
+    a policy that refused from a run that merely reported a refusal. Run through
+    the query surface because `$out` writes there too, and a write is a write
+    whichever operation carried it.
+    """
+    import importlib
+
+    from gantry.actor import actor, context
+    from gantry.runs.status import RunStatus
+
+    pytest.importorskip("pymongo")
+    if not await _reachable():
+        pytest.skip(f"no MongoDB at {URI}")
+    pymongo = importlib.import_module("pymongo")
+    client = pymongo.AsyncMongoClient(URI)
+    for name in ("scratch_rollup", "prod_rollup"):
+        await client[DATABASE].drop_collection(name)
+
+    policy = gantry.Policy(
+        name="scratch-only",
+        rules=[
+            gantry.allow.query(
+                sources=[f"{DATABASE}.orders"], destinations=[f"{DATABASE}.scratch_*"]
+            ),
+            gantry.deny.query(destinations=[f"{DATABASE}.prod_*"]),
+        ],
+    )
+    db = gantry.nosql.connect("mongodb", uri=URI, database=DATABASE, policy=policy)
+    query = db.query(
+        read_only=False,
+        collections=["orders", "scratch_rollup", "prod_rollup"],
+        max_documents=10,
+        timeout=30,
+    )
+    rollup = [
+        {"$match": {"status": "open"}},
+        {"$group": {"_id": "$region", "total": {"$sum": "$amount"}}},
+    ]
+
+    try:
+        with context(actor=actor("agent", "etl-agent")):
+            refused = await query("orders", [*rollup, {"$out": "prod_rollup"}])
+            allowed = await query("orders", [*rollup, {"$out": "scratch_rollup"}])
+        names = set(await client[DATABASE].list_collection_names())
+    finally:
+        await client.close()
+
+    assert refused.status is RunStatus.POLICY_REJECTED
+    assert refused.execution is None
+    assert refused.admission is not None
+    assert refused.admission.codes == ("DESTINATION_DENIED",)
+    assert allowed.status is RunStatus.ACCEPTED
+    assert "scratch_rollup" in names, "an authorized write must still happen"
+    assert "prod_rollup" not in names, "a denied write must leave nothing behind"

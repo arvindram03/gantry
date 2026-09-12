@@ -195,7 +195,11 @@ def _admission(value: object) -> AdmissionRecord | None:
     return AdmissionRecord(
         allowed=bool(data.get("allowed", False)),
         reasons=tuple(str(item) for item in _sequence(data.get("reasons"))),
+        policy=_optional_str(data.get("policy")),
         policy_hash=_optional_str(data.get("policy_hash")),
+        matched_rules=tuple(str(item) for item in _sequence(data.get("matched_rules"))),
+        codes=tuple(str(item) for item in _sequence(data.get("codes"))),
+        request=_mapping(data.get("request")) or None,
         **({"decided_at": decided} if decided is not None else {}),
     )
 

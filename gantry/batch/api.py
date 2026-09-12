@@ -9,6 +9,7 @@ from gantry.batch.capabilities import BatchCapabilities
 from gantry.flink.api import FlinkRuntime, connect_runtime
 from gantry.flink.operation import FlinkBatchJob
 from gantry.flink.verification import FlinkHealthCheck
+from gantry.policy.model import Policy
 from gantry.verify import MaterializationCheck
 
 
@@ -58,9 +59,12 @@ def connect(
     *,
     endpoint: str,
     config: Mapping[str, object] | None = None,
+    policy: Policy | None = None,
     **options: object,
 ) -> BatchConnection:
     normalized = provider.strip().lower()
     if normalized != "flink":
         raise ValueError(f"unsupported batch provider: {provider}")
-    return BatchConnection(normalized, connect_runtime(endpoint, config=config, **options))
+    return BatchConnection(
+        normalized, connect_runtime(endpoint, config=config, policy=policy, **options)
+    )

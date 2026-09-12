@@ -14,7 +14,18 @@ from gantry.failure import Failure, FailureKind
 from gantry.handle import ExecutionHandle
 from gantry.metrics import ExecutionMetrics
 from gantry.output import OutputKind, OutputRef
-from gantry.policy import PolicyRequirements
+from gantry.policy import (
+    Policy,
+    PolicyConfigurationError,
+    PolicyDecision,
+    PolicyReason,
+    PolicyReasonCode,
+    PolicyRequest,
+    PolicyRequirements,
+    PolicyRule,
+    allow,
+    deny,
+)
 from gantry.result import Result, ResultStatus
 from gantry.runs.model import Run
 from gantry.runs.status import RunStatus
@@ -68,7 +79,14 @@ __all__ = [
     "ObservationSource",
     "OutputKind",
     "OutputRef",
+    "Policy",
+    "PolicyConfigurationError",
+    "PolicyDecision",
+    "PolicyReason",
+    "PolicyReasonCode",
+    "PolicyRequest",
     "PolicyRequirements",
+    "PolicyRule",
     "Result",
     "ResultStatus",
     "Run",
@@ -83,9 +101,11 @@ __all__ = [
     "__version__",
     "actor",
     "admit",
+    "allow",
     "batch",
     "cancel",
     "configure",
+    "deny",
     "get",
     "nosql",
     "register_adapter",

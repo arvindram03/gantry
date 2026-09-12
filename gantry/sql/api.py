@@ -17,6 +17,8 @@ from gantry.execution import Execution, ExecutionResult, ExecutionState, Validat
 from gantry.failure import Failure, FailureKind
 from gantry.handle import ExecutionHandle
 from gantry.output import OutputKind, OutputRef
+from gantry.policy.evaluator import evaluate
+from gantry.policy.model import Policy
 from gantry.result import Result, ResultStatus
 from gantry.runs.lifecycle import RunRecorder
 from gantry.runs.model import OperationKind, QueryResultRef, ResourceRef, Run
@@ -26,6 +28,7 @@ from gantry.sql.adapter import SQLAdapter
 from gantry.sql.bridge import SQLExecutionAdapter
 from gantry.sql.dialect import SQLDialect
 from gantry.sql.explain import ExplainResult
+from gantry.sql.inspection import query_request
 from gantry.sql.output import InlineRows
 from gantry.sql.policy import SQLPolicy
 from gantry.sql.registry import resolve_dialect, resolve_provider
@@ -61,11 +64,23 @@ class SQLConnection:
         target: SQLTarget,
         adapter: SQLAdapter,
         dialect: SQLDialect,
+        policy: Policy | None = None,
     ) -> None:
         self._target = target
         self._adapter = adapter
         self._dialect = dialect
+        self._policy = policy
         self._plane = ControlPlane(store=MemoryExecutionStore())
+
+    @property
+    def policy(self) -> Policy | None:
+        """The reusable policy this connection admits against, if any.
+
+        Readable so an application can log what it attached. There is no
+        setter: policy is configuration, and something that could be swapped at
+        runtime is something an agent-reachable code path could swap.
+        """
+        return self._policy
 
     @property
     def provider(self) -> str:
@@ -251,6 +266,17 @@ class SQLConnection:
             )
         agent_checks_validated = cast("tuple[MaterializationCheck, ...]", tuple(agent_checks))
 
+        # Authority, before anything external happens. What the SQL touches
+        # comes from the dialect, not from the proposal's own account of itself.
+        request = query_request(sql, dialect=self._dialect, provider=self.provider, policy=policy)
+        if self._policy is not None:
+            decision = evaluate(self._policy, request)
+            if not decision.allowed:
+                return recorder.policy_rejected(decision, request)
+            recorder.admitted(request=request, decision=decision)
+        else:
+            recorder.admitted(request=request)
+
         result = await self.execute(sql, policy=policy, context=context, verify=verifiers)
         recorder.running(result.handle)
         inline = _find_inline(result, policy.max_rows)
@@ -430,9 +456,16 @@ class SQLConnection:
         return ExecutionTarget(self.provider, {"dialect": self.dialect})
 
 
-def connect(provider: str, **config: object) -> SQLConnection:
-    """Resolve a provider preset and create a governed SQL connection."""
+def connect(provider: str, *, policy: Policy | None = None, **config: object) -> SQLConnection:
+    """Resolve a provider preset and create a governed SQL connection.
 
+    `policy` attaches a reusable policy to everything this connection runs. It
+    is trusted configuration: per-operation constraints still apply on top, and
+    neither can be reached from a tool argument.
+    """
+
+    if policy is not None and not isinstance(policy, Policy):
+        raise TypeError("policy must be a gantry.Policy")
     preset = resolve_provider(provider)
     preset.validate_config(config)
     target = SQLTarget(
@@ -442,7 +475,12 @@ def connect(provider: str, **config: object) -> SQLConnection:
         config=dict(config),
         metadata=preset.metadata,
     )
-    return SQLConnection(target, preset.adapter_factory(target), resolve_dialect(preset.dialect))
+    return SQLConnection(
+        target,
+        preset.adapter_factory(target),
+        resolve_dialect(preset.dialect),
+        policy=policy,
+    )
 
 
 def _reasons(failure: Failure | None) -> tuple[str, ...]:
