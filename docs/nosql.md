@@ -134,4 +134,4 @@ documents:
 
 `examples/mongodb_rollup.py` is a runnable version of the query and materialize paths above,
 against a local MongoDB started with `docker run mongo`. See
-[examples/README.md](../examples/README.md) for setup.
+[examples/README.md](https://github.com/arvindram03/gantry/tree/main/examples) for setup.
