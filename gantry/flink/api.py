@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 
 from gantry.capabilities import AdapterCapabilities
 from gantry.context import Context
+from gantry.evidence import EvidenceBundle, Observation, ObservationSource
 from gantry.execution import Execution, ExecutionState, ValidationResult
 from gantry.failure import Failure, FailureKind
 from gantry.flink.adapter import FlinkAdapter
@@ -18,6 +19,7 @@ from gantry.flink.metrics import FlinkMetrics
 from gantry.flink.target import FlinkTarget
 from gantry.flink.verification import FlinkHealthCheck, JobRunning, verify_health
 from gantry.handle import ExecutionHandle
+from gantry.output import OutputRef
 from gantry.policy import PolicyRequirements
 from gantry.result import ResultStatus
 from gantry.runtime import ControlPlane, SubmissionError
@@ -164,35 +166,62 @@ class FlinkRuntime:
                         await asyncio.sleep(poll_interval_seconds)
                         continue
                     return _verification_failure(handle, health)
+                accepted_outputs = self._adapter.outputs(handle)
                 return FlinkResult(
                     ResultStatus.ACCEPTED,
                     handle=handle,
                     execution=health.execution,
-                    outputs=self._adapter.outputs(handle),
+                    outputs=accepted_outputs,
                     metrics=health.metrics,
                     verification=health.verification,
                     health=health,
+                    evidence=_flink_evidence(
+                        handle,
+                        health.execution,
+                        accepted_outputs,
+                        health.metrics,
+                        health.verification,
+                        ResultStatus.ACCEPTED,
+                    ),
                 )
             if mode is FlinkMode.BATCH and execution.state is ExecutionState.SUCCEEDED:
                 metrics = await self.metrics(handle)
                 verification = verify_health(execution, metrics, tuple(checks))
                 if not verification.ok:
+                    failed_outputs = self._adapter.outputs(handle)
                     return FlinkResult(
                         ResultStatus.VERIFICATION_FAILED,
                         handle,
                         execution,
-                        self._adapter.outputs(handle),
+                        failed_outputs,
                         metrics,
                         verification,
                         failure=_verification_failure_value(verification),
+                        evidence=_flink_evidence(
+                            handle,
+                            execution,
+                            failed_outputs,
+                            metrics,
+                            verification,
+                            ResultStatus.VERIFICATION_FAILED,
+                        ),
                     )
+                batch_outputs = self._adapter.outputs(handle)
                 return FlinkResult(
                     ResultStatus.ACCEPTED,
                     handle,
                     execution,
-                    self._adapter.outputs(handle),
+                    batch_outputs,
                     metrics,
                     verification,
+                    evidence=_flink_evidence(
+                        handle,
+                        execution,
+                        batch_outputs,
+                        metrics,
+                        verification,
+                        ResultStatus.ACCEPTED,
+                    ),
                 )
             terminal = _terminal_result(
                 execution, FlinkMetrics.from_execution_metrics(execution.metrics)
@@ -366,6 +395,60 @@ def _terminal_result(execution: Execution, metrics: FlinkMetrics) -> FlinkResult
         metrics=metrics,
         failure=execution.failure,
     )
+
+
+def _flink_evidence(
+    handle: ExecutionHandle,
+    execution: Execution,
+    outputs: tuple[OutputRef, ...],
+    metrics: FlinkMetrics,
+    verification: VerificationResult,
+    decision: ResultStatus,
+) -> EvidenceBundle:
+    """Flink's observations in the same shape SQL emits.
+
+    A stream's evidence answers a different question from a table's — not "what
+    was produced" but "was it healthy when we looked" — and the model holds both
+    because the observations are named and sourced rather than typed.
+    """
+    observations: list[Observation] = [
+        Observation("execution_state", execution.state.value, ObservationSource.ENGINE)
+    ]
+    for name, value, unit in (
+        ("records_in", metrics.records_in, "records"),
+        ("records_out", metrics.records_out, "records"),
+        ("restart_count", metrics.restart_count, None),
+        ("watermark_lag_seconds", metrics.watermark_lag_seconds, "seconds"),
+        ("runtime_seconds", metrics.runtime_seconds, "seconds"),
+    ):
+        if value is not None:
+            observations.append(Observation(name, value, ObservationSource.ENGINE, unit=unit))
+    for check in verification.checks:
+        if check.actual is not None:
+            observations.append(Observation(check.name, check.actual, ObservationSource.OUTPUT))
+    return EvidenceBundle(
+        run_id=handle.gantry_id,
+        engine=handle.engine,
+        operation=str(handle.metadata.get("mode", "flink")),
+        decision=decision.value,
+        native_execution_id=handle.native_id,
+        inputs=tuple(str(value) for value in _handle_names(handle, "inputs")),
+        outputs=tuple(output.uri for output in outputs),
+        started_at=execution.started_at or handle.submitted_at,
+        finished_at=execution.updated_at,
+        execution={"status": execution.state.value, "engine": handle.engine},
+        observations=tuple(observations),
+        checks=verification.checks,
+    )
+
+
+def _handle_names(handle: ExecutionHandle, key: str) -> tuple[str, ...]:
+    value = handle.metadata.get(key)
+    if isinstance(value, str):
+        return (value,)
+    if isinstance(value, (list, tuple)):
+        return tuple(str(item) for item in value)
+    return ()
 
 
 def _verification_failure(handle: ExecutionHandle, health: StreamingHealth) -> FlinkResult:

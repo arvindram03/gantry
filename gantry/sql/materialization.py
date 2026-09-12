@@ -5,12 +5,14 @@ from __future__ import annotations
 
 import re
 from collections.abc import Collection, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from fnmatch import fnmatchcase
+from hashlib import sha256
 from typing import TYPE_CHECKING, NoReturn, Protocol, runtime_checkable
 
 from gantry.context import Context
+from gantry.evidence import EvidenceBundle, Observation, ObservationSource
 from gantry.execution import Execution
 from gantry.failure import Failure, FailureKind
 from gantry.handle import ExecutionHandle
@@ -172,6 +174,24 @@ class MaterializationAdapter(Protocol):
     ) -> Table | None: ...
 
 
+@runtime_checkable
+class ColumnStatistics(Protocol):
+    """An adapter that can measure per-column statistics at a destination.
+
+    Separate from `MaterializationAdapter` because not every provider can do
+    this, and the spec is explicit that not every provider must support every
+    check. An adapter without it makes `null_rate` unsupported, which fails
+    closed rather than passing unmeasured.
+    """
+
+    async def column_null_rates(
+        self,
+        reference: TableRef,
+        target: SQLTarget,
+        columns: Sequence[str],
+    ) -> Mapping[str, float]: ...
+
+
 @dataclass(frozen=True, slots=True)
 class MaterializationPolicy:
     """Where a materialization may read from and write to.
@@ -237,6 +257,8 @@ class MaterializationResult:
     execution: Execution | None = None
     verification: VerificationResult | None = None
     failure: Failure | None = None
+    evidence: EvidenceBundle | None = None
+    """What Gantry observed while deciding, serializable and outliving the run."""
 
     @property
     def ok(self) -> bool:
@@ -297,6 +319,7 @@ class SQLMaterializer:
         self._policy = policy
         self._verify = tuple(verify)
         self._plans: dict[str, MaterializationPlan] = {}
+        self._proposals: dict[str, str] = {}
 
     @property
     def input_schema(self) -> dict[str, object]:
@@ -369,6 +392,10 @@ class SQLMaterializer:
                 error.result.status,
             ) from error
         self._plans[handle.gantry_id] = plan
+        # Identifies the proposal without storing it. Evidence should say which
+        # statement was run without becoming a place agent-written SQL
+        # accumulates, and a digest is enough to match a run to its proposal.
+        self._proposals[handle.gantry_id] = sha256(value.sql.encode()).hexdigest()
         return handle
 
     async def wait(
@@ -413,22 +440,42 @@ class SQLMaterializer:
 
         verification = await self._verification(plan.destination)
         if not verification.ok:
+            unsupported = verification.unsupported_checks
+            reasons = unsupported or verification.failed_checks
             message = next(
-                (check.message for check in verification.checks if not check.ok and check.message),
+                (check.message for check in reasons if check.message),
                 "materialization verification failed",
             )
+            status = ResultStatus.VERIFICATION_FAILED
             return MaterializationResult(
-                status=ResultStatus.VERIFICATION_FAILED,
+                status=status,
                 output=output,
                 execution=execution,
                 verification=verification,
-                failure=Failure(FailureKind.VERIFICATION_FAILED, False, message),
+                failure=Failure(
+                    FailureKind.UNSUPPORTED_VERIFICATION
+                    if unsupported
+                    else FailureKind.VERIFICATION_FAILED,
+                    False,
+                    message,
+                ),
+                evidence=_evidence(
+                    plan, execution, output, verification, status, self._proposal_hash(handle)
+                ),
             )
         return MaterializationResult(
             status=ResultStatus.ACCEPTED,
             output=output,
             execution=execution,
             verification=verification,
+            evidence=_evidence(
+                plan,
+                execution,
+                output,
+                verification,
+                ResultStatus.ACCEPTED,
+                self._proposal_hash(handle),
+            ),
         )
 
     async def status(self, handle: ExecutionHandle) -> Execution:
@@ -540,6 +587,7 @@ class SQLMaterializer:
                 f"destination inspection raised {type(error).__name__}: {error}",
                 name="destination_introspection",
             )
+        table = await self._with_null_rates(table, destination)
         checks: list[CheckResult] = []
         for verifier in self._verify:
             try:
@@ -556,6 +604,32 @@ class SQLMaterializer:
             ok=all(check.ok for check in checks),
             checks=tuple(checks),
         )
+
+    def _proposal_hash(self, handle: ExecutionHandle) -> str | None:
+        return self._proposals.get(handle.gantry_id)
+
+    async def _with_null_rates(self, table: Table | None, destination: TableRef) -> Table | None:
+        """Attach null rates to the destination metadata, if any check needs them.
+
+        Gathered only when asked for: it is a scan per column, and a check that
+        nobody configured should cost nothing.
+        """
+        wanted: list[str] = []
+        for verifier in self._verify:
+            wanted.extend(getattr(verifier, "null_rate_columns", ()))
+        if table is None or not wanted:
+            return table
+        adapter = self._connection._materialization_adapter()
+        if not isinstance(adapter, ColumnStatistics):
+            # Leaves the metadata absent, which makes the check unsupported.
+            return table
+        try:
+            rates = await adapter.column_null_rates(
+                destination, self._connection._target, tuple(dict.fromkeys(wanted))
+            )
+        except Exception:
+            return table
+        return replace(table, metadata={**table.metadata, "null_rates": dict(rates)})
 
     def _sql_policy(self) -> SQLPolicy:
         return SQLPolicy(
@@ -744,6 +818,61 @@ def _matches(reference: TableRef, patterns: Collection[str]) -> bool:
     if reference.catalog is not None and reference.schema is not None:
         candidates.append(f"{reference.schema}.{reference.name}".lower())
     return any(fnmatchcase(candidate, pattern) for pattern in patterns for candidate in candidates)
+
+
+def _evidence(
+    plan: MaterializationPlan,
+    execution: Execution,
+    output: OutputRef | None,
+    verification: VerificationResult,
+    decision: ResultStatus,
+    proposal_hash: str | None = None,
+) -> EvidenceBundle:
+    """Assemble the record of what was seen, from the three sources.
+
+    The engine's account of itself, the measurements taken at the destination,
+    and what Gantry was configured to require. Each observation keeps its
+    source, because they are not equally trustworthy: a runtime the engine
+    reports is its own word for it, while a row count is something Gantry went
+    and looked at.
+    """
+    handle = execution.handle
+    observations: list[Observation] = [
+        Observation("execution_state", execution.state.value, ObservationSource.ENGINE),
+    ]
+    metrics = execution.metrics
+    for name, value, unit in (
+        ("rows_read", metrics.rows_read, "rows"),
+        ("rows_written", metrics.rows_written, "rows"),
+        ("bytes_read", metrics.bytes_read, "bytes"),
+        ("runtime_seconds", metrics.runtime_seconds, "seconds"),
+    ):
+        if value is not None:
+            observations.append(Observation(name, value, ObservationSource.ENGINE, unit=unit))
+    for check in verification.checks:
+        # The measurement the check was decided on, kept beside the verdict so
+        # a reader can disagree with the bound without rerunning anything.
+        if check.actual is not None:
+            observations.append(Observation(check.name, check.actual, ObservationSource.OUTPUT))
+    return EvidenceBundle(
+        run_id=handle.gantry_id,
+        engine=handle.engine,
+        operation=plan.operation.value,
+        decision=decision.value,
+        native_execution_id=handle.native_id,
+        proposal_hash=proposal_hash,
+        inputs=tuple(source.qualified_name for source in plan.sources),
+        outputs=() if output is None else (output.uri,),
+        started_at=execution.started_at or handle.submitted_at,
+        finished_at=execution.updated_at,
+        execution={
+            "status": execution.state.value,
+            "engine": handle.engine,
+            "target": handle.target,
+        },
+        observations=tuple(observations),
+        checks=verification.checks,
+    )
 
 
 def _materialized_output(

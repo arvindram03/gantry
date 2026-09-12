@@ -6,6 +6,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
+from gantry.evidence import EvidenceBundle
 from gantry.execution import Execution
 from gantry.failure import Failure
 from gantry.flink.metrics import FlinkMetrics
@@ -37,6 +38,8 @@ class FlinkResult:
     verification: VerificationResult | None = None
     health: StreamingHealth | None = None
     failure: Failure | None = None
+    evidence: EvidenceBundle | None = None
+    """What Gantry observed while deciding, in the same shape SQL emits."""
 
     @property
     def is_accepted(self) -> bool:

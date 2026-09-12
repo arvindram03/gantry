@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Gantry: the execution control plane for agent-generated data work."""
 
-from gantry import batch, nosql, sql, stream, verify
+from gantry import batch, nosql, runs, sql, stream, verify
 from gantry.adapter import ExecutionAdapter
 from gantry.admission import AdmissionDecision, admit
 from gantry.artifact import Artifact
 from gantry.capabilities import AdapterCapabilities
 from gantry.context import Context
+from gantry.evidence import EvidenceBundle, Observation, ObservationSource
 from gantry.execution import Execution, ExecutionResult, ExecutionState, ValidationResult
 from gantry.failure import Failure, FailureKind
 from gantry.handle import ExecutionHandle
@@ -39,6 +40,7 @@ __all__ = [
     "CheckResult",
     "Context",
     "ControlPlane",
+    "EvidenceBundle",
     "Execution",
     "ExecutionAdapter",
     "ExecutionHandle",
@@ -50,6 +52,8 @@ __all__ = [
     "Failure",
     "FailureKind",
     "MemoryExecutionStore",
+    "Observation",
+    "ObservationSource",
     "OutputKind",
     "OutputRef",
     "PolicyRequirements",
@@ -70,6 +74,7 @@ __all__ = [
     "nosql",
     "register_adapter",
     "run",
+    "runs",
     "sql",
     "stream",
     "submit",

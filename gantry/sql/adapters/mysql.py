@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from datetime import UTC, datetime
 from typing import Any, cast
@@ -130,6 +130,34 @@ class MySQLAdapter:
             schemas=tuple(dict.fromkeys(table.schema for table in tables if table.schema)),
             tables=tables,
         )
+
+    async def column_null_rates(
+        self,
+        reference: TableRef,
+        target: SQLTarget,
+        columns: Sequence[str],
+    ) -> Mapping[str, float]:
+        """Measure how often each column is null, in one pass over the table."""
+        if not columns:
+            return {}
+        schema = reference.schema or self._config.get("db")
+        if not isinstance(schema, str):
+            return {}
+        projections = ", ".join(
+            f"AVG(CASE WHEN {_quoted(column)} IS NULL THEN 1.0 ELSE 0.0 END)" for column in columns
+        )
+        rows = await self._fetch_all(
+            f"SELECT {projections} FROM {_quoted(schema)}.{_quoted(reference.name)}"
+        )
+        if not rows:
+            return {}
+        # AVG over an empty table is NULL; omitted rather than reported as zero,
+        # which would be a measurement nobody took.
+        return {
+            column: float(value)
+            for column, value in zip(columns, rows[0], strict=False)
+            if value is not None
+        }
 
     async def validate(
         self,

@@ -96,9 +96,22 @@ class Result:
         admission: AdmissionDecision,
     ) -> Result:
         if not verification.ok:
+            # A check the provider could not evaluate is reported as such. Both
+            # outcomes reject — an unmeasured bound is not a bound — but they
+            # call for different remedies, and only one of them is about the
+            # data.
+            unsupported = verification.unsupported_checks
+            kind = (
+                FailureKind.UNSUPPORTED_VERIFICATION
+                if unsupported
+                else FailureKind.VERIFICATION_FAILED
+            )
+            reasons = unsupported or verification.failed_checks
             message = next(
-                (check.message for check in verification.checks if not check.ok and check.message),
-                "verification failed",
+                (check.message for check in reasons if check.message),
+                f"{reasons[0].name} could not be evaluated"
+                if unsupported
+                else "verification failed",
             )
             return cls(
                 status=ResultStatus.VERIFICATION_FAILED,
@@ -108,7 +121,7 @@ class Result:
                 metrics=engine_result.metrics,
                 verification=verification,
                 failure=Failure(
-                    kind=FailureKind.VERIFICATION_FAILED,
+                    kind=kind,
                     retryable=False,
                     message=message,
                 ),

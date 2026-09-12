@@ -5,11 +5,14 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import UTC, datetime
+from hashlib import sha256
 from typing import TYPE_CHECKING
 
 from gantry.artifact import Artifact
 from gantry.context import Context
+from gantry.evidence import EvidenceBundle, Observation, ObservationSource
 from gantry.execution import Execution, ExecutionResult, ExecutionState, ValidationResult
 from gantry.failure import Failure, FailureKind
 from gantry.handle import ExecutionHandle
@@ -23,11 +26,16 @@ from gantry.sql.output import InlineRows
 from gantry.sql.policy import SQLPolicy
 from gantry.sql.registry import resolve_dialect, resolve_provider
 from gantry.sql.result import SQLResult
+from gantry.sql.resultset import (
+    applies_to_result_set,
+    result_set_table,
+    unsupported_for_query,
+)
 from gantry.sql.schema import DatabaseSchema, Table
 from gantry.sql.target import SQLTarget
 from gantry.store import MemoryExecutionStore
 from gantry.target import ExecutionTarget
-from gantry.verifier import Verifier
+from gantry.verifier import CheckResult, VerificationResult, Verifier
 
 if TYPE_CHECKING:
     from gantry.sql.capabilities import SQLCapabilities
@@ -143,9 +151,14 @@ class SQLConnection:
         max_bytes_scanned: int | None = None,
         max_cost_usd: float | None = None,
         allow_multiple_statements: bool = False,
-        verify: Sequence[Verifier] = (),
+        verify: Sequence[Verifier | MaterializationCheck] = (),
     ) -> SQLQuery:
-        """Configure a governed query operation."""
+        """Configure a governed query operation.
+
+        `verify` takes the same `gantry.verify` checks a materialization takes,
+        evaluated against the rows the query returns rather than a destination,
+        plus any `Verifier` that inspects the execution itself.
+        """
 
         from gantry.sql.query import SQLQuery
 
@@ -168,20 +181,31 @@ class SQLConnection:
         *,
         policy: SQLPolicy,
         context: Context | None = None,
-        verify: Sequence[Verifier] = (),
+        verify: Sequence[Verifier | MaterializationCheck] = (),
     ) -> SQLResult:
-        """Execute SQL for a configured query operation."""
+        """Execute SQL for a configured query operation.
 
-        result = await self.execute(sql, policy=policy, context=context, verify=verify)
+        Two kinds of check arrive here. A `Verifier` inspects the execution and
+        runs inside the control plane, as it always has. A `MaterializationCheck`
+        — the `gantry.verify` library — is evaluated afterwards against the rows
+        that came back, described as a table, so the same `row_count` means the
+        same thing whether the caller is querying or materializing.
+        """
+        verifiers = tuple(item for item in verify if isinstance(item, Verifier))
+        checks = tuple(item for item in verify if not isinstance(item, Verifier))
+        result = await self.execute(sql, policy=policy, context=context, verify=verifiers)
         inline = _find_inline(result, policy.max_rows)
+        verification = _merge(result.verification, _result_set_checks(checks, inline))
+        status, failure = _decide(result, verification)
         return SQLResult(
-            status=result.status,
+            status=status,
             handle=result.handle,
             inline=inline,
             outputs=result.outputs,
             metrics=result.metrics,
-            verification=result.verification,
-            failure=result.failure,
+            verification=verification,
+            failure=failure,
+            evidence=_query_evidence(sql, result, inline, verification, status),
         )
 
     async def status(self, handle: ExecutionHandle) -> Execution:
@@ -292,6 +316,14 @@ class SQLConnection:
             include_row_count=include_row_count,
         )
 
+    def _materialization_adapter(self) -> SQLAdapter:
+        """The native adapter, for observations beyond `inspect_table`.
+
+        Kept private: an agent tool must not reach the driver, and this is the
+        only reason anything outside the connection needs it.
+        """
+        return self._adapter
+
     def _bridge(self, policy: SQLPolicy) -> SQLExecutionAdapter:
         return SQLExecutionAdapter(self._adapter, self._dialect, self._target, policy)
 
@@ -318,6 +350,127 @@ def connect(provider: str, **config: object) -> SQLConnection:
         metadata=preset.metadata,
     )
     return SQLConnection(target, preset.adapter_factory(target), resolve_dialect(preset.dialect))
+
+
+def _result_set_checks(
+    checks: Sequence[MaterializationCheck], inline: InlineRows | None
+) -> tuple[CheckResult, ...]:
+    """Evaluate the shared check library against the rows a query returned."""
+    if not checks:
+        return ()
+    truncated = bool(inline is not None and inline.truncated)
+    wanted: list[str] = []
+    for check in checks:
+        wanted.extend(getattr(check, "null_rate_columns", ()))
+    table = result_set_table(inline, null_rate_columns=tuple(dict.fromkeys(wanted)))
+    results: list[CheckResult] = []
+    for check in checks:
+        reason = applies_to_result_set(check, truncated=truncated)
+        if reason is not None:
+            results.append(unsupported_for_query(check, reason))
+            continue
+        try:
+            results.append(replace(check.evaluate(table), source="result set"))
+        except Exception as error:
+            results.append(
+                CheckResult(
+                    name=type(check).__name__,
+                    ok=False,
+                    message=f"verification raised {type(error).__name__}: {error}",
+                )
+            )
+    return tuple(results)
+
+
+def _merge(
+    existing: VerificationResult | None, extra: tuple[CheckResult, ...]
+) -> VerificationResult | None:
+    """One verification covering both kinds of check, or none if neither ran."""
+    if existing is None and not extra:
+        return None
+    checks = (() if existing is None else existing.checks) + extra
+    return VerificationResult(ok=all(check.ok for check in checks), checks=checks)
+
+
+def _decide(
+    result: Result, verification: VerificationResult | None
+) -> tuple[ResultStatus, Failure | None]:
+    """Re-decide once the result-set checks have had their say.
+
+    The control plane already settled the execution and its own verifiers. This
+    can only take acceptance away, never grant it: a failed execution stays
+    failed whatever the rows look like.
+    """
+    if result.status is not ResultStatus.ACCEPTED:
+        return result.status, result.failure
+    if verification is None or verification.ok:
+        return result.status, result.failure
+    unsupported = verification.unsupported_checks
+    reasons = unsupported or verification.failed_checks
+    message = next((check.message for check in reasons if check.message), "verification failed")
+    return ResultStatus.VERIFICATION_FAILED, Failure(
+        FailureKind.UNSUPPORTED_VERIFICATION if unsupported else FailureKind.VERIFICATION_FAILED,
+        False,
+        message,
+    )
+
+
+def _query_evidence(
+    sql: str,
+    result: Result,
+    inline: InlineRows | None,
+    verification: VerificationResult | None,
+    decision: ResultStatus,
+) -> EvidenceBundle | None:
+    """A query's evidence, in the shape a materialization emits.
+
+    Fewer observations, because a read has less to say about itself than a
+    write does — but the same model, so one reader handles both.
+    """
+    handle = result.handle
+    if handle is None:
+        return None
+    observations: list[Observation] = []
+    execution = result.execution
+    if execution is not None:
+        observations.append(
+            Observation("execution_state", execution.state.value, ObservationSource.ENGINE)
+        )
+    metrics = result.metrics
+    for name, value, unit in (
+        ("rows_read", metrics.rows_read, "rows"),
+        ("runtime_seconds", metrics.runtime_seconds, "seconds"),
+    ):
+        if value is not None:
+            observations.append(Observation(name, value, ObservationSource.ENGINE, unit=unit))
+    if inline is not None:
+        observations.append(
+            Observation("rows_returned", len(inline.rows), ObservationSource.OUTPUT, unit="rows")
+        )
+        # Whether the answer is the whole answer. A bound that silently clipped
+        # the result changes what every other observation means.
+        observations.append(Observation("truncated", inline.truncated, ObservationSource.OUTPUT))
+    for check in verification.checks if verification is not None else ():
+        if check.actual is not None:
+            observations.append(Observation(check.name, check.actual, ObservationSource.OUTPUT))
+    return EvidenceBundle(
+        run_id=handle.gantry_id,
+        engine=handle.engine,
+        operation="query",
+        decision=decision.value,
+        native_execution_id=handle.native_id,
+        proposal_hash=sha256(sql.encode()).hexdigest(),
+        outputs=tuple(output.uri for output in result.outputs),
+        started_at=None if execution is None else (execution.started_at or handle.submitted_at),
+        finished_at=None if execution is None else execution.updated_at,
+        execution={
+            "status": "UNKNOWN" if execution is None else execution.state.value,
+            "engine": handle.engine,
+            "target": handle.target,
+        },
+        observations=tuple(observations),
+        checks=() if verification is None else verification.checks,
+    )
 
 
 def _find_inline(result: Result, max_rows: int) -> InlineRows | None:

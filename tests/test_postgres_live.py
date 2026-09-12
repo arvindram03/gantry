@@ -373,3 +373,91 @@ def test_metadata_lookups_quote_and_escape_what_they_interpolate() -> None:
     assert _schema_filter(TableRef("t")) == ""
     assert _schema_filter(TableRef("t", "analytics")) == "AND c.table_schema = 'analytics'"
     assert _schema_filter(TableRef("t", "an'alytics")) == "AND c.table_schema = 'an''alytics'"
+
+
+async def test_null_rate_catches_a_join_that_row_count_calls_healthy(
+    db: gantry.sql.SQLConnection,
+) -> None:
+    """The failure `row_count` cannot see.
+
+    A query that runs, produces the expected number of rows, and joins wrongly,
+    so the column everything downstream keys on is null in most of them. The
+    count says the table is fine. Measured against the real engine, because the
+    null rate has to be observed at the destination rather than reported by the
+    statement that wrote it.
+    """
+    import gantry.verify
+
+    await _raw_execute("DROP TABLE IF EXISTS reporting.null_probe")
+    build = db.materialize(
+        sources=["analytics.*"],
+        destinations=["reporting.*"],
+        verify=[
+            gantry.verify.row_count(min=1),
+            gantry.verify.null_rate(column="customer_id", max=0.01),
+        ],
+    )
+
+    result = await build(
+        "CREATE TABLE reporting.null_probe AS "
+        "SELECT o.order_id, c.customer_id FROM analytics.orders o "
+        "LEFT JOIN analytics.customers c ON c.customer_id = o.order_id"
+    )
+
+    assert result.status is ResultStatus.VERIFICATION_FAILED
+    checks = {
+        check.name: check for check in (result.verification.checks if result.verification else ())
+    }
+    assert checks["row_count"].ok, "the row count is fine, which is the point"
+    assert not checks["null_rate"].ok
+    assert checks["null_rate"].supported, "the provider measured it; it simply failed"
+    observed = checks["null_rate"].actual
+    assert isinstance(observed, dict) and observed["value"] > 0.5
+    await _raw_execute("DROP TABLE IF EXISTS reporting.null_probe")
+
+
+async def test_a_run_is_readable_from_another_process_with_only_its_id(
+    db: gantry.sql.SQLConnection, tmp_path: object
+) -> None:
+    """Criterion 9: understood without the agent conversation that produced it.
+
+    The store is opened twice over the same file, the second time after the
+    first is closed, because "it is still in memory" is not the property being
+    tested.
+    """
+    import gantry.verify
+    from gantry.runs.store import SQLiteRunStore
+
+    await _raw_execute("DROP TABLE IF EXISTS reporting.evidence_probe")
+    build = db.materialize(
+        sources=["analytics.*"],
+        destinations=["reporting.*"],
+        verify=[gantry.verify.destination_exists(), gantry.verify.row_count(min=1)],
+    )
+
+    result = await build(
+        "CREATE TABLE reporting.evidence_probe AS SELECT customer_id FROM analytics.customers"
+    )
+    assert result.status is ResultStatus.ACCEPTED, result.failure
+    assert result.evidence is not None
+
+    path = f"{tmp_path}/runs.db"
+    writer = SQLiteRunStore(path)
+    writer.record(result.evidence)
+    writer.close()
+
+    reader = SQLiteRunStore(path)
+    try:
+        run = reader.get(result.evidence.run_id)
+        assert run is not None
+        assert run.decision == "ACCEPTED"
+        assert run.evidence.inputs == ("analytics.customers",)
+        assert run.evidence.outputs == ("postgres://reporting/evidence_probe",)
+        assert run.evidence.native_execution_id is not None
+        assert run.evidence.proposal_hash is not None
+        rendered = run.render()
+        assert "✓ row_count" in rendered
+        assert "analytics.customers" in rendered
+    finally:
+        reader.close()
+    await _raw_execute("DROP TABLE IF EXISTS reporting.evidence_probe")

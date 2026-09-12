@@ -15,6 +15,7 @@ from gantry.verifier import Verifier
 
 if TYPE_CHECKING:
     from gantry.sql.api import SQLConnection
+    from gantry.verify import MaterializationCheck
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,7 +24,7 @@ class SQLQuery:
 
     _connection: SQLConnection = field(repr=False)
     _policy: SQLPolicy = field(repr=False)
-    _verify: tuple[Verifier, ...] = field(default=(), repr=False)
+    _verify: tuple[Verifier | MaterializationCheck, ...] = field(default=(), repr=False)
 
     async def __call__(self, sql: str, *, context: Context | None = None) -> SQLResult:
         return await self._connection._query(

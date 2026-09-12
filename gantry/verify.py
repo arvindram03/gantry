@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Protocol, runtime_checkable
 
@@ -21,7 +21,15 @@ if TYPE_CHECKING:
 
 @runtime_checkable
 class MaterializationCheck(Protocol):
-    """A trusted check evaluated against destination metadata."""
+    """A trusted check evaluated against a table's metadata.
+
+    The same checks serve a materialization and a query. A materialization is
+    checked against the destination it created; a query is checked against the
+    shape of the rows it returned, described as a table so one check can do
+    both. Two of them do need a destination and say so with
+    `requires_destination`, which makes them unsupported on a query rather than
+    quietly true.
+    """
 
     def evaluate(self, table: Table | None) -> CheckResult: ...
 
@@ -29,6 +37,7 @@ class MaterializationCheck(Protocol):
 @dataclass(frozen=True, slots=True)
 class DestinationExists:
     requires_row_count: ClassVar[bool] = False
+    requires_destination: ClassVar[bool] = True
 
     def evaluate(self, table: Table | None) -> CheckResult:
         exists = table is not None
@@ -44,6 +53,7 @@ class DestinationExists:
 @dataclass(frozen=True, slots=True)
 class OutputExists:
     requires_row_count: ClassVar[bool] = False
+    requires_destination: ClassVar[bool] = True
 
     def evaluate(self, table: Table | None) -> CheckResult:
         exists = table is not None
@@ -80,7 +90,8 @@ class RowCount:
                 False,
                 {"min": self.minimum, "max": self.maximum},
                 actual_value,
-                "destination row count is unavailable",
+                "row count is unavailable",
+                supported=False,
             )
         actual = actual_value
         ok = True
@@ -89,10 +100,7 @@ class RowCount:
         if ok and self.maximum is not None:
             ok = actual <= self.maximum
         expected = {"min": self.minimum, "max": self.maximum}
-        if not ok:
-            message = f"destination row count {actual} is outside the accepted range"
-        else:
-            message = None
+        message = None if ok else f"row count {actual} is outside the accepted range"
         return CheckResult("row_count", ok, expected, actual, message)
 
 
@@ -136,6 +144,74 @@ def row_count(*, min: int | None = None, max: int | None = None) -> RowCount:  #
     return RowCount(minimum=min, maximum=max)
 
 
+def null_rate(*, column: str, max: float) -> NullRate:  # noqa: A002
+    """Reject a destination where a column is emptier than it should be.
+
+    The failure this catches is a query that runs, produces the right number of
+    rows, and joins wrongly — so the column everyone downstream keys on is null
+    in most of them. Row count says the table is fine. This does not.
+    """
+    return NullRate(column=column, maximum=max)
+
+
+@dataclass(frozen=True, slots=True)
+class NullRate:
+    """The fraction of rows where one column is null, bounded above.
+
+    Measured at the destination by the provider, not reported by the statement
+    that wrote it. A provider that cannot measure it makes the check
+    unsupported rather than passing it, because an unmeasured bound would be
+    indistinguishable from a satisfied one.
+    """
+
+    requires_row_count: ClassVar[bool] = False
+
+    column: str
+    maximum: float
+
+    def __post_init__(self) -> None:
+        if not self.column.strip():
+            raise ValueError("null rate column must not be empty")
+        if isinstance(self.maximum, bool) or not isinstance(self.maximum, (int, float)):
+            raise TypeError("null rate maximum must be numeric")
+        if not 0 <= self.maximum <= 1:
+            raise ValueError("null rate maximum must be a fraction between 0 and 1")
+
+    @property
+    def null_rate_columns(self) -> tuple[str, ...]:
+        return (self.column,)
+
+    def evaluate(self, table: Table | None) -> CheckResult:
+        expected = {"column": self.column, "max": self.maximum}
+        if table is None:
+            return CheckResult(
+                "null_rate",
+                False,
+                expected,
+                None,
+                "there is nothing to measure",
+            )
+        rates = table.metadata.get("null_rates")
+        observed = rates.get(self.column) if isinstance(rates, Mapping) else None
+        if not isinstance(observed, (int, float)) or isinstance(observed, bool):
+            return CheckResult(
+                "null_rate",
+                False,
+                expected,
+                None,
+                f"null rate for {self.column} is unavailable from this provider",
+                supported=False,
+            )
+        ok = observed <= self.maximum
+        return CheckResult(
+            "null_rate",
+            ok,
+            expected,
+            {"value": observed},
+            None if ok else f"{self.column} is null in {observed:.1%} of rows",
+        )
+
+
 def required_columns(columns: Sequence[str]) -> RequiredColumns:
     return RequiredColumns(tuple(columns))
 
@@ -167,11 +243,13 @@ def watermark_lag(*, max_seconds: float | str) -> MaxWatermarkLag:
 __all__ = [
     "DestinationExists",
     "MaterializationCheck",
+    "NullRate",
     "OutputExists",
     "RequiredColumns",
     "RowCount",
     "destination_exists",
     "job_succeeded",
+    "null_rate",
     "output_exists",
     "required_columns",
     "restart_count",
