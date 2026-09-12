@@ -18,6 +18,9 @@ from gantry.failure import Failure, FailureKind
 from gantry.handle import ExecutionHandle
 from gantry.output import OutputKind, OutputRef
 from gantry.result import ResultStatus
+from gantry.runs.lifecycle import RunRecorder
+from gantry.runs.model import OperationKind, ResourceRef, Run
+from gantry.runs.status import RunStatus
 from gantry.runtime import SubmissionError
 from gantry.sql.policy import SQLPolicy
 from gantry.sql.schema import Table
@@ -366,7 +369,7 @@ class SQLMaterializer:
         *,
         name: str = "materialize_sql",
         description: str = "Create a derived table from approved SQL sources.",
-    ) -> Tool[MaterializationResult]:
+    ) -> Tool[Run]:
         """Return the narrow framework-neutral form of this operation."""
 
         return Tool(
@@ -568,34 +571,74 @@ class SQLMaterializer:
         proposal: str | MaterializationProposal,
         *,
         verify: Sequence[MaterializationCheck] = (),
-    ) -> MaterializationResult:
+    ) -> Run:
+        """Materialize, and record the run.
+
+        The run is created before admission, so a proposal that never reaches
+        the engine still leaves a record of having been refused — which is the
+        case anyone asks about later.
+        """
+        body = proposal.sql if isinstance(proposal, MaterializationProposal) else str(proposal)
+        recorder = RunRecorder(
+            kind=OperationKind.MATERIALIZE,
+            engine="sql",
+            provider=self._connection.provider,
+            proposal=body,
+            agent_verification=tuple(type(check).__name__ for check in verify),
+        )
         try:
             handle = await self.submit(proposal, verify=verify)
         except VerificationUnsupported as error:
-            return _failed(
-                ResultStatus.VERIFICATION_UNSUPPORTED,
-                Failure(FailureKind.VERIFICATION_UNSUPPORTED, False, str(error)),
-            )
+            return _refuse(recorder, error, RunStatus.VERIFICATION_UNSUPPORTED)
         except VerificationConflict as error:
-            return _failed(
-                ResultStatus.VERIFICATION_CONFLICT,
-                Failure(FailureKind.VERIFICATION_CONFLICT, False, str(error)),
-            )
+            return _refuse(recorder, error, RunStatus.VERIFICATION_CONFLICT)
         except VerificationInputError as error:
-            return _failed(
-                ResultStatus.REJECTED,
-                Failure(FailureKind.VALIDATION_ERROR, False, str(error)),
-            )
+            return _refuse(recorder, error, RunStatus.POLICY_REJECTED)
         except MaterializationError as error:
-            return _failed(error.status, error.failure)
+            return recorder.rejected(
+                (error.failure.message,), status=RunStatus.POLICY_REJECTED
+            ).with_failure(error.failure)
         except (TypeError, ValueError) as error:
-            return _failed(
-                ResultStatus.REJECTED,
-                Failure(FailureKind.VALIDATION_ERROR, False, str(error)),
-            )
-        return await self.wait(handle, poll_interval_seconds=0.05)
+            return _refuse(recorder, error, RunStatus.POLICY_REJECTED)
 
-    async def _invoke_tool(self, arguments: Mapping[str, object]) -> MaterializationResult:
+        plan = self._plans.get(handle.gantry_id)
+        recorder.admitted(
+            inputs=tuple(
+                ResourceRef(system=self._connection.provider, resource=source.qualified_name)
+                for source in (plan.sources if plan is not None else ())
+            )
+        )
+        recorder.running(handle)
+        result = await self.wait(handle, poll_interval_seconds=0.05)
+        if result.status is ResultStatus.VERIFICATION_UNSUPPORTED:
+            return recorder.rejected(
+                (result.failure.message if result.failure else "unsupported verification",),
+                status=RunStatus.VERIFICATION_UNSUPPORTED,
+            ).with_failure(result.failure)
+        if result.status is ResultStatus.VERIFICATION_CONFLICT:
+            return recorder.rejected(
+                (result.failure.message if result.failure else "verification conflict",),
+                status=RunStatus.VERIFICATION_CONFLICT,
+            ).with_failure(result.failure)
+        if result.status is not ResultStatus.ACCEPTED and result.verification is None:
+            return recorder.execution_failed().with_failure(result.failure)
+        recorder.verifying()
+        return recorder.decided(
+            verification=result.verification,
+            evidence=result.evidence,
+            outputs=()
+            if result.output is None
+            else (
+                ResourceRef(
+                    system=self._connection.provider,
+                    resource=plan.destination.qualified_name
+                    if plan is not None
+                    else result.output.uri,
+                ),
+            ),
+        ).with_failure(result.failure)
+
+    async def _invoke_tool(self, arguments: Mapping[str, object]) -> Run:
         unexpected = set(arguments) - {"sql", "verify"}
         if unexpected:
             names = ", ".join(sorted(unexpected))
@@ -607,15 +650,18 @@ class SQLMaterializer:
             checks = parse_agent_checks(
                 arguments.get("verify"), capabilities=self._agent_capabilities
             )
-        except VerificationUnsupported as error:
-            return _failed(
-                ResultStatus.VERIFICATION_UNSUPPORTED,
-                Failure(FailureKind.VERIFICATION_UNSUPPORTED, False, str(error)),
-            )
-        except VerificationInputError as error:
-            return _failed(
-                ResultStatus.REJECTED,
-                Failure(FailureKind.VALIDATION_ERROR, False, str(error)),
+        except (VerificationUnsupported, VerificationInputError) as error:
+            return _refuse(
+                RunRecorder(
+                    kind=OperationKind.MATERIALIZE,
+                    engine="sql",
+                    provider=self._connection.provider,
+                    proposal=sql,
+                ),
+                error,
+                RunStatus.VERIFICATION_UNSUPPORTED
+                if isinstance(error, VerificationUnsupported)
+                else RunStatus.POLICY_REJECTED,
             )
         return await self(sql, verify=checks)  # type: ignore[arg-type]
 
@@ -971,10 +1017,19 @@ def _matches(reference: TableRef, patterns: Collection[str]) -> bool:
     return any(fnmatchcase(candidate, pattern) for pattern in patterns for candidate in candidates)
 
 
-def _recorded(result: MaterializationResult) -> MaterializationResult:
-    from gantry.runs import record
+def _refuse(recorder: RunRecorder, error: Exception, status: RunStatus) -> Run:
+    kind = {
+        RunStatus.VERIFICATION_UNSUPPORTED: FailureKind.VERIFICATION_UNSUPPORTED,
+        RunStatus.VERIFICATION_CONFLICT: FailureKind.VERIFICATION_CONFLICT,
+    }.get(status, FailureKind.VALIDATION_ERROR)
+    return recorder.rejected((str(error),), status=status).with_failure(
+        Failure(kind, False, str(error))
+    )
 
-    record(result.evidence)
+
+def _recorded(result: MaterializationResult) -> MaterializationResult:
+    """Kept as the internal `wait()` return path; the run is recorded by the
+    caller's `RunRecorder`, which owns persistence for the whole lifecycle."""
     return result
 
 

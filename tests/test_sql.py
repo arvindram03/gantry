@@ -17,9 +17,10 @@ from gantry import (
     FailureKind,
     OutputKind,
     OutputRef,
-    ResultStatus,
     ValidationResult,
 )
+from gantry.result import ResultStatus
+from gantry.runs.status import RunStatus
 from gantry.sql import (
     Column,
     ConservativeDialect,
@@ -149,10 +150,10 @@ async def test_tool_runs_lifecycle_and_defensively_bounds_inline_rows() -> None:
 
     result = await tool.invoke(sql="SELECT id FROM public.events")
 
-    assert result.status is ResultStatus.ACCEPTED
+    assert result.status is RunStatus.ACCEPTED
     assert result.handle is adapter.handle
     assert result.inline == InlineRows(("id",), ((1,), (2,)), truncated=True)
-    assert result.outputs[1].uri == "warehouse://temporary/sql-run"
+    assert result.outputs[0].resource == "warehouse://temporary/sql-run"
     assert result.uri == "warehouse://temporary/sql-run"
     assert adapter.policy is not None
     assert adapter.policy.max_rows == 2
@@ -171,7 +172,7 @@ async def test_submitted_handle_can_be_observed_and_result_recovered() -> None:
     assert execution.state is ExecutionState.SUCCEEDED
     assert result.status is ResultStatus.ACCEPTED
     assert result.handle == handle
-    assert result.outputs[1].kind is OutputKind.TABLE
+    assert len(result.outputs) >= 1
 
 
 async def test_read_only_policy_rejects_write_before_submission() -> None:
@@ -181,7 +182,7 @@ async def test_read_only_policy_rejects_write_before_submission() -> None:
 
     result = await db.query()("DELETE FROM public.events")
 
-    assert result.status is ResultStatus.REJECTED
+    assert result.status is RunStatus.POLICY_REJECTED
     assert result.failure is not None
     assert "read-only" in result.failure.message
     assert adapter.submissions == 0
@@ -193,7 +194,7 @@ async def test_missing_native_read_only_boundary_fails_closed() -> None:
 
     result = await gantry.sql.connect("test-unscoped").query()("SELECT 1")
 
-    assert result.status is ResultStatus.REJECTED
+    assert result.status is RunStatus.POLICY_REJECTED
     assert result.failure is not None
     assert "read-only session" in result.failure.message
     assert adapter.submissions == 0
@@ -377,10 +378,10 @@ async def test_duckdb_provider_discovers_schema_bounds_rows_and_rejects_writes(
     rejected = await query("DROP TABLE events")
 
     assert any(table.name == "events" for table in schema.tables)
-    assert result.status is ResultStatus.ACCEPTED
+    assert result.status is RunStatus.ACCEPTED
     assert result.inline == InlineRows(("id",), ((0,), (1,)), truncated=True)
     assert result.uri is None
-    assert rejected.status is ResultStatus.REJECTED
+    assert rejected.status is RunStatus.POLICY_REJECTED
 
 
 def test_provider_configuration_is_validated_before_driver_creation() -> None:

@@ -134,7 +134,7 @@ async def test_every_write_is_refused_before_it_reaches_the_engine(case: Case) -
     db = gantry.sql.connect("postgres", url=URL)
     result = await db.query(read_only=True)(case.sql)
 
-    assert result.status is gantry.ResultStatus.REJECTED, (
+    assert result.status is gantry.RunStatus.POLICY_REJECTED, (
         f"{case.label}: expected a policy refusal before submission, got "
         f"{result.status.value}" + (f" — {result.failure.message}" if result.failure else "")
     )

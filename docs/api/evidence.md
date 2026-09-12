@@ -80,32 +80,5 @@ check that ran and failed.
 
 ## Durable runs
 
-Evidence that lives only in the calling process answers nothing later. The run
-store keeps it past the process, and past the agent conversation.
-
-```python
-gantry.runs.configure(gantry.runs.SQLiteRunStore(".gantry/runs.db"))
-
-result = await build(sql)
-# Governed operations record their evidence automatically.
-
-# …in another process, holding only the id
-run = gantry.runs.get(run_id)
-print(run.render())
-```
-
-::: gantry.runs.RunRecord
-
-::: gantry.runs.RunStore
-
-::: gantry.runs.SQLiteRunStore
-
-::: gantry.runs.MemoryRunStore
-
-::: gantry.runs.record
-
-::: gantry.runs.get
-
-::: gantry.runs.recent
-
-::: gantry.runs.configure
+Evidence is attached to a run, which is the durable record of the whole
+operation. See [Runs](runs.md).

@@ -530,10 +530,30 @@ class FlinkStreamJob(FlinkJob):
 
 
 def _recorded(result: FlinkResult) -> FlinkResult:
-    from gantry.runs import record
+    """Record the run for a Flink job and hand it back on the result."""
+    from dataclasses import replace
 
-    record(result.evidence)
-    return result
+    from gantry.runs.lifecycle import run_from_evidence
+    from gantry.runs.model import OperationKind
+
+    kind = (
+        (
+            OperationKind.STREAM
+            if str(result.execution.handle.metadata.get("mode", "")).lower() == "streaming"
+            else OperationKind.BATCH
+        )
+        if result.execution is not None
+        else OperationKind.BATCH
+    )
+    run = run_from_evidence(
+        result.evidence,
+        kind=kind,
+        engine="flink",
+        provider="flink",
+        status=result.status,
+        verification=result.verification,
+    )
+    return replace(result, run=run)
 
 
 def _parse_job(sql: str) -> FlinkJobPlan:

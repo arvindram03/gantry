@@ -8,7 +8,7 @@ from collections.abc import Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from hashlib import sha256
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from gantry.artifact import Artifact
 from gantry.context import Context
@@ -16,7 +16,11 @@ from gantry.evidence import EvidenceBundle, Observation, ObservationSource
 from gantry.execution import Execution, ExecutionResult, ExecutionState, ValidationResult
 from gantry.failure import Failure, FailureKind
 from gantry.handle import ExecutionHandle
+from gantry.output import OutputKind, OutputRef
 from gantry.result import Result, ResultStatus
+from gantry.runs.lifecycle import RunRecorder
+from gantry.runs.model import OperationKind, QueryResultRef, ResourceRef, Run
+from gantry.runs.status import RunStatus
 from gantry.runtime import ControlPlane
 from gantry.sql.adapter import SQLAdapter
 from gantry.sql.bridge import SQLExecutionAdapter
@@ -188,8 +192,14 @@ class SQLConnection:
         context: Context | None = None,
         trusted_verify: Sequence[Verifier | MaterializationCheck] = (),
         agent_verify: Sequence[MaterializationCheck] = (),
-    ) -> SQLResult:
-        """Execute SQL for a configured query operation.
+        agent_capabilities: frozenset[str] = frozenset(),
+    ) -> Run:
+        """Execute SQL for a configured query operation, and record the run.
+
+        Returns the `Run`: the durable record of what was asked, what was
+        allowed, what ran and what was decided. A query's rows travel on it as
+        `run.rows`, and are dropped on the way to storage — a run record is not
+        a place for result sets to accumulate.
 
         Two kinds of check arrive here. A `Verifier` inspects the execution and
         runs inside the control plane, as it always has. A `MaterializationCheck`
@@ -199,33 +209,93 @@ class SQLConnection:
         """
         verifiers = tuple(item for item in trusted_verify if isinstance(item, Verifier))
         trusted_checks = tuple(item for item in trusted_verify if not isinstance(item, Verifier))
+
+        # Recorded before anything reaches the engine. If this raises, nothing
+        # is submitted — an engine job without a record of why it was allowed
+        # is the one outcome this ordering exists to prevent.
+        recorder = RunRecorder(
+            kind=OperationKind.QUERY,
+            engine="sql",
+            provider=self.provider,
+            proposal=sql,
+            agent_verification=tuple(type(check).__name__ for check in agent_verify),
+        )
+
+        # Admission, in the sense the spec means: is this contract even
+        # satisfiable? A contradictory one is settled here, before the engine is
+        # asked to do work that could never be accepted.
+        from gantry.verify import (
+            VerificationConflict,
+            VerificationInputError,
+            VerificationUnsupported,
+            detect_conflicts,
+            validate_agent_checks,
+        )
+
+        try:
+            agent_checks = validate_agent_checks(
+                tuple(agent_verify), capabilities=agent_capabilities
+            )
+            detect_conflicts(trusted_checks, agent_checks)
+        except VerificationUnsupported as error:
+            return recorder.rejected(
+                (str(error),), status=RunStatus.VERIFICATION_UNSUPPORTED
+            ).with_failure(Failure(FailureKind.VERIFICATION_UNSUPPORTED, False, str(error)))
+        except VerificationConflict as error:
+            return recorder.rejected(
+                (str(error),), status=RunStatus.VERIFICATION_CONFLICT
+            ).with_failure(Failure(FailureKind.VERIFICATION_CONFLICT, False, str(error)))
+        except VerificationInputError as error:
+            return recorder.rejected((str(error),), status=RunStatus.POLICY_REJECTED).with_failure(
+                Failure(FailureKind.VALIDATION_ERROR, False, str(error))
+            )
+        agent_checks_validated = cast("tuple[MaterializationCheck, ...]", tuple(agent_checks))
+
         result = await self.execute(sql, policy=policy, context=context, verify=verifiers)
+        recorder.running(result.handle)
         inline = _find_inline(result, policy.max_rows)
         base = _source_existing(result.verification, CheckSource.TRUSTED)
         verification = _merge(
             base,
             (
                 *_result_set_checks(trusted_checks, inline, CheckSource.TRUSTED),
-                *_result_set_checks(agent_verify, inline, CheckSource.AGENT),
+                *_result_set_checks(agent_checks_validated, inline, CheckSource.AGENT),
             ),
         )
         status, failure = _decide(result, verification)
-        response = SQLResult(
-            status=status,
-            handle=result.handle,
-            inline=inline,
-            outputs=result.outputs,
-            metrics=result.metrics,
-            verification=verification,
-            failure=failure,
-            evidence=_query_evidence(
-                sql, result, inline, verification, status, agent_verify=agent_verify
-            ),
+        evidence = _query_evidence(
+            sql, result, inline, verification, status, agent_verify=agent_checks_validated
         )
-        from gantry.runs import record
-
-        record(response.evidence)
-        return response
+        if status is ResultStatus.REJECTED:
+            return recorder.rejected(
+                _reasons(failure), status=RunStatus.POLICY_REJECTED
+            ).with_failure(failure)
+        if status is ResultStatus.VERIFICATION_UNSUPPORTED:
+            return recorder.rejected(
+                (failure.message if failure else "unsupported verification",),
+                status=RunStatus.VERIFICATION_UNSUPPORTED,
+                verification=verification,
+                evidence=evidence,
+            ).with_failure(failure)
+        if status is ResultStatus.VERIFICATION_CONFLICT:
+            return recorder.rejected(
+                (failure.message if failure else "verification conflict",),
+                status=RunStatus.VERIFICATION_CONFLICT,
+                verification=verification,
+                evidence=evidence,
+            ).with_failure(failure)
+        if status not in {ResultStatus.ACCEPTED, ResultStatus.VERIFICATION_FAILED}:
+            return recorder.execution_failed().with_failure(failure)
+        recorder.verifying()
+        return recorder.decided(
+            verification=verification,
+            evidence=evidence,
+            outputs=_output_refs(self.provider, result.outputs),
+            result_ref=None
+            if inline is None
+            else QueryResultRef(rows=len(inline.rows), inline=True, truncated=inline.truncated),
+            inline=inline,
+        ).with_failure(failure)
 
     async def status(self, handle: ExecutionHandle) -> Execution:
         return await self._adapter.status(handle)
@@ -373,6 +443,19 @@ def connect(provider: str, **config: object) -> SQLConnection:
         metadata=preset.metadata,
     )
     return SQLConnection(target, preset.adapter_factory(target), resolve_dialect(preset.dialect))
+
+
+def _reasons(failure: Failure | None) -> tuple[str, ...]:
+    return () if failure is None else (failure.message,)
+
+
+def _output_refs(provider: str, outputs: Sequence[OutputRef]) -> tuple[ResourceRef, ...]:
+    """Durable outputs as references. Inline rows are a result, not an output."""
+    return tuple(
+        ResourceRef(system=provider, resource=output.uri)
+        for output in outputs
+        if output.kind is not OutputKind.INLINE
+    )
 
 
 def _result_set_checks(

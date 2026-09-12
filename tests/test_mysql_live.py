@@ -24,7 +24,7 @@ import time
 import gantry
 import pytest
 from gantry.failure import FailureKind
-from gantry.result import ResultStatus
+from gantry.runs.status import RunStatus
 
 from _live import require_live_or_skip
 
@@ -107,7 +107,7 @@ async def test_a_governed_query_returns_bounded_rows(db: gantry.sql.SQLConnectio
 
     result = await query("SELECT id, plan FROM analytics.customers ORDER BY id")
 
-    assert result.status is ResultStatus.ACCEPTED
+    assert result.status is RunStatus.ACCEPTED
     assert result.inline is not None
     assert len(result.inline.rows) == 2
     assert result.inline.truncated is True
@@ -121,7 +121,7 @@ async def test_a_write_is_refused_before_it_reaches_the_server(
 
     result = await query("DELETE FROM analytics.customers")
 
-    assert result.status is ResultStatus.REJECTED
+    assert result.status is RunStatus.POLICY_REJECTED
     assert result.handle is None, "a handle would mean it was submitted"
     connection = await _raw()
     try:
@@ -187,7 +187,7 @@ async def test_materialize_creates_verifies_and_then_refuses_to_repeat(
 
     result = await build(sql)
 
-    assert result.status is ResultStatus.ACCEPTED, result.failure
+    assert result.status is RunStatus.ACCEPTED, result.failure
     assert result.uri == f"mysql://{REPORTING}/active_customers"
     checks = {
         check.name: check for check in (result.verification.checks if result.verification else ())
@@ -198,7 +198,7 @@ async def test_materialize_creates_verifies_and_then_refuses_to_repeat(
     assert checks["row_count"].ok and checks["row_count"].actual == 2
 
     repeat = await build(sql)
-    assert repeat.status is ResultStatus.REJECTED
+    assert repeat.status is RunStatus.POLICY_REJECTED
     assert "already exists" in (repeat.failure.message if repeat.failure else "")
 
 
@@ -207,7 +207,7 @@ async def test_a_destination_outside_the_policy_is_refused(db: gantry.sql.SQLCon
 
     result = await build("CREATE TABLE analytics.sneaky AS SELECT id FROM analytics.customers")
 
-    assert result.status is ResultStatus.REJECTED
+    assert result.status is RunStatus.POLICY_REJECTED
     connection = await _raw()
     try:
         exists = await _scalar(
@@ -261,7 +261,7 @@ async def test_the_timeout_stops_the_server_not_just_the_waiting() -> None:
     )
     elapsed = time.monotonic() - started
 
-    assert result.status is not ResultStatus.ACCEPTED
+    assert result.status is not RunStatus.ACCEPTED
     assert result.failure is not None
     assert "exceeded" in result.failure.message
     assert elapsed < 20, f"the deadline did not bound the call: {elapsed:.1f}s"
@@ -306,7 +306,7 @@ async def test_native_validation_rejects_before_anything_runs(
         f"CREATE TABLE {REPORTING}.from_nowhere AS SELECT id FROM analytics.no_such_table"
     )
 
-    assert result.status is not ResultStatus.ACCEPTED
+    assert result.status is not RunStatus.ACCEPTED
     connection = await _raw()
     try:
         exists = await _scalar(

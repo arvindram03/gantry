@@ -13,10 +13,14 @@ import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from gantry.actor import actor
 from gantry.evidence import EvidenceBundle, Observation, ObservationSource
-from gantry.runs.model import render
-from gantry.runs.store import MemoryRunStore, SQLiteRunStore, _bundle_from_dict
-from gantry.verifier import CheckResult
+from gantry.runs.model import OperationKind, OperationRef, ResourceRef, Run, render
+from gantry.runs.sqlite import SQLiteRunStore
+from gantry.runs.sqlite import evidence_from_dict as _bundle_from_dict
+from gantry.runs.status import RunStatus
+from gantry.runs.store import MemoryRunStore
+from gantry.verifier import CheckResult, VerificationResult
 
 
 def _bundle(**overrides: object) -> EvidenceBundle:
@@ -44,6 +48,23 @@ def _bundle(**overrides: object) -> EvidenceBundle:
         ),
     }
     return EvidenceBundle(**{**defaults, **overrides})  # type: ignore[arg-type]
+
+
+def _run(**overrides: object) -> Run:
+    """A run carrying the bundle above, for the store tests."""
+    defaults: dict[str, object] = {
+        "id": "run_123",
+        "status": RunStatus.ACCEPTED,
+        "actor": actor("agent", "test-agent"),
+        "operation": OperationRef(
+            kind=OperationKind.MATERIALIZE, engine="sql", provider="postgres"
+        ),
+        "inputs": (ResourceRef(system="postgres", resource="raw.orders"),),
+        "outputs": (ResourceRef(system="postgres", resource="analytics.customer_metrics"),),
+        "evidence": _bundle(),
+        "verification": VerificationResult(ok=True, checks=_bundle().checks),
+    }
+    return Run(**{**defaults, **overrides})  # type: ignore[arg-type]
 
 
 def test_a_bundle_is_json_and_carries_both_sides_of_every_check() -> None:
@@ -74,6 +95,7 @@ def test_a_bundle_survives_a_round_trip_through_json() -> None:
     original = _bundle()
 
     restored = _bundle_from_dict(json.loads(original.to_json()))
+    assert restored is not None
 
     assert restored.run_id == original.run_id
     assert restored.inputs == original.inputs
@@ -135,14 +157,13 @@ def test_a_run_renders_for_a_person_without_losing_the_numbers() -> None:
     A reader who can only see a verdict can disagree with the verdict. A reader
     who can see the bound and the measurement can disagree with the bound.
     """
-    text = render(_bundle())
+    text = render(_run())
 
     assert "Run run_123" in text
-    assert "Status       ACCEPTED" in text
+    assert "agent:test-agent" in text
+    assert "materialize" in text
     assert "raw.orders" in text
-    assert "postgres://analytics/customer_metrics" in text
-    assert "job: job_xyz" in text
-    assert "runtime: 18.3s" in text
+    assert "analytics.customer_metrics" in text
     assert "✓ row_count" in text
     assert "expected: min 1000000" in text
     assert "observed: value 1190432" in text
@@ -150,11 +171,16 @@ def test_a_run_renders_for_a_person_without_losing_the_numbers() -> None:
 
 def test_an_unsupported_check_renders_differently_from_a_failed_one() -> None:
     """ "Could not measure" and "measured and it was wrong" are different facts."""
-    failed = _bundle(
-        decision="VERIFICATION_FAILED",
-        checks=(
-            CheckResult("row_count", False, {"min": 1}, {"value": 0}, "too few rows"),
-            CheckResult("null_rate", False, {"max": 0.01}, None, "unavailable", supported=False),
+    failed = _run(
+        status=RunStatus.VERIFICATION_UNSUPPORTED,
+        verification=VerificationResult(
+            ok=False,
+            checks=(
+                CheckResult("row_count", False, {"min": 1}, {"value": 0}, "too few rows"),
+                CheckResult(
+                    "null_rate", False, {"max": 0.01}, None, "unavailable", supported=False
+                ),
+            ),
         ),
     )
 
@@ -167,21 +193,21 @@ def test_an_unsupported_check_renders_differently_from_a_failed_one() -> None:
 def test_a_memory_store_returns_what_it_was_given() -> None:
     store = MemoryRunStore()
 
-    stored = store.record(_bundle())
+    store.create(_run())
 
-    assert store.get("run_123") is stored
+    assert store.get("run_123") is not None
     assert store.get("absent") is None
-    assert [run.run_id for run in store.list()] == ["run_123"]
+    assert [run.id for run in store.recent()] == ["run_123"]
 
 
 def test_a_memory_store_filters_by_decision() -> None:
     store = MemoryRunStore()
-    store.record(_bundle())
-    store.record(_bundle(run_id="run_456", decision="VERIFICATION_FAILED"))
+    store.create(_run())
+    store.create(_run(id="run_456", status=RunStatus.REJECTED))
 
-    rejected = store.list(decision="VERIFICATION_FAILED")
+    rejected = store.recent(status="REJECTED")
 
-    assert [run.run_id for run in rejected] == ["run_456"]
+    assert [run.id for run in rejected] == ["run_456"]
 
 
 def test_a_sqlite_store_outlives_the_object_that_wrote_it(tmp_path: object) -> None:
@@ -193,16 +219,16 @@ def test_a_sqlite_store_outlives_the_object_that_wrote_it(tmp_path: object) -> N
     """
     path = f"{tmp_path}/runs.db"
     writer = SQLiteRunStore(path)
-    writer.record(_bundle())
+    writer.create(_run())
     writer.close()
 
     reader = SQLiteRunStore(path)
     try:
         run = reader.get("run_123")
         assert run is not None
-        assert run.decision == "ACCEPTED"
-        assert run.evidence.inputs == ("raw.orders",)
-        assert run.evidence.checks[0].expected == {"min": 1_000_000}
+        assert run.status is RunStatus.ACCEPTED
+        assert [r.resource for r in run.inputs] == ["raw.orders"]
+        assert run.verification is not None
         assert "✓ row_count" in run.render()
     finally:
         reader.close()
@@ -214,21 +240,26 @@ def test_recording_the_same_run_twice_updates_rather_than_duplicates(
     """A stream is observed more than once, and is one run each time."""
     store = SQLiteRunStore(f"{tmp_path}/runs.db")
     try:
-        store.record(_bundle(decision="ACCEPTED"))
-        store.record(_bundle(decision="VERIFICATION_FAILED"))
+        store.create(_run())
+        store.create(_run(status=RunStatus.REJECTED))
 
-        assert len(store.list()) == 1
+        assert len(store.recent()) == 1
         run = store.get("run_123")
-        assert run is not None and run.decision == "VERIFICATION_FAILED"
+        assert run is not None and run.status is RunStatus.REJECTED
     finally:
         store.close()
 
 
-def test_recording_nothing_is_not_an_error() -> None:
-    """Results without evidence exist; callers should not need a guard."""
-    from gantry import runs
+def test_a_run_without_evidence_still_records() -> None:
+    """A refused proposal has no evidence and is still a run worth keeping."""
+    store = MemoryRunStore()
 
-    assert runs.record(None) is None
+    store.create(_run(evidence=None, status=RunStatus.POLICY_REJECTED))
+
+    recorded = store.get("run_123")
+    assert recorded is not None
+    assert recorded.evidence is None
+    assert recorded.status is RunStatus.POLICY_REJECTED
 
 
 async def test_a_provider_that_cannot_measure_a_check_fails_closed(tmp_path: object) -> None:
@@ -244,7 +275,7 @@ async def test_a_provider_that_cannot_measure_a_check_fails_closed(tmp_path: obj
     import gantry
     import gantry.verify
     from gantry.failure import FailureKind
-    from gantry.result import ResultStatus
+    from gantry.runs.status import RunStatus
 
     pytest.importorskip("duckdb")
     db = gantry.sql.connect("duckdb", path=f"{tmp_path}/probe.duckdb")
@@ -262,7 +293,7 @@ async def test_a_provider_that_cannot_measure_a_check_fails_closed(tmp_path: obj
 
     result = await build("CREATE TABLE main.derived AS SELECT customer_id FROM main.source")
 
-    assert result.status is ResultStatus.VERIFICATION_FAILED
+    assert result.status is RunStatus.VERIFICATION_UNSUPPORTED
     assert result.failure is not None
     assert result.failure.kind is FailureKind.UNSUPPORTED_VERIFICATION, (
         "an unmeasurable check must be distinguishable from a failed one"
@@ -304,7 +335,6 @@ async def test_the_same_checks_serve_a_query_and_a_materialization(tmp_path: obj
     """
     import gantry
     import gantry.verify
-    from gantry.result import ResultStatus
 
     read_path = _seeded(
         tmp_path, "CREATE TABLE main.people AS SELECT 1 AS id UNION ALL SELECT 2", name="read"
@@ -324,17 +354,17 @@ async def test_the_same_checks_serve_a_query_and_a_materialization(tmp_path: obj
         "CREATE TABLE main.copy AS SELECT id FROM main.people"
     )
 
-    assert queried.status is ResultStatus.ACCEPTED, queried.failure
-    assert built.status is ResultStatus.ACCEPTED, built.failure
+    assert queried.status is RunStatus.ACCEPTED, queried.failure
+    assert built.status is RunStatus.ACCEPTED, built.failure
     for result in (queried, built):
         assert result.verification is not None
         assert [c.name for c in result.verification.checks] == ["row_count", "required_columns"]
     # Both emit evidence, in the same shape.
     for result in (queried, built):
         assert result.evidence is not None
-        assert result.evidence.decision == "ACCEPTED"
-        assert result.evidence.checks
-        assert json.loads(result.evidence.to_json())["run_id"] == result.evidence.run_id
+        assert result.status is RunStatus.ACCEPTED
+        assert result.verification is not None
+        assert json.loads(result.to_json())["id"] == result.id
 
 
 async def test_a_check_that_cannot_mean_anything_on_a_query_is_unsupported(
@@ -349,7 +379,6 @@ async def test_a_check_that_cannot_mean_anything_on_a_query_is_unsupported(
     import gantry
     import gantry.verify
     from gantry.failure import FailureKind
-    from gantry.result import ResultStatus
 
     db = gantry.sql.connect(
         "duckdb", path=_seeded(tmp_path, "CREATE TABLE main.t AS SELECT 1 AS a"), read_only=True
@@ -359,7 +388,7 @@ async def test_a_check_that_cannot_mean_anything_on_a_query_is_unsupported(
         "SELECT a FROM main.t"
     )
 
-    assert result.status is ResultStatus.VERIFICATION_FAILED
+    assert result.status is RunStatus.VERIFICATION_UNSUPPORTED
     assert result.failure is not None
     assert result.failure.kind is FailureKind.UNSUPPORTED_VERIFICATION
     assert result.verification is not None
@@ -378,7 +407,6 @@ async def test_a_truncated_result_cannot_have_its_rows_counted(tmp_path: object)
     """
     import gantry
     import gantry.verify
-    from gantry.result import ResultStatus
 
     db = gantry.sql.connect(
         "duckdb",
@@ -394,7 +422,7 @@ async def test_a_truncated_result_cannot_have_its_rows_counted(tmp_path: object)
     )
 
     assert result.inline is not None and result.inline.truncated
-    assert result.status is ResultStatus.VERIFICATION_FAILED
+    assert result.status is RunStatus.VERIFICATION_UNSUPPORTED
     assert result.verification is not None
     check = result.verification.checks[0]
     assert not check.supported
@@ -433,7 +461,6 @@ async def test_execution_failure_is_not_overridden_by_result_set_checks(
     """Re-deciding can only take acceptance away, never grant it."""
     import gantry
     import gantry.verify
-    from gantry.result import ResultStatus
 
     db = gantry.sql.connect(
         "duckdb", path=_seeded(tmp_path, "CREATE TABLE main.t AS SELECT 1 AS id"), read_only=True
@@ -443,8 +470,8 @@ async def test_execution_failure_is_not_overridden_by_result_set_checks(
         "SELECT * FROM main.no_such_table"
     )
 
-    assert result.status is not ResultStatus.ACCEPTED
-    assert result.status is not ResultStatus.VERIFICATION_FAILED
+    assert result.status is not RunStatus.ACCEPTED
+    assert result.status is not RunStatus.REJECTED
 
 
 async def test_a_null_rate_over_no_rows_is_not_a_null_rate_of_zero(tmp_path: object) -> None:
@@ -456,7 +483,6 @@ async def test_a_null_rate_over_no_rows_is_not_a_null_rate_of_zero(tmp_path: obj
     """
     import gantry
     import gantry.verify
-    from gantry.result import ResultStatus
 
     db = gantry.sql.connect(
         "duckdb",
@@ -469,7 +495,7 @@ async def test_a_null_rate_over_no_rows_is_not_a_null_rate_of_zero(tmp_path: obj
     )("SELECT id FROM main.t")
 
     assert result.inline is not None and result.inline.rows == ()
-    assert result.status is ResultStatus.VERIFICATION_FAILED
+    assert result.status is RunStatus.VERIFICATION_UNSUPPORTED
     assert result.verification is not None
     check = result.verification.checks[0]
     assert not check.supported, "no rows measured is not a measurement of zero"

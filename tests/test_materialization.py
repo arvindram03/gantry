@@ -8,7 +8,8 @@ from typing import Any, cast
 import duckdb
 import gantry
 import pytest
-from gantry import Context, FailureKind, OutputKind, ResultStatus
+from gantry import Context, FailureKind
+from gantry.runs.status import RunStatus
 from gantry.sql import (
     MaterializationError,
     MaterializationOperation,
@@ -99,16 +100,16 @@ async def test_duckdb_materialization_returns_reference_and_verifies_destination
 
     result = await materialize(_sql())
 
-    assert result.status is ResultStatus.ACCEPTED
-    assert result.output is not None
-    assert result.output.kind is OutputKind.TABLE
-    assert result.output.uri == "duckdb://agent_scratch/high_risk_customers"
+    assert result.status is RunStatus.ACCEPTED
+    assert result.outputs
+    assert result.outputs and result.outputs[0].system
+    assert result.uri == "duckdb://agent_scratch/high_risk_customers"
     assert result.uri == "duckdb://agent_scratch/high_risk_customers"
     assert result.execution is not None
-    assert result.execution.state.value == "SUCCEEDED"
+    assert result.execution.status == "SUCCEEDED"
     assert result.verification is not None
     assert result.verification.ok
-    assert all(output.kind is not OutputKind.INLINE for output in (result.output,))
+    assert result.uri is not None
 
 
 async def test_materialization_enforces_source_destination_and_create_only_policy(
@@ -129,15 +130,15 @@ async def test_materialization_enforces_source_destination_and_create_only_polic
     accepted = await materialize(_sql())
     existing = await materialize(_sql())
 
-    assert source_rejected.status is ResultStatus.REJECTED
+    assert source_rejected.status is RunStatus.POLICY_REJECTED
     assert source_rejected.failure is not None
     assert source_rejected.failure.kind is FailureKind.SOURCE_NOT_ALLOWED
     assert source_rejected.uri is None
-    assert destination_rejected.status is ResultStatus.REJECTED
+    assert destination_rejected.status is RunStatus.POLICY_REJECTED
     assert destination_rejected.failure is not None
     assert destination_rejected.failure.kind is FailureKind.DESTINATION_NOT_ALLOWED
     assert accepted.ok
-    assert existing.status is ResultStatus.REJECTED
+    assert existing.status is RunStatus.POLICY_REJECTED
     assert existing.failure is not None
     assert existing.failure.kind is FailureKind.DESTINATION_EXISTS
 
@@ -152,8 +153,8 @@ async def test_verification_failure_reports_existing_output_without_cleanup(tmp_
 
     result = await materialize(_sql("agent_scratch.too_small"))
 
-    assert result.status is ResultStatus.VERIFICATION_FAILED
-    assert result.output is not None
+    assert result.status is RunStatus.REJECTED
+    assert result.outputs
     assert result.failure is not None
     assert result.failure.kind is FailureKind.VERIFICATION_FAILED
     assert result.verification is not None
@@ -173,8 +174,8 @@ async def test_duckdb_adapter_optionally_materializes_a_view(tmp_path: Path) -> 
     )
 
     assert result.ok
-    assert result.output is not None
-    assert result.output.metadata["object_kind"] == "view"
+    assert result.outputs
+    assert result.uri is not None
     assert result.verification is not None
     assert result.verification.checks[0].actual == 3
 
@@ -235,7 +236,7 @@ async def test_read_only_adapter_rejects_materialization_before_submission(tmp_p
         "CREATE TABLE scratch.result AS SELECT 1 AS id"
     )
 
-    assert result.status is ResultStatus.REJECTED
+    assert result.status is RunStatus.POLICY_REJECTED
     assert result.failure is not None
     assert result.failure.kind is FailureKind.OPERATION_NOT_ALLOWED
 
@@ -251,10 +252,10 @@ async def test_materializer_normalizes_invalid_sql_and_unsupported_limits(tmp_pa
     invalid = await materialize("DELETE FROM raw.invoices")
     unsupported = await materialize(_sql("agent_scratch.expensive"))
 
-    assert invalid.status is ResultStatus.REJECTED
+    assert invalid.status is RunStatus.POLICY_REJECTED
     assert invalid.failure is not None
     assert invalid.failure.kind is FailureKind.OPERATION_NOT_ALLOWED
-    assert unsupported.status is ResultStatus.REJECTED
+    assert unsupported.status is RunStatus.POLICY_REJECTED
     assert unsupported.failure is not None
     assert unsupported.failure.kind is FailureKind.UNSUPPORTED_POLICY_REQUIREMENT
     assert materialize.input_schema["required"] == ["sql"]

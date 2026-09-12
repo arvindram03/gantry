@@ -5,7 +5,42 @@ Notable changes. Dates are release dates; the format follows
 
 ## Unreleased
 
+### Changed
+
+- **Governed operations return a `Run`.** `db.query(...)` and
+  `db.materialize(...)` now return the durable record of the work — its id,
+  status, actor, proposal, inputs, outputs, admission, execution, verification
+  and evidence — rather than a provider-shaped result. A query's rows are on
+  `run.rows`; `run.ok` still means executed *and* verified. This is a breaking
+  change to the return type; `submit()` and `wait()` are unchanged.
+- `RunStatus` separates outcomes that were previously one. A proposal Gantry
+  refused (`POLICY_REJECTED`), work the engine could not do
+  (`EXECUTION_FAILED`), a check that could not be evaluated
+  (`VERIFICATION_UNSUPPORTED`), a contract that contradicted itself
+  (`VERIFICATION_CONFLICT`) and a measured result that was not acceptable
+  (`REJECTED`) are five different events with five different remedies.
+
 ### Added
+
+- **Durable runs.** Every governed operation records a run before anything
+  reaches the engine, and updates it as the work progresses. If that first
+  write fails, nothing is submitted — an engine job that exists without a
+  record of why it was allowed to is the outcome the ordering prevents.
+  `gantry.runs.get(run_id)` reads one back in another process;
+  `run.render()` lays it out for a person.
+- `gantry.actor` — `ActorRef`, `gantry.actor.actor(...)` and a
+  `gantry.actor.context(...)` block that attributes every run inside it. The
+  identity comes from the application, never from the proposal: an agent that
+  could name itself could name someone else. Unattributed runs record
+  `unknown` rather than guessing.
+- Proposal retention is configurable. The digest is always kept; the body is
+  kept by default and can be reduced to `ProposalStorage.HASH` for callers who
+  would rather agent-written SQL — which routinely carries values out of the
+  data it filters — did not accumulate in a durable file.
+- Flink and MongoDB operations record runs through the same lifecycle and
+  expose `result.run` and `result.run_id`. Their result types keep their
+  provider shapes rather than folding `StreamingHealth` and inline documents
+  into `Run`, which the spec warns against.
 
 - **Trusted plus agent-proposed verification.** Configure immutable trusted
   checks with `checks=` and add task-specific commitments with call-time

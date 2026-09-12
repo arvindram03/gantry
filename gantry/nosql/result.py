@@ -22,6 +22,13 @@ class NoSQLResult:
     metrics: ExecutionMetrics = field(default_factory=ExecutionMetrics)
     verification: VerificationResult | None = None
     failure: Failure | None = None
+    run: object | None = None
+    """The durable run record for this operation."""
+
+    @property
+    def run_id(self) -> str | None:
+        return None if self.run is None else str(getattr(self.run, "id", None))
+
     evidence: EvidenceBundle | None = None
 
     @property

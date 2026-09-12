@@ -39,6 +39,14 @@ class FlinkResult:
     health: StreamingHealth | None = None
     failure: Failure | None = None
     evidence: EvidenceBundle | None = None
+    run: object | None = None
+    """The durable run record for this job."""
+
+    @property
+    def run_id(self) -> str | None:
+        """The Gantry run id, for a caller or an agent to refer to later."""
+        return None if self.run is None else str(getattr(self.run, "id", None))
+
     """What Gantry observed while deciding, in the same shape SQL emits."""
 
     @property

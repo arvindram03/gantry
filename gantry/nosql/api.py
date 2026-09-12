@@ -149,10 +149,20 @@ class NoSQLConnection:
                 collection, pipeline, raw, result.inline, verification, status, agent_verify
             ),
         )
-        from gantry.runs import record
+        from dataclasses import replace as _replace
 
-        record(response.evidence)
-        return response
+        from gantry.runs.lifecycle import run_from_evidence
+        from gantry.runs.model import OperationKind
+
+        run = run_from_evidence(
+            response.evidence,
+            kind=OperationKind.QUERY,
+            engine="mongodb",
+            provider=self.provider,
+            status=response.status,
+            verification=response.verification,
+        )
+        return _replace(response, run=run)
 
     async def submit(
         self,

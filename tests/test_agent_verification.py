@@ -10,8 +10,9 @@ from pathlib import Path
 import duckdb
 import gantry
 from gantry.failure import FailureKind
-from gantry.result import ResultStatus
-from gantry.runs.store import MemoryRunStore, _bundle_from_dict
+from gantry.runs.sqlite import evidence_from_dict as _bundle_from_dict
+from gantry.runs.status import RunStatus
+from gantry.runs.store import MemoryRunStore
 from gantry.verifier import CheckSource
 
 
@@ -35,7 +36,7 @@ async def test_runtime_checks_are_agent_commitments_and_are_recorded(tmp_path: P
         verify=[gantry.verify.not_empty(), gantry.verify.required_columns(["id"])],
     )
 
-    assert result.status is ResultStatus.ACCEPTED
+    assert result.status is RunStatus.ACCEPTED
     assert result.verification is not None
     assert [check.source for check in result.verification.checks] == [
         CheckSource.TRUSTED,
@@ -47,8 +48,10 @@ async def test_runtime_checks_are_agent_commitments_and_are_recorded(tmp_path: P
         {"type": "not_empty"},
         {"type": "required_columns", "columns": ["id"]},
     ]
-    assert store.get(result.evidence.run_id) is not None
+    assert store.get(result.id) is not None
+    assert result.evidence is not None
     restored = _bundle_from_dict(json.loads(result.evidence.to_json()))
+    assert restored is not None
     assert len(restored.trusted_checks) == 1
     assert len(restored.agent_checks) == 2
     assert restored.agent_checks[0].source is CheckSource.AGENT
@@ -59,7 +62,8 @@ async def test_conflicting_count_contract_stops_before_execution(tmp_path: Path)
 
     result = await query("SELECT id FROM events", verify=[gantry.verify.row_count(min=2)])
 
-    assert result.status is ResultStatus.VERIFICATION_CONFLICT
+    assert result.status is RunStatus.VERIFICATION_CONFLICT
+    assert result.failure is not None
     assert result.failure is not None
     assert result.failure.kind is FailureKind.VERIFICATION_CONFLICT
     assert result.handle is None
@@ -76,8 +80,8 @@ async def test_agent_cannot_spoof_provenance_or_request_provider_incompatible_ch
     )
     unsupported = await tool.invoke(sql="SELECT id FROM events", verify=[{"type": "running"}])
 
-    assert spoofed.status is ResultStatus.REJECTED
-    assert unsupported.status is ResultStatus.VERIFICATION_UNSUPPORTED
+    assert spoofed.status is RunStatus.POLICY_REJECTED
+    assert unsupported.status is RunStatus.VERIFICATION_UNSUPPORTED
     assert unsupported.failure is not None
     assert unsupported.failure.kind is FailureKind.VERIFICATION_UNSUPPORTED
 
@@ -89,7 +93,8 @@ async def test_agent_check_that_cannot_be_measured_fails_as_unsupported(
 
     result = await query("SELECT id FROM events", verify=[gantry.verify.row_count(min=1)])
 
-    assert result.status is ResultStatus.VERIFICATION_UNSUPPORTED
+    assert result.status is RunStatus.VERIFICATION_UNSUPPORTED
+    assert result.failure is not None
     assert result.failure is not None
     assert result.failure.kind is FailureKind.VERIFICATION_UNSUPPORTED
     assert result.verification is not None

@@ -125,6 +125,7 @@ class MaterializationResult:
     metrics: ExecutionMetrics = field(default_factory=ExecutionMetrics)
     verification: VerificationResult | None = None
     failure: Failure | None = None
+    run: object | None = None
     evidence: EvidenceBundle | None = None
 
     @property
@@ -672,10 +673,21 @@ def _evidence(
 
 
 def _recorded(result: MaterializationResult) -> MaterializationResult:
-    from gantry.runs import record
+    """Record the run for a MongoDB materialization and hand it back."""
+    from dataclasses import replace
 
-    record(result.evidence)
-    return result
+    from gantry.runs.lifecycle import run_from_evidence
+    from gantry.runs.model import OperationKind
+
+    run = run_from_evidence(
+        result.evidence,
+        kind=OperationKind.MATERIALIZE,
+        engine="mongodb",
+        provider="mongodb",
+        status=result.status,
+        verification=result.verification,
+    )
+    return replace(result, run=run)
 
 
 def _failed(status: ResultStatus, failure: Failure) -> MaterializationResult:

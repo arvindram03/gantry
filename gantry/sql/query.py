@@ -9,18 +9,16 @@ from typing import TYPE_CHECKING
 
 from gantry.context import Context
 from gantry.failure import Failure, FailureKind
-from gantry.result import ResultStatus
+from gantry.runs.lifecycle import RunRecorder
+from gantry.runs.model import OperationKind, Run
+from gantry.runs.status import RunStatus
 from gantry.sql.policy import SQLPolicy
-from gantry.sql.result import SQLResult
 from gantry.tool import Tool
 from gantry.verifier import Verifier
 from gantry.verify import (
-    VerificationConflict,
     VerificationInputError,
     VerificationUnsupported,
-    detect_conflicts,
     parse_agent_checks,
-    validate_agent_checks,
     verification_schema,
 )
 
@@ -45,23 +43,14 @@ class SQLQuery:
         *,
         context: Context | None = None,
         verify: Sequence[MaterializationCheck] = (),
-    ) -> SQLResult:
-        try:
-            agent_checks = validate_agent_checks(
-                tuple(verify), capabilities=self._agent_capabilities
-            )
-            trusted_checks = tuple(item for item in self._verify if not isinstance(item, Verifier))
-            detect_conflicts(trusted_checks, agent_checks)
-        except VerificationUnsupported as error:
-            return _verification_rejection(error, unsupported=True)
-        except (VerificationConflict, VerificationInputError) as error:
-            return _verification_rejection(error, conflict=isinstance(error, VerificationConflict))
+    ) -> Run:
         return await self._connection._query(
             sql,
             policy=self._policy,
+            agent_capabilities=self._agent_capabilities,
             context=context,
             trusted_verify=self._verify,
-            agent_verify=agent_checks,  # type: ignore[arg-type]
+            agent_verify=tuple(verify),
         )
 
     def tool(
@@ -69,7 +58,7 @@ class SQLQuery:
         *,
         name: str = "query_sql",
         description: str = "Run a governed read-only SQL query.",
-    ) -> Tool[SQLResult]:
+    ) -> Tool[Run]:
         """Return the narrow framework-neutral form of this query operation."""
 
         if not self._policy.read_only:
@@ -91,7 +80,7 @@ class SQLQuery:
             _handler=self._invoke_tool,
         )
 
-    async def _invoke_tool(self, arguments: Mapping[str, object]) -> SQLResult:
+    async def _invoke_tool(self, arguments: Mapping[str, object]) -> Run:
         _require_query_arguments(arguments)
         sql = arguments.get("sql")
         if not isinstance(sql, str):
@@ -101,10 +90,32 @@ class SQLQuery:
                 arguments.get("verify"), capabilities=self._agent_capabilities
             )
         except VerificationUnsupported as error:
-            return _verification_rejection(error, unsupported=True)
+            return self._refused(sql, error, RunStatus.VERIFICATION_UNSUPPORTED)
         except VerificationInputError as error:
-            return _verification_rejection(error)
+            return self._refused(sql, error, RunStatus.POLICY_REJECTED)
         return await self(sql, verify=checks)  # type: ignore[arg-type]
+
+    def _refused(self, sql: str, error: Exception, status: RunStatus) -> Run:
+        """Record a run for a proposal refused before admission.
+
+        A tool response carries a run id, so a malformed proposal has to get one
+        too — an agent that is told "rejected" with nothing to refer to cannot
+        be asked about it later.
+        """
+        recorder = RunRecorder(
+            kind=OperationKind.QUERY,
+            engine="sql",
+            provider=self._connection.provider,
+            proposal=sql,
+        )
+        kind = (
+            FailureKind.VERIFICATION_UNSUPPORTED
+            if status is RunStatus.VERIFICATION_UNSUPPORTED
+            else FailureKind.VALIDATION_ERROR
+        )
+        return recorder.rejected((str(error),), status=status).with_failure(
+            Failure(kind, False, str(error))
+        )
 
 
 def _require_query_arguments(arguments: Mapping[str, object]) -> None:
@@ -112,23 +123,3 @@ def _require_query_arguments(arguments: Mapping[str, object]) -> None:
     if unexpected:
         names = ", ".join(sorted(unexpected))
         raise ValueError(f"unexpected query tool arguments: {names}")
-
-
-def _verification_rejection(
-    error: Exception, *, unsupported: bool = False, conflict: bool = False
-) -> SQLResult:
-    status = (
-        ResultStatus.VERIFICATION_UNSUPPORTED
-        if unsupported
-        else ResultStatus.VERIFICATION_CONFLICT
-        if conflict
-        else ResultStatus.REJECTED
-    )
-    kind = (
-        FailureKind.VERIFICATION_UNSUPPORTED
-        if unsupported
-        else FailureKind.VERIFICATION_CONFLICT
-        if conflict
-        else FailureKind.VALIDATION_ERROR
-    )
-    return SQLResult(status, failure=Failure(kind, False, str(error)))

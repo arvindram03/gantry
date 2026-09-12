@@ -19,7 +19,7 @@ import os
 
 import gantry
 import pytest
-from gantry.result import ResultStatus
+from gantry.runs.status import RunStatus
 
 from _live import require_live_or_skip
 
@@ -116,7 +116,7 @@ async def test_a_write_is_refused_before_it_reaches_the_database(
     query = db.query(read_only=True)
     result = await query("CREATE TABLE gantry_should_not_exist (id int)")
 
-    assert result.status.value == "REJECTED"
+    assert result.status is RunStatus.POLICY_REJECTED
     assert result.failure is not None
     assert "read-only" in result.failure.message
 
@@ -156,7 +156,7 @@ async def test_materialize_creates_verifies_and_refuses_to_repeat(
 
     result = await build(sql)
 
-    assert result.status is ResultStatus.ACCEPTED, result.failure
+    assert result.status is RunStatus.ACCEPTED, result.failure
     assert result.uri == "postgres://reporting/live_rollup"
     checks = {
         check.name: check for check in (result.verification.checks if result.verification else ())
@@ -166,7 +166,7 @@ async def test_materialize_creates_verifies_and_refuses_to_repeat(
     assert checks["row_count"].ok and isinstance(checks["row_count"].actual, int)
 
     repeat = await build(sql)
-    assert repeat.status is ResultStatus.REJECTED
+    assert repeat.status is RunStatus.POLICY_REJECTED
     assert "already exists" in (repeat.failure.message if repeat.failure else "")
 
     await _raw_execute("DROP TABLE IF EXISTS reporting.live_rollup")
@@ -189,7 +189,7 @@ async def test_a_view_is_validated_by_dry_run_and_leaves_nothing_behind(
     refused = await build(
         "CREATE VIEW reporting.live_view AS SELECT * FROM analytics.no_such_table"
     )
-    assert refused.status is ResultStatus.REJECTED
+    assert refused.status is RunStatus.POLICY_REJECTED
     assert "no_such_table" in (refused.failure.message if refused.failure else "")
 
     absent = db.query(schemas=["information_schema"])
@@ -201,7 +201,7 @@ async def test_a_view_is_validated_by_dry_run_and_leaves_nothing_behind(
     assert found.inline.rows[0][0] == 0, "the dry run left the view behind"
 
     created = await build("CREATE VIEW reporting.live_view AS SELECT status FROM analytics.orders")
-    assert created.status is ResultStatus.ACCEPTED, created.failure
+    assert created.status is RunStatus.ACCEPTED, created.failure
     assert created.uri == "postgres://reporting/live_view"
 
     await _raw_execute("DROP VIEW IF EXISTS reporting.live_view")
@@ -404,7 +404,7 @@ async def test_null_rate_catches_a_join_that_row_count_calls_healthy(
         "LEFT JOIN analytics.customers c ON c.customer_id = o.order_id"
     )
 
-    assert result.status is ResultStatus.VERIFICATION_FAILED
+    assert result.status is RunStatus.REJECTED
     checks = {
         check.name: check for check in (result.verification.checks if result.verification else ())
     }
@@ -438,23 +438,23 @@ async def test_a_run_is_readable_from_another_process_with_only_its_id(
     result = await build(
         "CREATE TABLE reporting.evidence_probe AS SELECT customer_id FROM analytics.customers"
     )
-    assert result.status is ResultStatus.ACCEPTED, result.failure
+    assert result.status is RunStatus.ACCEPTED, result.failure
     assert result.evidence is not None
 
     path = f"{tmp_path}/runs.db"
     writer = SQLiteRunStore(path)
-    writer.record(result.evidence)
+    writer.create(result)
     writer.close()
 
     reader = SQLiteRunStore(path)
     try:
-        run = reader.get(result.evidence.run_id)
+        run = reader.get(result.id)
         assert run is not None
-        assert run.decision == "ACCEPTED"
-        assert run.evidence.inputs == ("analytics.customers",)
-        assert run.evidence.outputs == ("postgres://reporting/evidence_probe",)
-        assert run.evidence.native_execution_id is not None
-        assert run.evidence.proposal_hash is not None
+        assert run.status is RunStatus.ACCEPTED
+        assert [r.resource for r in run.inputs] == ["analytics.customers"]
+        assert run.uri == "postgres://reporting/evidence_probe"
+        assert run.execution is not None and run.execution.native_id is not None
+        assert run.proposal is not None and run.proposal.hash
         rendered = run.render()
         assert "✓ row_count" in rendered
         assert "analytics.customers" in rendered

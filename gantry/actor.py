@@ -1,0 +1,111 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Who initiated a piece of governed work.
+
+A run records an actor so the question "who asked for this" has an answer
+months later. The identity comes from the application, not from the proposal:
+an agent that could name itself could name someone else, and an audit record
+an agent can write is not one.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from enum import StrEnum
+
+
+class ActorType(StrEnum):
+    """What kind of thing initiated a run.
+
+    `UNKNOWN` is the honest default rather than a failure: a library that
+    guessed would put a wrong name in a durable record, and an unattributed run
+    is more useful than a misattributed one.
+    """
+
+    AGENT = "agent"
+    USER = "user"
+    SERVICE = "service"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True, slots=True)
+class ActorRef:
+    """The thing that initiated a run.
+
+    `metadata` is for the few facts that help identify a caller later — which
+    framework, which deployment. It is deliberately not somewhere to put a
+    conversation: a run record is not a transcript store, and anything written
+    here outlives the process and lands in a durable file.
+    """
+
+    type: ActorType = ActorType.UNKNOWN
+    id: str | None = None
+    session_id: str | None = None
+    metadata: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.id is not None and not self.id.strip():
+            raise ValueError("actor id must not be empty when given")
+        oversized = [key for key, value in self.metadata.items() if len(str(value)) > 1024]
+        if oversized:
+            raise ValueError(
+                f"actor metadata values must stay small; too long: {', '.join(sorted(oversized))}"
+            )
+
+    @property
+    def label(self) -> str:
+        """`agent:migration-agent`, or just the type when nothing identified it."""
+        return self.type.value if self.id is None else f"{self.type.value}:{self.id}"
+
+    def as_dict(self) -> dict[str, object]:
+        payload: dict[str, object] = {"type": self.type.value, "id": self.id}
+        if self.session_id is not None:
+            payload["session_id"] = self.session_id
+        if self.metadata:
+            payload["metadata"] = {str(key): value for key, value in self.metadata.items()}
+        return payload
+
+
+UNKNOWN_ACTOR = ActorRef()
+
+_current: ContextVar[ActorRef] = ContextVar("gantry_actor", default=UNKNOWN_ACTOR)
+
+
+def actor(
+    type: str | ActorType = ActorType.AGENT,  # noqa: A002
+    id: str | None = None,  # noqa: A002
+    *,
+    session_id: str | None = None,
+    metadata: Mapping[str, object] | None = None,
+) -> ActorRef:
+    """Name the caller. `gantry.actor("agent", "research-agent")`."""
+    return ActorRef(
+        type=ActorType(type) if not isinstance(type, ActorType) else type,
+        id=id,
+        session_id=session_id,
+        metadata=dict(metadata or {}),
+    )
+
+
+@contextmanager
+def context(*, actor: ActorRef) -> Iterator[ActorRef]:
+    """Attribute every run inside the block to one actor.
+
+    A context variable rather than a global: concurrent requests in one process
+    each keep their own caller, which a module-level assignment would not.
+    """
+    token = _current.set(actor)
+    try:
+        yield actor
+    finally:
+        _current.reset(token)
+
+
+def current_actor() -> ActorRef:
+    """The actor in scope, or the unknown one. Never raises, never guesses."""
+    return _current.get()
+
+
+__all__ = ["UNKNOWN_ACTOR", "ActorRef", "ActorType", "actor", "context", "current_actor"]
