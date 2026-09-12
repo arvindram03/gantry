@@ -109,9 +109,9 @@ async def test_a_governed_query_returns_bounded_rows(db: gantry.sql.SQLConnectio
 
     assert result.status is RunStatus.ACCEPTED
     assert result.inline is not None
-    assert len(result.inline.rows) == 2
-    assert result.inline.truncated is True
-    assert result.inline.columns == ("id", "plan")
+    assert len(result.rows) == 2
+    assert result.truncated is True
+    assert result.columns == ("id", "plan")
 
 
 async def test_a_write_is_refused_before_it_reaches_the_server(

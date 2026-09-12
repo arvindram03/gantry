@@ -8,12 +8,15 @@ from typing import Any, cast
 
 import gantry
 import pytest
-from gantry import ExecutionState, FailureKind, OutputKind, ResultStatus
+from gantry import ExecutionState, FailureKind
 from gantry.batch import BatchCapabilities, BatchConnection
 from gantry.flink.artifact import FlinkMode, FlinkSQLArtifact
 from gantry.flink.client import HTTPResponse
+from gantry.flink.execution import StreamingHealth
+from gantry.flink.metrics import FlinkMetrics
 from gantry.flink.operation import FlinkJobError, FlinkJobStatement
 from gantry.flink.target import FlinkTarget
+from gantry.runs.status import RunStatus
 from gantry.stream import StreamCapabilities, StreamConnection
 
 
@@ -286,10 +289,10 @@ async def test_batch_waits_for_success_then_verifies_the_output() -> None:
 
     result = await job("INSERT INTO snapshot SELECT * FROM raw")
 
-    assert result.status is ResultStatus.ACCEPTED
+    assert result.status is RunStatus.ACCEPTED
     assert result.execution is not None
-    assert result.execution.state is ExecutionState.SUCCEEDED
-    assert result.outputs[0].kind is OutputKind.TABLE
+    assert result.execution.status == "SUCCEEDED"
+    assert result.uri is not None
     assert result.uri == "flink-table:///snapshot"
     assert result.verification is not None
     assert {check.name: check.ok for check in result.verification.checks} == {
@@ -316,8 +319,8 @@ async def test_engine_success_is_not_accepted_when_batch_verification_fails() ->
     result = await job("INSERT INTO snapshot SELECT * FROM raw")
 
     assert result.execution is not None
-    assert result.execution.state is ExecutionState.SUCCEEDED
-    assert result.status is ResultStatus.VERIFICATION_FAILED
+    assert result.execution.status == "SUCCEEDED"
+    assert result.status is RunStatus.REJECTED
     assert result.failure is not None
     assert result.failure.kind is FailureKind.VERIFICATION_FAILED
 
@@ -340,11 +343,12 @@ async def test_stream_accepts_a_healthy_running_job_and_returns_stream_uri() -> 
     assert result.ok
     assert result.handle is not None
     assert result.handle.metadata["mode"] == "stream"
-    assert result.execution is not None and result.execution.state is ExecutionState.RUNNING
-    assert result.health is not None and result.health.healthy
-    assert result.metrics.records_in == 19
-    assert result.metrics.records_out == 17
-    assert result.outputs[0].kind is OutputKind.STREAM
+    assert result.execution is not None and result.execution.status == "RUNNING"
+    health = cast("StreamingHealth", result.health)
+    assert health is not None and health.healthy
+    assert cast("FlinkMetrics", result.native["metrics"]).records_in == 19
+    assert cast("FlinkMetrics", result.native["metrics"]).records_out == 17
+    assert result.uri is not None
     assert result.uri == "kafka://clean"
     assert "secret-token" not in repr(result.handle)
     assert transport.calls[0].headers["Authorization"] == "Bearer secret-token"
@@ -363,8 +367,8 @@ async def test_running_stream_is_not_accepted_when_health_check_fails() -> None:
     result = await job("INSERT INTO clean SELECT * FROM raw")
 
     assert result.execution is not None
-    assert result.execution.state is ExecutionState.RUNNING
-    assert result.status is ResultStatus.VERIFICATION_FAILED
+    assert result.execution.status == "RUNNING"
+    assert result.status is RunStatus.REJECTED
 
 
 async def test_handle_reconnects_from_a_fresh_configured_job_and_can_be_cancelled() -> None:
@@ -414,9 +418,9 @@ async def test_failed_job_maps_connector_failure_and_preserves_native_state() ->
 
     result = await job("INSERT INTO clean SELECT * FROM raw")
 
-    assert result.status is ResultStatus.FAILED
+    assert result.status is RunStatus.EXECUTION_FAILED
     assert result.execution is not None
-    assert result.execution.native["state"] == "FAILED"
+    assert result.execution.metrics["state"] == "FAILED"
     assert result.failure is not None
     assert result.failure.kind is FailureKind.CONNECTOR_ERROR
 
@@ -428,7 +432,7 @@ async def test_planner_rejections_are_normalized() -> None:
 
     result = await job("INSERT INTO clean SELECT * FROM raw_events")
 
-    assert result.status is ResultStatus.REJECTED
+    assert result.status is RunStatus.POLICY_REJECTED
     assert result.failure is not None
     assert result.failure.kind is FailureKind.VALIDATION_ERROR
     assert "Unknown table" in result.failure.message

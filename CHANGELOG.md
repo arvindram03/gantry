@@ -7,12 +7,14 @@ Notable changes. Dates are release dates; the format follows
 
 ### Changed
 
-- **Governed operations return a `Run`.** `db.query(...)` and
-  `db.materialize(...)` now return the durable record of the work — its id,
+- **Governed operations return a `Run`.** `db.query(...)`,
+  `db.materialize(...)`, MongoDB's equivalents and a Flink `job(...)` all
+  return the durable record of the work — its id,
   status, actor, proposal, inputs, outputs, admission, execution, verification
   and evidence — rather than a provider-shaped result. A query's rows are on
-  `run.rows`; `run.ok` still means executed *and* verified. This is a breaking
-  change to the return type; `submit()` and `wait()` are unchanged.
+  `run.rows`, MongoDB's documents on `run.documents`; `run.ok` still means
+  executed *and* verified. This is a breaking change to the return type;
+  `submit()` and the provider `wait()` methods are unchanged.
 - `RunStatus` separates outcomes that were previously one. A proposal Gantry
   refused (`POLICY_REJECTED`), work the engine could not do
   (`EXECUTION_FAILED`), a check that could not be evaluated
@@ -37,10 +39,11 @@ Notable changes. Dates are release dates; the format follows
   kept by default and can be reduced to `ProposalStorage.HASH` for callers who
   would rather agent-written SQL — which routinely carries values out of the
   data it filters — did not accumulate in a durable file.
-- Flink and MongoDB operations record runs through the same lifecycle and
-  expose `result.run` and `result.run_id`. Their result types keep their
-  provider shapes rather than folding `StreamingHealth` and inline documents
-  into `Run`, which the spec warns against.
+- `Run.native` carries what has no place in the common model — Flink's
+  `StreamingHealth` and metrics live under `run.native["health"]` and
+  `run.native["metrics"]`. One generic field rather than a field per engine,
+  so `Run` does not become the union of everything any provider returns. What
+  a decision rested on is in `run.verification` either way.
 
 - **Trusted plus agent-proposed verification.** Configure immutable trusted
   checks with `checks=` and add task-specific commitments with call-time

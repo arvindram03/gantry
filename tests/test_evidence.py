@@ -421,7 +421,7 @@ async def test_a_truncated_result_cannot_have_its_rows_counted(tmp_path: object)
         "SELECT id FROM main.many"
     )
 
-    assert result.inline is not None and result.inline.truncated
+    assert result.inline is not None and result.truncated
     assert result.status is RunStatus.VERIFICATION_UNSUPPORTED
     assert result.verification is not None
     check = result.verification.checks[0]
@@ -494,7 +494,7 @@ async def test_a_null_rate_over_no_rows_is_not_a_null_rate_of_zero(tmp_path: obj
         schemas=["main"], verify=[gantry.verify.null_rate(column="id", max=0.01)]
     )("SELECT id FROM main.t")
 
-    assert result.inline is not None and result.inline.rows == ()
+    assert result.inline is not None and result.rows == ()
     assert result.status is RunStatus.VERIFICATION_UNSUPPORTED
     assert result.verification is not None
     check = result.verification.checks[0]

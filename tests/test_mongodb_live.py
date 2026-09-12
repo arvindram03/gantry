@@ -72,7 +72,7 @@ async def test_a_read_only_query_returns_bounded_documents(
     result = await query("orders", {"status": "open"})
 
     assert result.inline is not None
-    assert len(result.inline.documents) <= 2
+    assert len(result.documents) <= 2
 
 
 async def test_a_write_is_refused_before_it_reaches_the_database(
@@ -157,8 +157,8 @@ async def test_bounded_results_are_flagged_as_truncated_when_the_cap_is_hit(
     result = await query("orders", {"status": "open"})
 
     assert result.inline is not None
-    assert len(result.inline.documents) == 1
-    assert result.inline.truncated is True
+    assert len(result.documents) == 1
+    assert result.truncated is True
 
 
 async def test_materialize_rejects_a_source_outside_the_allowed_sources(

@@ -21,6 +21,8 @@ from gantry.nosql.result import NoSQLResult
 from gantry.nosql.verify import CollectionSnapshot, DocumentCheck
 from gantry.output import OutputKind, OutputRef
 from gantry.result import ResultStatus
+from gantry.runs.model import Run
+from gantry.runs.status import RunStatus
 from gantry.runtime import SubmissionError
 from gantry.tool import Tool
 from gantry.verifier import CheckResult, CheckSource, VerificationResult
@@ -221,7 +223,7 @@ class NoSQLMaterializer:
         *,
         name: str = "materialize_nosql",
         description: str = "Create a governed derived collection from approved MongoDB sources.",
-    ) -> Tool[MaterializationResult]:
+    ) -> Tool[Run]:
         return Tool(
             name=name,
             description=description,
@@ -298,9 +300,7 @@ class NoSQLMaterializer:
         self._agent_checks[handle.gantry_id] = agent_checks  # type: ignore[assignment]
         return handle
 
-    async def wait(
-        self, handle: ExecutionHandle, *, poll_interval_seconds: float = 1.0
-    ) -> MaterializationResult:
+    async def wait(self, handle: ExecutionHandle, *, poll_interval_seconds: float = 1.0) -> Run:
         plan = self._plans.get(handle.gantry_id) or _plan_from_handle(handle)
         nosql_result = await self._connection.wait(
             handle, poll_interval_seconds=poll_interval_seconds
@@ -390,33 +390,20 @@ class NoSQLMaterializer:
         pipeline: Pipeline,
         *,
         verify: Sequence[DocumentCheck] = (),
-    ) -> MaterializationResult:
+    ) -> Run:
         try:
             handle = await self.submit(collection, pipeline, verify=verify)
         except VerificationUnsupported as error:
-            return _failed(
-                ResultStatus.VERIFICATION_UNSUPPORTED,
-                Failure(FailureKind.VERIFICATION_UNSUPPORTED, False, str(error)),
-            )
+            return _refuse(error, RunStatus.VERIFICATION_UNSUPPORTED)
         except VerificationConflict as error:
-            return _failed(
-                ResultStatus.VERIFICATION_CONFLICT,
-                Failure(FailureKind.VERIFICATION_CONFLICT, False, str(error)),
-            )
-        except VerificationInputError as error:
-            return _failed(
-                ResultStatus.REJECTED,
-                Failure(FailureKind.VALIDATION_ERROR, False, str(error)),
-            )
+            return _refuse(error, RunStatus.VERIFICATION_CONFLICT)
+        except (VerificationInputError, TypeError, ValueError) as error:
+            return _refuse(error, RunStatus.POLICY_REJECTED)
         except MaterializationError as error:
-            return _failed(error.status, error.failure)
-        except (TypeError, ValueError) as error:
-            return _failed(
-                ResultStatus.REJECTED, Failure(FailureKind.VALIDATION_ERROR, False, str(error))
-            )
+            return _refuse(error.failure.message, RunStatus.POLICY_REJECTED, error.failure)
         return await self.wait(handle, poll_interval_seconds=0.05)
 
-    async def _invoke_tool(self, arguments: Mapping[str, object]) -> MaterializationResult:
+    async def _invoke_tool(self, arguments: Mapping[str, object]) -> Run:
         unexpected = set(arguments) - {"collection", "pipeline", "verify"}
         if unexpected:
             names = ", ".join(sorted(unexpected))
@@ -434,15 +421,9 @@ class NoSQLMaterializer:
                 arguments.get("verify"), capabilities=self._agent_capabilities
             )
         except VerificationUnsupported as error:
-            return _failed(
-                ResultStatus.VERIFICATION_UNSUPPORTED,
-                Failure(FailureKind.VERIFICATION_UNSUPPORTED, False, str(error)),
-            )
+            return _refuse(error, RunStatus.VERIFICATION_UNSUPPORTED)
         except VerificationInputError as error:
-            return _failed(
-                ResultStatus.REJECTED,
-                Failure(FailureKind.VALIDATION_ERROR, False, str(error)),
-            )
+            return _refuse(error, RunStatus.POLICY_REJECTED)
         return await self(collection, pipeline, verify=checks)  # type: ignore[arg-type]
 
     async def _admit(self, plan: MaterializationPlan) -> None:
@@ -672,11 +653,24 @@ def _evidence(
     )
 
 
-def _recorded(result: MaterializationResult) -> MaterializationResult:
-    """Record the run for a MongoDB materialization and hand it back."""
-    from dataclasses import replace
+def _refuse(error: Exception | str, status: RunStatus, failure: Failure | None = None) -> Run:
+    """Record a run for a proposal refused before it reached MongoDB."""
+    from gantry.runs.lifecycle import RunRecorder
+    from gantry.runs.model import OperationKind
 
-    from gantry.runs.lifecycle import run_from_evidence
+    recorder = RunRecorder(kind=OperationKind.MATERIALIZE, engine="mongodb", provider="mongodb")
+    kind = {
+        RunStatus.VERIFICATION_UNSUPPORTED: FailureKind.VERIFICATION_UNSUPPORTED,
+        RunStatus.VERIFICATION_CONFLICT: FailureKind.VERIFICATION_CONFLICT,
+    }.get(status, FailureKind.VALIDATION_ERROR)
+    return recorder.rejected((str(error),), status=status).with_failure(
+        failure or Failure(kind, False, str(error))
+    )
+
+
+def _recorded(result: MaterializationResult) -> Run:
+    """Record the run for a MongoDB materialization and return it."""
+    from gantry.runs.lifecycle import RunRecorder, run_from_evidence
     from gantry.runs.model import OperationKind
 
     run = run_from_evidence(
@@ -686,8 +680,17 @@ def _recorded(result: MaterializationResult) -> MaterializationResult:
         provider="mongodb",
         status=result.status,
         verification=result.verification,
+        handle=result.handle,
+        failure=result.failure,
     )
-    return replace(result, run=run)
+    if run is None:
+        recorder = RunRecorder(kind=OperationKind.MATERIALIZE, engine="mongodb", provider="mongodb")
+        run = recorder.rejected(
+            (result.failure.message if result.failure else "refused",),
+            status=RunStatus.POLICY_REJECTED,
+            verification=result.verification,
+        )
+    return run.with_failure(result.failure)
 
 
 def _failed(status: ResultStatus, failure: Failure) -> MaterializationResult:

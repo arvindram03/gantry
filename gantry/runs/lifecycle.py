@@ -12,12 +12,13 @@ to. If that first write fails, nothing is submitted.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 
 from gantry.actor import ActorRef, current_actor
 from gantry.evidence import EvidenceBundle
+from gantry.failure import Failure
 from gantry.handle import ExecutionHandle
 from gantry.result import ResultStatus
 from gantry.runs.model import (
@@ -118,10 +119,18 @@ class RunRecorder:
             ),
         )
 
-    def execution_failed(self, reason: str | None = None) -> Run:
+    def execution_failed(
+        self, reason: str | None = None, *, metrics: Mapping[str, object] | None = None
+    ) -> Run:
+        """The engine could not do work Gantry had admitted.
+
+        `metrics` carries whatever the engine said about the failure. Losing it
+        means the record can say a job failed but not what the engine called
+        it, which is the first thing anyone looks for.
+        """
         return self._save(
             RunStatus.EXECUTION_FAILED,
-            execution=self._finished("FAILED"),
+            execution=replace(self._finished("FAILED"), metrics=dict(metrics or {})),
             admission=self.run.admission or AdmissionRecord(allowed=True),
             **({"failure": reason} if reason else {}),
         )
@@ -137,6 +146,7 @@ class RunRecorder:
         outputs: Sequence[ResourceRef] = (),
         result_ref: QueryResultRef | None = None,
         inline: object | None = None,
+        native: Mapping[str, object] | None = None,
     ) -> Run:
         """The final transition, and the only one that can say ACCEPTED."""
         return self._save(
@@ -146,17 +156,26 @@ class RunRecorder:
             outputs=tuple(outputs),
             result_ref=result_ref,
             inline=inline,
+            native=dict(native or {}),
             execution=self.run.execution or self._finished("SUCCEEDED"),
         )
 
     def _finished(self, status: str) -> ExecutionRecord:
+        """Close the execution record — except for a stream, which has not closed.
+
+        `ACCEPTED` on a stream means it reached the healthy state the contract
+        required, not that it stopped. Marking its execution `SUCCEEDED` with a
+        finish time would record the opposite of what is true: the job is still
+        running, and its record should say so.
+        """
         existing = self.run.execution
+        streaming = self.run.operation.kind is OperationKind.STREAM
         return ExecutionRecord(
-            status=status,
+            status="RUNNING" if streaming else status,
             native_id=None if existing is None else existing.native_id,
             submitted_at=None if existing is None else existing.submitted_at,
             started_at=None if existing is None else existing.started_at,
-            finished_at=datetime.now(UTC),
+            finished_at=None if streaming else datetime.now(UTC),
             metrics={} if existing is None else existing.metrics,
         )
 
@@ -188,6 +207,11 @@ def run_from_evidence(
     provider: str | None = None,
     status: ResultStatus | None = None,
     verification: VerificationResult | None = None,
+    handle: ExecutionHandle | None = None,
+    inline: object | None = None,
+    result_ref: QueryResultRef | None = None,
+    native: Mapping[str, object] | None = None,
+    failure: Failure | None = None,
 ) -> Run | None:
     """Record a terminal run for an operation that reports once, at the end.
 
@@ -213,13 +237,30 @@ def run_from_evidence(
         else None,
         inputs=tuple(ResourceRef(system=engine, resource=name) for name in evidence.inputs),
     )
+    if status is ResultStatus.VERIFICATION_UNSUPPORTED:
+        return recorder.rejected(
+            ("a required check could not be evaluated",),
+            status=RunStatus.VERIFICATION_UNSUPPORTED,
+            verification=verification,
+            evidence=evidence,
+        )
+    if status is ResultStatus.VERIFICATION_CONFLICT:
+        return recorder.rejected(
+            ("the verification contract was contradictory",),
+            status=RunStatus.VERIFICATION_CONFLICT,
+            verification=verification,
+            evidence=evidence,
+        )
     if status is not None and status is not ResultStatus.ACCEPTED and verification is None:
         return recorder.execution_failed()
-    recorder.running(None)
+    recorder.running(handle)
     return recorder.decided(
         verification=verification,
         evidence=evidence,
         outputs=tuple(ResourceRef(system=engine, resource=name) for name in evidence.outputs),
+        inline=inline,
+        result_ref=result_ref,
+        native=dict(native or {}),
     )
 
 

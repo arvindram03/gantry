@@ -9,9 +9,9 @@ from gantry.context import Context
 from gantry.failure import Failure, FailureKind
 from gantry.nosql.pipeline import Pipeline
 from gantry.nosql.policy import NoSQLPolicy
-from gantry.nosql.result import NoSQLResult
 from gantry.nosql.verify import DocumentCheck
-from gantry.result import ResultStatus
+from gantry.runs.model import Run
+from gantry.runs.status import RunStatus
 from gantry.tool import Tool
 from gantry.verifier import Verifier
 from gantry.verify import (
@@ -35,7 +35,7 @@ class _QueryConnection(Protocol):
         context: Context | None = None,
         trusted_verify: Sequence[Verifier | DocumentCheck] = (),
         agent_verify: Sequence[DocumentCheck] = (),
-    ) -> NoSQLResult: ...
+    ) -> Run: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,7 +52,7 @@ class NoSQLQuery:
         *,
         context: Context | None = None,
         verify: Sequence[DocumentCheck] = (),
-    ) -> NoSQLResult:
+    ) -> Run:
         try:
             agent_checks = validate_agent_checks(verify, capabilities=self._agent_capabilities)
             trusted_checks = tuple(
@@ -60,9 +60,11 @@ class NoSQLQuery:
             )
             detect_conflicts(trusted_checks, agent_checks)
         except VerificationUnsupported as error:
-            return _rejected(error, unsupported=True)
-        except (VerificationConflict, VerificationInputError) as error:
-            return _rejected(error, conflict=isinstance(error, VerificationConflict))
+            return _refused(self._connection, error, RunStatus.VERIFICATION_UNSUPPORTED)
+        except VerificationConflict as error:
+            return _refused(self._connection, error, RunStatus.VERIFICATION_CONFLICT)
+        except VerificationInputError as error:
+            return _refused(self._connection, error, RunStatus.POLICY_REJECTED)
         return await self._connection._query(
             collection,
             pipeline,
@@ -93,7 +95,7 @@ class NoSQLQuery:
         *,
         name: str = "query_nosql",
         description: str = "Run a governed, read-only MongoDB query or aggregation pipeline.",
-    ) -> Tool[NoSQLResult]:
+    ) -> Tool[Run]:
         return Tool(
             name=name,
             description=description,
@@ -101,7 +103,7 @@ class NoSQLQuery:
             _handler=self._invoke_tool,
         )
 
-    async def _invoke_tool(self, arguments: Mapping[str, object]) -> NoSQLResult:
+    async def _invoke_tool(self, arguments: Mapping[str, object]) -> Run:
         unexpected = set(arguments) - {"collection", "pipeline", "verify"}
         if unexpected:
             raise ValueError(f"unexpected query tool arguments: {', '.join(sorted(unexpected))}")
@@ -117,28 +119,36 @@ class NoSQLQuery:
             checks = parse_agent_checks(
                 arguments.get("verify"), capabilities=self._agent_capabilities
             )
-        except VerificationUnsupported as error:
-            return _rejected(error, unsupported=True)
-        except VerificationInputError as error:
-            return _rejected(error)
+        except (VerificationUnsupported, VerificationInputError) as error:
+            return _refused(
+                self._connection,
+                error,
+                RunStatus.VERIFICATION_UNSUPPORTED
+                if isinstance(error, VerificationUnsupported)
+                else RunStatus.POLICY_REJECTED,
+            )
         return await self(collection, pipeline, verify=checks)  # type: ignore[arg-type]
 
 
-def _rejected(
-    error: Exception, *, unsupported: bool = False, conflict: bool = False
-) -> NoSQLResult:
-    status = (
-        ResultStatus.VERIFICATION_UNSUPPORTED
-        if unsupported
-        else ResultStatus.VERIFICATION_CONFLICT
-        if conflict
-        else ResultStatus.REJECTED
+def _refused(connection: object, error: Exception, status: RunStatus) -> Run:
+    """Record a run for a proposal refused at the tool boundary.
+
+    A tool response carries a run id, so an agent told "rejected" has
+    something to refer to.
+    """
+    from gantry.runs.lifecycle import RunRecorder
+    from gantry.runs.model import OperationKind
+
+    recorder = RunRecorder(
+        kind=OperationKind.QUERY,
+        engine="mongodb",
+        provider=str(getattr(connection, "provider", "mongodb")),
     )
     kind = (
         FailureKind.VERIFICATION_UNSUPPORTED
-        if unsupported
-        else FailureKind.VERIFICATION_CONFLICT
-        if conflict
+        if status is RunStatus.VERIFICATION_UNSUPPORTED
         else FailureKind.VALIDATION_ERROR
     )
-    return NoSQLResult(status, failure=Failure(kind, False, str(error)))
+    return recorder.rejected((str(error),), status=status).with_failure(
+        Failure(kind, False, str(error))
+    )

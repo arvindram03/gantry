@@ -18,9 +18,9 @@ from gantry import (
     FailureKind,
     OutputKind,
     OutputRef,
-    ResultStatus,
     ValidationResult,
 )
+from gantry.actor import UNKNOWN_ACTOR
 from gantry.nosql.bridge import NoSQLExecutionAdapter
 from gantry.nosql.capabilities import NoSQLCapabilities
 from gantry.nosql.enforcement import policy_errors
@@ -44,6 +44,9 @@ from gantry.nosql.verify import (
     document_count,
     required_fields,
 )
+from gantry.result import ResultStatus
+from gantry.runs.model import OperationKind, OperationRef, Run
+from gantry.runs.status import RunStatus
 
 
 def test_target_rejects_empty_provider_or_driver() -> None:
@@ -375,9 +378,14 @@ class _FakeConnection:
         context: Context | None = None,
         trusted_verify: Sequence[object] = (),
         agent_verify: Sequence[object] = (),
-    ) -> NoSQLResult:
+    ) -> Run:
         self.calls.append((collection, pipeline, policy))
-        return NoSQLResult(ResultStatus.ACCEPTED)
+        return Run(
+            id="run_fake",
+            status=RunStatus.ACCEPTED,
+            actor=UNKNOWN_ACTOR,
+            operation=OperationRef(kind=OperationKind.QUERY, engine="mongodb"),
+        )
 
 
 async def test_query_calls_connection_with_collection_and_pipeline() -> None:
@@ -482,7 +490,7 @@ async def test_materializer_rejects_out_when_destination_already_exists() -> Non
 
     result = await materializer("orders", [{"$match": {}}, {"$out": "reporting.rollup"}])
 
-    assert result.status is ResultStatus.REJECTED
+    assert result.status is RunStatus.POLICY_REJECTED
     assert result.failure is not None
     assert result.failure.kind is FailureKind.DESTINATION_EXISTS
 
@@ -525,7 +533,7 @@ async def test_materializer_accepts_agent_document_checks_and_records_evidence()
         ],
     )
 
-    assert result.status is ResultStatus.ACCEPTED
+    assert result.status is RunStatus.ACCEPTED
     assert result.verification is not None
     assert [check.source for check in result.verification.checks] == [
         gantry.CheckSource.TRUSTED,
@@ -557,7 +565,7 @@ async def test_materializer_rejects_sources_outside_policy() -> None:
 
     result = await materializer("secrets", [{"$match": {}}, {"$out": "reporting.rollup"}])
 
-    assert result.status is ResultStatus.REJECTED
+    assert result.status is RunStatus.POLICY_REJECTED
     assert result.failure is not None
     assert result.failure.kind is FailureKind.SOURCE_NOT_ALLOWED
 
@@ -615,10 +623,10 @@ async def test_connect_query_runs_lifecycle_and_bounds_inline_documents() -> Non
 
     result = await query("orders", {"status": "open"})
 
-    assert result.status is ResultStatus.ACCEPTED
+    assert result.status is RunStatus.ACCEPTED
     assert result.inline is not None
-    assert len(result.inline.documents) <= 1
-    assert result.inline.truncated is True
+    assert len(result.documents) <= 1
+    assert result.truncated is True
     assert adapter.submitted_collection == "orders"
     assert adapter.policy is not None
     assert adapter.policy.max_documents == 1
@@ -637,7 +645,7 @@ async def test_mongodb_query_merges_trusted_and_agent_verification() -> None:
         verify=[gantry.verify.not_empty(), gantry.verify.required_fields(["_id"])],
     )
 
-    assert result.status is ResultStatus.ACCEPTED
+    assert result.status is RunStatus.ACCEPTED
     assert result.verification is not None
     assert [check.source for check in result.verification.checks] == [
         gantry.CheckSource.TRUSTED,
@@ -660,7 +668,7 @@ async def test_mongodb_query_conflict_stops_before_submission() -> None:
 
     result = await query("orders", {}, verify=[gantry.verify.document_count(min=2)])
 
-    assert result.status is ResultStatus.VERIFICATION_CONFLICT
+    assert result.status is RunStatus.VERIFICATION_CONFLICT
     assert adapter.submissions == 0
 
 
@@ -673,7 +681,7 @@ async def test_mongodb_not_empty_conflicts_with_zero_document_limit() -> None:
 
     result = await query("orders", {}, verify=[gantry.verify.not_empty()])
 
-    assert result.status is ResultStatus.VERIFICATION_CONFLICT
+    assert result.status is RunStatus.VERIFICATION_CONFLICT
     assert adapter.submissions == 0
 
 
@@ -686,7 +694,7 @@ async def test_mongodb_truncated_document_count_is_unsupported() -> None:
 
     result = await query("orders", {}, verify=[gantry.verify.document_count(max=10)])
 
-    assert result.status is ResultStatus.VERIFICATION_UNSUPPORTED
+    assert result.status is RunStatus.VERIFICATION_UNSUPPORTED
     assert result.failure is not None
     assert result.failure.kind is FailureKind.VERIFICATION_UNSUPPORTED
     assert result.verification is not None
@@ -703,7 +711,7 @@ async def test_connect_rejects_writes_under_a_read_only_query_policy() -> None:
 
     result = await db.query()("orders", [{"$match": {}}, {"$out": "reporting.rollup"}])
 
-    assert result.status is ResultStatus.REJECTED
+    assert result.status is RunStatus.POLICY_REJECTED
     assert result.failure is not None
     assert "read-only" in result.failure.message
     assert adapter.submissions == 0

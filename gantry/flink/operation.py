@@ -21,6 +21,9 @@ from gantry.flink.metrics import FlinkMetrics
 from gantry.flink.verification import FlinkHealthCheck
 from gantry.handle import ExecutionHandle
 from gantry.result import ResultStatus
+from gantry.runs.lifecycle import RunRecorder
+from gantry.runs.model import OperationKind, ResourceRef, Run
+from gantry.runs.status import RunStatus
 from gantry.runtime import SubmissionError
 from gantry.sql.classification import SQLOperation
 from gantry.sql.dialect import ConservativeDialect
@@ -209,8 +212,8 @@ class FlinkJob:
         )
         result = self._source_health_result(result, entries)
         if self._kind is FlinkJobKind.BATCH and result.ok:
-            return _recorded(await self._verify_batch(result, entries))
-        return _recorded(self._with_agent_commitment(result, handle))
+            return await self._verify_batch(result, entries)
+        return self._with_agent_commitment(result, handle)
 
     async def health(self, handle: ExecutionHandle) -> StreamingHealth:
         if self._kind is not FlinkJobKind.STREAM:
@@ -226,39 +229,41 @@ class FlinkJob:
         *,
         context: Context | None = None,
         verify: Sequence[FlinkHealthCheck | MaterializationCheck] = (),
-    ) -> FlinkResult:
+    ) -> Run:
+        """Run the job, and record it.
+
+        Returns the `Run`, as the SQL paths do. A streaming job's health and
+        the Flink metrics travel on `run.native`; the checks they produced are
+        in `run.verification` like any other.
+        """
+        recorder = RunRecorder(
+            kind=OperationKind.STREAM if self._kind is FlinkJobKind.STREAM else OperationKind.BATCH,
+            engine="flink",
+            provider="flink",
+            proposal=sql if isinstance(sql, str) else None,
+            agent_verification=tuple(type(check).__name__ for check in verify),
+        )
         try:
             handle = await self.submit(sql, context=context, verify=verify)
         except VerificationUnsupported as error:
-            return _failed(
-                ResultStatus.VERIFICATION_UNSUPPORTED,
-                Failure(FailureKind.VERIFICATION_UNSUPPORTED, False, str(error)),
-            )
+            return _refuse(recorder, error, RunStatus.VERIFICATION_UNSUPPORTED)
         except VerificationConflict as error:
-            return _failed(
-                ResultStatus.VERIFICATION_CONFLICT,
-                Failure(FailureKind.VERIFICATION_CONFLICT, False, str(error)),
-            )
-        except VerificationInputError as error:
-            return _failed(
-                ResultStatus.REJECTED,
-                Failure(FailureKind.VALIDATION_ERROR, False, str(error)),
-            )
+            return _refuse(recorder, error, RunStatus.VERIFICATION_CONFLICT)
+        except (VerificationInputError, TypeError, ValueError) as error:
+            return _refuse(recorder, error, RunStatus.POLICY_REJECTED)
         except FlinkJobError as error:
-            return _failed(error.status, error.failure)
-        except (TypeError, ValueError) as error:
-            return _failed(
-                ResultStatus.REJECTED,
-                Failure(FailureKind.VALIDATION_ERROR, False, str(error)),
-            )
-        return await self.wait(handle)
+            return recorder.rejected(
+                (error.failure.message,), status=RunStatus.POLICY_REJECTED
+            ).with_failure(error.failure)
+        recorder.running(handle)
+        return _recorded(await self.wait(handle), recorder=recorder)
 
     def tool(
         self,
         *,
         name: str | None = None,
         description: str | None = None,
-    ) -> Tool[FlinkResult]:
+    ) -> Tool[Run]:
         default_name = f"flink_{self._kind.value}_job"
         default_description = (
             "Run an approved Flink batch job."
@@ -272,7 +277,7 @@ class FlinkJob:
             _handler=self._invoke_tool,
         )
 
-    async def _invoke_tool(self, arguments: Mapping[str, object]) -> FlinkResult:
+    async def _invoke_tool(self, arguments: Mapping[str, object]) -> Run:
         unexpected = set(arguments) - {"sql", "verify"}
         if unexpected:
             names = ", ".join(sorted(unexpected))
@@ -284,15 +289,20 @@ class FlinkJob:
             checks = parse_agent_checks(
                 arguments.get("verify"), capabilities=self._agent_capabilities
             )
-        except VerificationUnsupported as error:
-            return _failed(
-                ResultStatus.VERIFICATION_UNSUPPORTED,
-                Failure(FailureKind.VERIFICATION_UNSUPPORTED, False, str(error)),
-            )
-        except VerificationInputError as error:
-            return _failed(
-                ResultStatus.REJECTED,
-                Failure(FailureKind.VALIDATION_ERROR, False, str(error)),
+        except (VerificationUnsupported, VerificationInputError) as error:
+            return _refuse(
+                RunRecorder(
+                    kind=OperationKind.STREAM
+                    if self._kind is FlinkJobKind.STREAM
+                    else OperationKind.BATCH,
+                    engine="flink",
+                    provider="flink",
+                    proposal=sql,
+                ),
+                error,
+                RunStatus.VERIFICATION_UNSUPPORTED
+                if isinstance(error, VerificationUnsupported)
+                else RunStatus.POLICY_REJECTED,
             )
         return await self(sql, verify=checks)  # type: ignore[arg-type]
 
@@ -529,22 +539,48 @@ class FlinkStreamJob(FlinkJob):
         )
 
 
-def _recorded(result: FlinkResult) -> FlinkResult:
-    """Record the run for a Flink job and hand it back on the result."""
-    from dataclasses import replace
+def _refuse(recorder: RunRecorder, error: Exception, status: RunStatus) -> Run:
+    kind = {
+        RunStatus.VERIFICATION_UNSUPPORTED: FailureKind.VERIFICATION_UNSUPPORTED,
+        RunStatus.VERIFICATION_CONFLICT: FailureKind.VERIFICATION_CONFLICT,
+    }.get(status, FailureKind.VALIDATION_ERROR)
+    return recorder.rejected((str(error),), status=status).with_failure(
+        Failure(kind, False, str(error))
+    )
 
+
+def _recorded(result: FlinkResult, *, recorder: RunRecorder | None = None) -> Run:
+    """Record the run for a Flink job and return it.
+
+    The job's own shape — `StreamingHealth`, the Flink metrics — goes into
+    `run.native`, which is one generic field rather than a per-engine one. What
+    the decision rested on is already in `verification`.
+    """
     from gantry.runs.lifecycle import run_from_evidence
     from gantry.runs.model import OperationKind
 
-    kind = (
-        (
-            OperationKind.STREAM
-            if str(result.execution.handle.metadata.get("mode", "")).lower() == "streaming"
-            else OperationKind.BATCH
-        )
-        if result.execution is not None
-        else OperationKind.BATCH
-    )
+    mode = str(result.handle.metadata.get("mode", "")).lower() if result.handle is not None else ""
+    kind = OperationKind.STREAM if mode == "streaming" else OperationKind.BATCH
+    if recorder is not None:
+        if result.status is ResultStatus.VERIFICATION_UNSUPPORTED:
+            return recorder.rejected(
+                ("a required check could not be evaluated",),
+                status=RunStatus.VERIFICATION_UNSUPPORTED,
+                verification=result.verification,
+                evidence=result.evidence,
+            ).with_failure(result.failure)
+        if result.status is not ResultStatus.ACCEPTED and result.verification is None:
+            native = dict(result.execution.native) if result.execution is not None else {}
+            return recorder.execution_failed(metrics=native).with_failure(result.failure)
+        recorder.verifying()
+        return recorder.decided(
+            verification=result.verification,
+            evidence=result.evidence,
+            outputs=tuple(
+                ResourceRef(system="flink", resource=output.uri) for output in result.outputs
+            ),
+            native={"health": result.health, "metrics": result.metrics},
+        ).with_failure(result.failure)
     run = run_from_evidence(
         result.evidence,
         kind=kind,
@@ -552,8 +588,22 @@ def _recorded(result: FlinkResult) -> FlinkResult:
         provider="flink",
         status=result.status,
         verification=result.verification,
+        handle=result.handle,
+        native={"health": result.health, "metrics": result.metrics},
+        failure=result.failure,
     )
-    return replace(result, run=run)
+    if run is None:
+        # No evidence means the job never got far enough to produce any; the
+        # record still has to exist, so one is made from what there is.
+        from gantry.runs.lifecycle import RunRecorder
+
+        recorder = RunRecorder(kind=kind, engine="flink", provider="flink")
+        run = (
+            recorder.execution_failed()
+            if result.status is not ResultStatus.ACCEPTED
+            else recorder.decided(verification=result.verification)
+        )
+    return run.with_failure(result.failure)
 
 
 def _parse_job(sql: str) -> FlinkJobPlan:

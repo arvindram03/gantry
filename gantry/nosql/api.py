@@ -32,6 +32,8 @@ from gantry.nosql.target import NoSQLTarget
 from gantry.nosql.verify import CollectionSnapshot, DocumentCheck
 from gantry.output import OutputKind, OutputRef
 from gantry.result import Result, ResultStatus
+from gantry.runs.model import Run
+from gantry.runs.status import RunStatus
 from gantry.runtime import ControlPlane
 from gantry.target import ExecutionTarget
 from gantry.verifier import CheckResult, CheckSource, VerificationResult, Verifier
@@ -120,8 +122,11 @@ class NoSQLConnection:
         context: Context | None = None,
         trusted_verify: Sequence[Verifier | DocumentCheck] = (),
         agent_verify: Sequence[DocumentCheck] = (),
-    ) -> NoSQLResult:
-        """Execute a pipeline for a configured query operation."""
+    ) -> Run:
+        """Execute a pipeline for a configured query operation, and record the run.
+
+        Returns the `Run`, as the SQL paths do. The documents are on
+        `run.documents`, and are dropped on the way to storage."""
 
         verifiers = tuple(check for check in trusted_verify if isinstance(check, Verifier))
         trusted_checks = tuple(check for check in trusted_verify if not isinstance(check, Verifier))
@@ -149,10 +154,8 @@ class NoSQLConnection:
                 collection, pipeline, raw, result.inline, verification, status, agent_verify
             ),
         )
-        from dataclasses import replace as _replace
-
         from gantry.runs.lifecycle import run_from_evidence
-        from gantry.runs.model import OperationKind
+        from gantry.runs.model import OperationKind, QueryResultRef
 
         run = run_from_evidence(
             response.evidence,
@@ -161,8 +164,28 @@ class NoSQLConnection:
             provider=self.provider,
             status=response.status,
             verification=response.verification,
+            handle=response.handle,
+            inline=response.inline,
+            result_ref=None
+            if response.inline is None
+            else QueryResultRef(
+                rows=len(response.inline.documents),
+                inline=True,
+                truncated=response.inline.truncated,
+            ),
+            failure=response.failure,
         )
-        return _replace(response, run=run)
+        if run is None:
+            from gantry.runs.lifecycle import RunRecorder
+
+            run = RunRecorder(
+                kind=OperationKind.QUERY, engine="mongodb", provider=self.provider
+            ).rejected(
+                (response.failure.message if response.failure else "refused",),
+                status=RunStatus.POLICY_REJECTED,
+                verification=response.verification,
+            )
+        return run.with_failure(response.failure)
 
     async def submit(
         self,

@@ -105,8 +105,8 @@ async def test_a_read_only_query_returns_bounded_rows(
     result = await query("SELECT generate_series(1, 100) AS n")
 
     assert result.inline is not None
-    assert len(result.inline.rows) <= 3
-    assert result.inline.truncated, "the row bound must be reported, not silently applied"
+    assert len(result.rows) <= 3
+    assert result.truncated, "the row bound must be reported, not silently applied"
 
 
 async def test_a_write_is_refused_before_it_reaches_the_database(
@@ -197,8 +197,7 @@ async def test_a_view_is_validated_by_dry_run_and_leaves_nothing_behind(
         "SELECT count(*) FROM information_schema.tables "
         "WHERE table_schema = 'reporting' AND table_name = 'live_view'"
     )
-    assert found.inline is not None
-    assert found.inline.rows[0][0] == 0, "the dry run left the view behind"
+    assert found.rows[0][0] == 0, "the dry run left the view behind"
 
     created = await build("CREATE VIEW reporting.live_view AS SELECT status FROM analytics.orders")
     assert created.status is RunStatus.ACCEPTED, created.failure
@@ -293,7 +292,7 @@ async def test_validating_a_create_table_as_does_not_execute_its_body(
     async def sequence_value() -> int:
         result = await reader("SELECT last_value FROM reporting.validate_probe")
         assert result.inline is not None, result.failure
-        value = result.inline.rows[0][0]
+        value = result.rows[0][0]
         assert isinstance(value, int)
         return value
 

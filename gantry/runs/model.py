@@ -27,7 +27,6 @@ from gantry.evidence import EvidenceBundle, _plain
 from gantry.failure import Failure
 from gantry.handle import ExecutionHandle
 from gantry.runs.status import RunStatus
-from gantry.sql.output import InlineRows
 from gantry.verifier import CheckResult, VerificationResult
 
 _ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"  # Crockford base32: no I, L, O, U
@@ -222,7 +221,23 @@ class Run:
 
     # Live-only. Excluded from `as_dict`, and therefore from storage: a run
     # record is not a place for query results to accumulate.
-    inline: InlineRows | None = field(default=None, compare=False, repr=False)
+    inline: object | None = field(default=None, compare=False, repr=False)
+    """The bounded result, in whatever shape the engine returned it.
+
+    Rows for SQL, documents for MongoDB. Read it through `rows`, `columns` or
+    `documents` rather than directly — those narrow it, and they are empty
+    rather than wrong when the operation produced nothing.
+    """
+
+    native: Mapping[str, object] = field(default_factory=dict, compare=False, repr=False)
+    """Provider-shaped observations that have no place in the common model.
+
+    One generic field rather than a field per engine: `Run` is not meant to
+    become the union of everything any provider returns, so Flink's
+    `StreamingHealth` lives here under `native["health"]` instead of on the
+    model. What matters for a decision — the checks it produced — is already in
+    `verification`.
+    """
     failure: Failure | None = field(default=None, compare=False, repr=False)
     handle: ExecutionHandle | None = field(default=None, compare=False, repr=False)
     """The engine handle, for callers that submit and wait separately.
@@ -244,13 +259,34 @@ class Run:
 
     @property
     def rows(self) -> tuple[tuple[object, ...], ...]:
-        """A query's rows, when it returned any and they came back inline."""
-        return () if self.inline is None else tuple(self.inline.rows)
+        """A SQL query's rows, when it returned any and they came back inline."""
+        return tuple(getattr(self.inline, "rows", ()) or ())
 
     @property
     def columns(self) -> tuple[str, ...]:
-        """The column names a query returned."""
-        return () if self.inline is None else tuple(self.inline.columns)
+        """The column names a SQL query returned."""
+        return tuple(getattr(self.inline, "columns", ()) or ())
+
+    @property
+    def truncated(self) -> bool:
+        """Whether a bound clipped the result.
+
+        Recorded rather than implied: a truncated answer changes what every
+        other observation about it means.
+        """
+        if self.result_ref is not None:
+            return self.result_ref.truncated
+        return bool(getattr(self.inline, "truncated", False))
+
+    @property
+    def documents(self) -> tuple[object, ...]:
+        """A document query's results, when it returned any."""
+        return tuple(getattr(self.inline, "documents", ()) or ())
+
+    @property
+    def health(self) -> object | None:
+        """A streaming job's health, for engines that report one."""
+        return self.native.get("health")
 
     @property
     def uri(self) -> str | None:
