@@ -81,12 +81,12 @@ def test_malformed_resource_patterns_are_refused_at_construction(pattern: str) -
 def test_a_string_where_a_list_belongs_is_not_a_one_element_policy() -> None:
     """`sources="analytics.*"` would otherwise iterate into single characters."""
     with pytest.raises(PolicyConfigurationError):
-        allow.query(sources="analytics.*")  # type: ignore[arg-type]
+        allow.query(sources="analytics.*")
 
 
 def test_unknown_operations_effects_and_constraints_are_refused() -> None:
     with pytest.raises(PolicyConfigurationError, match="unknown operation"):
-        PolicyRule(effect="allow", operations=["transmogrify"])  # type: ignore[list-item]
+        PolicyRule(effect="allow", operations=["transmogrify"])  # type: ignore[arg-type]
     with pytest.raises(PolicyConfigurationError, match="unknown policy effect"):
         PolicyRule(effect="maybe")  # type: ignore[arg-type]
     with pytest.raises(PolicyConfigurationError, match="unknown constraint"):
@@ -668,7 +668,7 @@ async def test_a_streaming_job_is_refused_before_it_is_submitted() -> None:
     has to land before the gateway is called at all — the transport must show no
     submission, not a submission that was later cancelled.
     """
-    from tests.test_flink import FakeFlinkTransport
+    from test_flink import FakeFlinkTransport
 
     transport = FakeFlinkTransport()
     policy = Policy(
@@ -724,7 +724,7 @@ async def test_a_batch_rule_does_not_authorize_a_stream_or_the_reverse() -> None
     it are different grants over the same two tables, so a policy written for one
     must not quietly cover the other.
     """
-    from tests.test_flink import FakeFlinkTransport
+    from test_flink import FakeFlinkTransport
 
     stream_only = Policy(
         name="stream-only",

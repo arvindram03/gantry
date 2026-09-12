@@ -174,10 +174,10 @@ optional extra.
 Every decision is structured. A denial names the resource and the rule:
 
 ```python
-run.admission.allowed        # False
-run.admission.codes          # ("DESTINATION_DENIED",)
+run.admission.allowed  # False
+run.admission.codes  # ("DESTINATION_DENIED",)
 run.admission.matched_rules  # ("deny-materialize-2",)
-run.admission.reasons        # ("writing prod.orders is denied by rule deny-materialize-2",)
+run.admission.reasons  # ("writing prod.orders is denied by rule deny-materialize-2",)
 ```
 
 | Code | Means |
@@ -234,8 +234,8 @@ A policy that cannot mean anything raises `PolicyConfigurationError` where it is
 written, not at admission:
 
 ```python
-gantry.allow.query(sources=["ana*lytics"])   # a star inside a name
-gantry.allow.materialize(destinations=[])    # could never authorize a write
+gantry.allow.query(sources=["ana*lytics"])  # a star inside a name
+gantry.allow.materialize(destinations=[])  # could never authorize a write
 gantry.allow.query(constraints={"max_joins": 3})  # not a bounded constraint
 ```
 

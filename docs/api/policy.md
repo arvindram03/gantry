@@ -23,9 +23,9 @@ db = gantry.sql.connect("postgres", url=DATABASE_URL, policy=policy)
 with gantry.actor.context(actor=gantry.actor.actor("agent", "etl-agent"), environment="prod"):
     run = await db.query(schemas=["analytics"])(sql)
 
-run.admission.policy        # "data-agents"
-run.admission.policy_hash   # "sha256:…"
-run.admission.matched_rules # ("allow-query-0",)
+run.admission.policy  # "data-agents"
+run.admission.policy_hash  # "sha256:…"
+run.admission.matched_rules  # ("allow-query-0",)
 ```
 
 !!! note "Policy decides before the engine is asked"

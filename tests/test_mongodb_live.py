@@ -390,7 +390,7 @@ async def test_policy_refuses_an_out_and_mongodb_keeps_no_collection() -> None:
         max_documents=10,
         timeout=30,
     )
-    rollup = [
+    rollup: list[Mapping[str, object]] = [
         {"$match": {"status": "open"}},
         {"$group": {"_id": "$region", "total": {"$sum": "$amount"}}},
     ]
