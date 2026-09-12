@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "Apache-2.0" }
 dependencies = []
-keywords = ["sql", "agents", "llm", "governance", "flink", "duckdb", "postgres"]
+keywords = ["sql", "agents", "llm", "governance", "flink", "duckdb", "postgres", "mysql"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -29,9 +29,11 @@ Changelog = "https://github.com/arvindram03/gantry/blob/main/CHANGELOG.md"
 [project.optional-dependencies]
 postgres = ["asyncpg>=0.30"]
 duckdb = ["duckdb>=1.1"]
+mysql = ["aiomysql>=0.2"]
 bigquery = ["google-cloud-bigquery>=3.25"]
 snowflake = ["snowflake-connector-python>=3.12"]
 all-sql = [
+    "aiomysql>=0.2",
     "asyncpg>=0.30",
     "duckdb>=1.1",
     "google-cloud-bigquery>=3.25",

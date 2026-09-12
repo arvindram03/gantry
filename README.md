@@ -107,6 +107,7 @@ generated from the adapter source and lists which backend enforces what.
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-4169E1?style=for-the-badge&logo=postgresql&logoColor=white)](https://arvindram03.github.io/gantry/sql/)
 [![Neon](https://img.shields.io/badge/Neon-00E599?style=for-the-badge&logo=neon&logoColor=black)](https://arvindram03.github.io/gantry/sql/)
 [![Supabase](https://img.shields.io/badge/Supabase-3FCF8E?style=for-the-badge&logo=supabase&logoColor=black)](https://arvindram03.github.io/gantry/sql/)
+[![MySQL](https://img.shields.io/badge/MySQL-4479A1?style=for-the-badge&logo=mysql&logoColor=white)](https://arvindram03.github.io/gantry/sql/)
 [![DuckDB](https://img.shields.io/badge/DuckDB-FFF000?style=for-the-badge&logo=duckdb&logoColor=black)](https://arvindram03.github.io/gantry/sql/)
 [![Apache Flink](https://img.shields.io/badge/Apache%20Flink-E6526F?style=for-the-badge&logo=apacheflink&logoColor=white)](https://arvindram03.github.io/gantry/flink/)
 [![BigQuery](https://img.shields.io/badge/BigQuery-669DF6?style=for-the-badge&logo=googlebigquery&logoColor=white)](https://arvindram03.github.io/gantry/sql/)
@@ -115,6 +116,7 @@ generated from the adapter source and lists which backend enforces what.
 | | What Gantry does there |
 | --- | --- |
 | **PostgreSQL**, Neon, Supabase | Governed queries, bounded inline results |
+| **MySQL** | Governed queries and materialization, with an enforced timeout |
 | **DuckDB** | Governed queries, local materialization |
 | **Apache Flink** | Batch and streaming jobs, durable handles, cancellation |
 | **BigQuery** \* | Governed queries, output references, materialization |
@@ -175,7 +177,7 @@ job does not need the agent, or the process that launched it, to still be alive.
 ## Next
 
 - **[Documentation](https://arvindram03.github.io/gantry/)** — guides and the full API reference
-- **[Examples](https://github.com/arvindram03/gantry/tree/main/examples)** — seven runnable scenarios, indexed by what you are trying to do
+- **[Examples](https://github.com/arvindram03/gantry/tree/main/examples)** — runnable scenarios, indexed by what you are trying to do
 - **[Capability matrix](https://arvindram03.github.io/gantry/api/capabilities/)** — what each backend enforces
 - **[Security](https://github.com/arvindram03/gantry/blob/main/SECURITY.md)** — what Gantry does and does not protect
 

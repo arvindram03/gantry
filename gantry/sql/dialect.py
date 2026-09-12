@@ -66,11 +66,37 @@ class SQLDialect(Protocol):
 
 
 class ConservativeDialect:
-    """A small deny-by-default classifier shared until a dialect overrides it."""
+    """A small deny-by-default classifier shared until a dialect overrides it.
+
+    The two options are lexical rules that genuinely differ between engines, and
+    getting them wrong changes where a statement ends. `backslash_escapes` is
+    off by default, matching PostgreSQL with `standard_conforming_strings`,
+    where a backslash is only special inside an `E''` string. `dollar_quoting`
+    is on by default because PostgreSQL has it and MySQL does not — there, `$$`
+    is a syntax error and `$` is an ordinary identifier character.
+    """
+
+    def __init__(self, *, backslash_escapes: bool = False, dollar_quoting: bool = True) -> None:
+        self._backslash_escapes = backslash_escapes
+        self._dollar_quoting = dollar_quoting
 
     def parse(self, sql: str) -> ParsedSQL:
-        statements = tuple(part.strip() for part in _split_statements(sql) if part.strip())
+        statements = tuple(part.strip() for part in self._split(sql) if part.strip())
         return ParsedSQL(statements)
+
+    def _split(self, sql: str) -> tuple[str, ...]:
+        return _split_statements(
+            sql,
+            backslash_escapes=self._backslash_escapes,
+            dollar_quoting=self._dollar_quoting,
+        )
+
+    def _blank(self, sql: str) -> str:
+        return _blank_comments(
+            sql,
+            backslash_escapes=self._backslash_escapes,
+            dollar_quoting=self._dollar_quoting,
+        )
 
     def classify(self, sql: str) -> SQLClassification:
         parsed = self.parse(sql)
@@ -87,7 +113,7 @@ class ConservativeDialect:
         statement = _LEADING_COMMENTS.sub("", parsed.statements[0])
         # Keyword scanning runs on the statement with comments blanked, so a
         # comment neither hides a keyword nor contributes words of its own.
-        scanned = _blank_comments(statement)
+        scanned = self._blank(statement)
         words = [match.group(0).upper() for match in _WORD.finditer(scanned)]
         first = words[0] if words else ""
         if first == "WITH":
@@ -134,7 +160,7 @@ class ConservativeDialect:
         # `/* FROM secret */` names no table. Scanning the comment would add a
         # reference the engine never resolves, and let the text of a comment
         # decide whether an allow-list matches.
-        for match in _OBJECT.finditer(_blank_comments(sql)):
+        for match in _OBJECT.finditer(self._blank(sql)):
             qualified = match.group(1)
             if qualified.lower() in seen:
                 continue
@@ -150,7 +176,27 @@ class ConservativeDialect:
         return tuple(references)
 
 
-def _spans(sql: str) -> Iterator[tuple[str, int, int]]:
+class MySQLDialect(ConservativeDialect):
+    """`ConservativeDialect` with MySQL's lexical rules rather than PostgreSQL's.
+
+    Two differences, both of which move where a statement ends. MySQL escapes
+    backslashes inside ordinary strings — `NO_BACKSLASH_ESCAPES` is not in the
+    default `sql_mode` — so `'a\\'; SELECT 2'` is one string and one statement.
+    Reading it with PostgreSQL's rule splits it in two and refuses it as a
+    batch, which is safe but wrong. And MySQL has no dollar-quoting: `$$` is a
+    syntax error there, while `$` is an ordinary identifier character, so
+    `my$tab$le` is one name.
+
+    Checked against MySQL 8.4 with the default `sql_mode`.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(backslash_escapes=True, dollar_quoting=False)
+
+
+def _spans(
+    sql: str, *, backslash_escapes: bool = False, dollar_quoting: bool = True
+) -> Iterator[tuple[str, int, int]]:
     """Walk `sql` once, yielding `(kind, start, end)` covering every character.
 
     `kind` is `"code"`, `"quoted"` for a string or quoted identifier, or
@@ -169,7 +215,7 @@ def _spans(sql: str) -> Iterator[tuple[str, int, int]]:
         char = sql[index]
         if char in {"'", '"', "`"}:
             yield "code", code_start, index
-            stop = _end_of_quoted(sql, index)
+            stop = _end_of_quoted(sql, index, backslash_escapes=backslash_escapes)
             yield "quoted", index, stop
             index = code_start = stop
             continue
@@ -188,7 +234,7 @@ def _spans(sql: str) -> Iterator[tuple[str, int, int]]:
             yield "comment", index, stop
             index = code_start = stop
             continue
-        if char == "$" and _starts_token(sql, index):
+        if dollar_quoting and char == "$" and _starts_token(sql, index):
             match = _DOLLAR_QUOTE.match(sql, index)
             if match is not None:
                 yield "code", code_start, index
@@ -202,14 +248,19 @@ def _spans(sql: str) -> Iterator[tuple[str, int, int]]:
     yield "code", code_start, len(sql)
 
 
-def _end_of_quoted(sql: str, index: int) -> int:
+def _end_of_quoted(sql: str, index: int, *, backslash_escapes: bool = False) -> int:
     """The index just past the string or quoted identifier opening at `index`."""
     quote = sql[index]
-    backslash_escapes = quote == "'" and _has_escape_prefix(sql, index)
+    # MySQL escapes backslashes in every string unless NO_BACKSLASH_ESCAPES is
+    # set; PostgreSQL only does so after an `E` prefix. Backticks quote an
+    # identifier in both, where a backslash is literal.
+    escapes = (backslash_escapes and quote in {"'", '"'}) or (
+        quote == "'" and _has_escape_prefix(sql, index)
+    )
     cursor = index + 1
     while cursor < len(sql):
         char = sql[cursor]
-        if backslash_escapes and char == "\\" and cursor + 1 < len(sql):
+        if escapes and char == "\\" and cursor + 1 < len(sql):
             # Inside an E'' string a backslash escapes whatever follows,
             # including the closing quote, so `E'O\'Brien'` is one string.
             cursor += 2
@@ -223,7 +274,9 @@ def _end_of_quoted(sql: str, index: int) -> int:
     return len(sql)
 
 
-def _split_statements(sql: str) -> tuple[str, ...]:
+def _split_statements(
+    sql: str, *, backslash_escapes: bool = False, dollar_quoting: bool = True
+) -> tuple[str, ...]:
     """Split on the semicolons that actually separate statements.
 
     A `;` only separates when it is code: inside a string, a quoted identifier,
@@ -231,7 +284,9 @@ def _split_statements(sql: str) -> tuple[str, ...]:
     """
     parts: list[str] = []
     start = 0
-    for kind, span_start, span_end in _spans(sql):
+    for kind, span_start, span_end in _spans(
+        sql, backslash_escapes=backslash_escapes, dollar_quoting=dollar_quoting
+    ):
         if kind != "code":
             continue
         offset = sql.find(";", span_start, span_end)
@@ -243,7 +298,9 @@ def _split_statements(sql: str) -> tuple[str, ...]:
     return tuple(parts)
 
 
-def _blank_comments(sql: str) -> str:
+def _blank_comments(
+    sql: str, *, backslash_escapes: bool = False, dollar_quoting: bool = True
+) -> str:
     """Replace each comment with spaces, as the engine's lexer treats them.
 
     Two reasons this has to happen before tokenizing. A comment is whitespace,
@@ -262,7 +319,9 @@ def _blank_comments(sql: str) -> str:
         return sql
     return "".join(
         " " * (end - start) if kind == "comment" else sql[start:end]
-        for kind, start, end in _spans(sql)
+        for kind, start, end in _spans(
+            sql, backslash_escapes=backslash_escapes, dollar_quoting=dollar_quoting
+        )
     )
 
 

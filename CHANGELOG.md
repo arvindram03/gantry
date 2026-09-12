@@ -7,6 +7,28 @@ Notable changes. Dates are release dates; the format follows
 
 ### Added
 
+- **MySQL as a SQL provider** (#13): `gantry.sql.connect("mysql", url=...)`, with
+  `query` and `materialize` behind the same contract as every other provider.
+  `pip install "data-gantry[mysql]"`.
+
+  Three things are MySQL rather than PostgreSQL-with-different-spelling, and
+  each was measured against MySQL 8.4 rather than assumed. `max_execution_time`
+  bounds `SELECT` and nothing else — a `CREATE TABLE ... AS SELECT` ran to
+  completion under a 200ms limit — so the timeout is enforced by the server
+  variable for reads and by a deadline plus `KILL QUERY` for everything else;
+  a timed-out materialization leaves no half-built destination. `EXPLAIN`
+  cannot describe DDL, so native validation uses `PREPARE`/`DEALLOCATE`, which
+  resolves a statement without running it. And a schema is a database, with
+  `table_catalog` always the literal `def`, so Gantry reports no catalog rather
+  than inventing one.
+- `gantry.sql.MySQLDialect`, because MySQL's lexing differs where it matters:
+  backslashes escape inside ordinary strings, so `'a\'; SELECT 2'` is one
+  statement there and two under PostgreSQL's rules, and there is no
+  dollar-quoting. `ConservativeDialect` now takes those two rules as options.
+- `examples/mysql_customers.py` and `examples/mysql/docker-compose.yml`: an
+  agent with two tools against MySQL, four of whose six statements are refused.
+- CI runs a real MySQL alongside the real PostgreSQL, so
+  `tests/test_mysql_live.py` executes rather than skipping.
 - An API reference for the public surface, published to GitHub Pages from
   `mkdocs.yml` and the pages under `docs/api/`. Signatures and types are
   generated from the source by `mkdocstrings`, so the reference cannot drift

@@ -122,9 +122,34 @@ process-local.
 | PostgreSQL | `gantry[postgres]` | PostgreSQL | Local async task, native transaction |
 | Neon | `gantry[postgres]` | PostgreSQL | Shared PostgreSQL adapter |
 | Supabase | `gantry[postgres]` | PostgreSQL | Shared PostgreSQL adapter |
+| MySQL | `gantry[mysql]` | MySQL | Local async task, read-only transaction, killed on timeout |
 | BigQuery | `gantry[bigquery]` | BigQuery | Reconnectable warehouse job + dry run |
 | Snowflake | `gantry[snowflake]` | Snowflake | Reconnectable query ID |
 | DuckDB | `gantry[duckdb]` | DuckDB | Local task, bounded cursor |
+
+### MySQL
+
+MySQL is close enough to the shared contract to need no new concepts, and
+different enough in three places that assuming PostgreSQL would be wrong.
+
+A schema is a database. `schemas=["analytics"]` allows the `analytics` database,
+and `information_schema.tables.table_catalog` is the literal `def` on every row,
+so Gantry reports no catalog rather than inventing one.
+
+`max_execution_time` bounds `SELECT` and nothing else — a
+`CREATE TABLE ... AS SELECT` runs to completion under it. So `timeout` is
+enforced twice: by the server variable for reads, and by a deadline plus
+`KILL QUERY` from a second connection for everything else. A timed-out
+materialization leaves no half-built destination, because MySQL 8 rolls the DDL
+back.
+
+`EXPLAIN` cannot describe DDL, so native validation uses `PREPARE` and
+`DEALLOCATE`, which resolves the statement without running it.
+
+The dialect differs too, and `gantry.sql.MySQLDialect` carries the difference:
+MySQL escapes backslashes inside ordinary strings, so `'a\'; SELECT 2'` is one
+statement there and two under PostgreSQL's rules, and MySQL has no
+dollar-quoting.
 
 ## Custom providers
 

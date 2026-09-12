@@ -39,6 +39,12 @@ def _postgres_factory(target: SQLTarget) -> SQLAdapter:
     return PostgresAdapter(target)
 
 
+def _mysql_factory(target: SQLTarget) -> SQLAdapter:
+    from gantry.sql.adapters.mysql import MySQLAdapter
+
+    return MySQLAdapter(target)
+
+
 def _bigquery_factory(target: SQLTarget) -> SQLAdapter:
     from gantry.sql.adapters.bigquery import BigQueryAdapter
 
@@ -100,6 +106,13 @@ def register_builtin_providers() -> None:
             adapter_factory=_postgres_factory,
             validate_config=_require_url,
         )
+    register_provider(
+        "mysql",
+        dialect="mysql",
+        driver="aiomysql",
+        adapter_factory=_mysql_factory,
+        validate_config=_require_url,
+    )
     register_provider(
         "bigquery",
         dialect="bigquery",

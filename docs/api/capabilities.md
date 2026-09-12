@@ -28,27 +28,27 @@ python scripts/capability_matrix.py --write
 
 ### What each provider declares
 
-| Capability | PostgreSQL, Neon, Supabase | BigQuery | Snowflake | DuckDB |
-| --- | --- | --- | --- | --- |
-| `describe_schema` | yes | yes | yes | yes |
-| `explain` | yes | yes | yes | yes |
-| `dry_run` | no | yes | no | no |
-| `async_jobs` | no | yes | yes | no |
-| `reconnect` | no | yes | yes | no |
-| `cancellation` | yes | yes | yes | yes |
-| `read_only_session` | yes | yes | read-only conn | read-only conn |
-| `write_execution` | yes | yes | writable conn | writable conn |
-| `statement_timeout` | yes | no | yes | yes |
-| `row_limit` | yes | yes | yes | yes |
-| `cost_estimate` | no | conditional | no | no |
-| `cost_limit` | no | conditional | no | no |
-| `bytes_scanned` | no | yes | no | no |
-| `query_metrics` | yes | yes | yes | yes |
-| `result_reference` | no | yes | yes | no |
-| `create_table_as` | no | yes | no | writable conn |
-| `create_view_as` | no | yes | no | writable conn |
-| `destination_introspection` | no | yes | no | yes |
-| `materialization_reference` | no | yes | no | writable conn |
+| Capability | PostgreSQL, Neon, Supabase | MySQL | BigQuery | Snowflake | DuckDB |
+| --- | --- | --- | --- | --- | --- |
+| `describe_schema` | yes | yes | yes | yes | yes |
+| `explain` | yes | yes | yes | yes | yes |
+| `dry_run` | no | no | yes | no | no |
+| `async_jobs` | no | no | yes | yes | no |
+| `reconnect` | no | no | yes | yes | no |
+| `cancellation` | yes | yes | yes | yes | yes |
+| `read_only_session` | yes | yes | yes | read-only conn | read-only conn |
+| `write_execution` | yes | yes | yes | writable conn | writable conn |
+| `statement_timeout` | yes | yes | no | yes | yes |
+| `row_limit` | yes | yes | yes | yes | yes |
+| `cost_estimate` | no | no | conditional | no | no |
+| `cost_limit` | no | no | conditional | no | no |
+| `bytes_scanned` | no | no | yes | no | no |
+| `query_metrics` | yes | yes | yes | yes | yes |
+| `result_reference` | no | no | yes | yes | no |
+| `create_table_as` | no | yes | yes | no | writable conn |
+| `create_view_as` | no | yes | yes | no | writable conn |
+| `destination_introspection` | no | yes | yes | no | yes |
+| `materialization_reference` | no | yes | yes | no | writable conn |
 
 A cell reading *read-only conn* or *writable conn* is declared conditionally: the adapter has the capability only when the connection was opened that way. `gantry.sql.connect("duckdb", path=..., read_only=True)` is what makes DuckDB able to hold a read-only session, and a connection that was not opened read-only is refused rather than trusted.
 

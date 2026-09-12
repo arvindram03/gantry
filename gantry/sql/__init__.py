@@ -5,7 +5,7 @@ from gantry.sql.adapter import SQLAdapter
 from gantry.sql.api import SQLConnection, connect
 from gantry.sql.capabilities import SQLCapabilities
 from gantry.sql.classification import ParsedSQL, SQLClassification, SQLObjectRef, SQLOperation
-from gantry.sql.dialect import ConservativeDialect, SQLDialect
+from gantry.sql.dialect import ConservativeDialect, MySQLDialect, SQLDialect
 from gantry.sql.explain import ExplainResult
 from gantry.sql.materialization import (
     MaterializationAdapter,
@@ -45,6 +45,7 @@ __all__ = [
     "MaterializationPolicy",
     "MaterializationProposal",
     "MaterializationResult",
+    "MySQLDialect",
     "ParsedSQL",
     "SQLAdapter",
     "SQLCapabilities",

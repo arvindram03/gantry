@@ -59,16 +59,41 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      # And a real MySQL for tests/test_mysql_live.py. MySQL differs from
+      # PostgreSQL in ways that only a server shows: `max_execution_time` does
+      # not bound writes, `EXPLAIN` cannot describe DDL, and a schema is a
+      # database. Every one of those was found here rather than by reading.
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: gantry
+          MYSQL_DATABASE: analytics
+          MYSQL_USER: gantry
+          MYSQL_PASSWORD: gantry
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -ugantry -pgantry"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
-      - run: uv sync --extra postgres
+      - run: uv sync --extra postgres --extra mysql
       - run: psql "$GANTRY_TEST_POSTGRES_URL" -f examples/seed.sql
         env:
           GANTRY_TEST_POSTGRES_URL: postgresql://gantry:gantry@localhost:5432/gantry
+      # The MySQL user only has rights on MYSQL_DATABASE, so the database a
+      # materialization writes to has to be created and granted separately.
+      - run: |
+          mysql -h 127.0.0.1 -uroot -pgantry -e "
+            CREATE DATABASE IF NOT EXISTS reporting;
+            GRANT ALL PRIVILEGES ON reporting.* TO 'gantry'@'%';
+            FLUSH PRIVILEGES;"
       # mypy no longer pins python_version, so it type-checks under the
       # semantics of whichever interpreter is running rather than always 3.12.
       - run: uv run mypy gantry tests
@@ -81,6 +106,7 @@ jobs:
         env:
           GANTRY_REQUIRE_LIVE: "1"
           GANTRY_TEST_POSTGRES_URL: postgresql://gantry:gantry@localhost:5432/gantry
+          GANTRY_TEST_MYSQL_URL: mysql://gantry:gantry@127.0.0.1:3306/analytics
 
   # Heavier than a service container — a full JobManager/TaskManager/SQL
   # Gateway stack, built from examples/flink/. On demand or weekly rather

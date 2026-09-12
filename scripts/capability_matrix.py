@@ -44,6 +44,7 @@ POLICY_REQUIREMENTS: tuple[tuple[str, str, str], ...] = (
 
 PROVIDERS = {
     "postgres": "PostgreSQL, Neon, Supabase",
+    "mysql": "MySQL",
     "bigquery": "BigQuery",
     "snowflake": "Snowflake",
     "duckdb": "DuckDB",

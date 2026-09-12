@@ -5,7 +5,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
 from gantry.sql.adapter import SQLAdapter
-from gantry.sql.dialect import ConservativeDialect, SQLDialect
+from gantry.sql.dialect import ConservativeDialect, MySQLDialect, SQLDialect
 from gantry.sql.target import SQLTarget
 
 AdapterFactory = Callable[[SQLTarget], SQLAdapter]
@@ -116,5 +116,8 @@ def _accept_config(config: Mapping[str, object]) -> None:
     return None
 
 
-for _dialect_name in ("postgres", "mysql", "sqlserver", "bigquery", "snowflake", "duckdb"):
+for _dialect_name in ("postgres", "sqlserver", "bigquery", "snowflake", "duckdb"):
     register_dialect(_dialect_name, ConservativeDialect())
+
+# MySQL lexes strings differently enough that the shared rules mis-split it.
+register_dialect("mysql", MySQLDialect())

@@ -1,0 +1,26 @@
+# Just MySQL, for examples/mysql_customers.py. Nothing else in examples/ needs it.
+#
+#   docker compose -f examples/mysql/docker-compose.yml up -d --wait
+#   python examples/mysql_customers.py
+
+name: gantry-mysql-example
+
+services:
+  mysql:
+    image: mysql:8
+    environment:
+      MYSQL_ROOT_PASSWORD: gantry
+      MYSQL_DATABASE: analytics
+      MYSQL_USER: gantry
+      MYSQL_PASSWORD: gantry
+    ports:
+      - "3306:3306"
+    volumes:
+      # Creates `reporting` and grants the example user access to it. MySQL runs
+      # anything here once, as root, on first start.
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-ugantry", "-pgantry"]
+      interval: 3s
+      timeout: 5s
+      retries: 30

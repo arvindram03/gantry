@@ -95,4 +95,6 @@ SQL — what the caller wrote is what the engine receives.
 
 ::: gantry.sql.ConservativeDialect
 
+::: gantry.sql.MySQLDialect
+
 ::: gantry.sql.register_dialect

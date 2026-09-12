@@ -12,6 +12,7 @@ psql "$GANTRY_DATABASE_URL" -f examples/seed.sql
 |---|---|---|
 | Let an agent answer questions about a warehouse | [`agent_sql.py`](agent_sql.py) | PostgreSQL |
 | Try this with nothing to set up | [`local_duckdb.py`](local_duckdb.py) | a file on disk |
+| Give an agent read access and one place to write, on MySQL | [`mysql_customers.py`](mysql_customers.py) | MySQL |
 | Let an agent build a feature table a model will train on | [`materialize_and_verify.py`](materialize_and_verify.py) | a file on disk |
 | Survive an agent writing a query that never finishes | [`long_running_query.py`](long_running_query.py) | PostgreSQL |
 | Have an agent build a rollup that is checked before anyone reads it | [`warehouse_rollup.py`](warehouse_rollup.py) | Flink + PostgreSQL |
