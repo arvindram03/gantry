@@ -170,9 +170,15 @@ async def test_submitted_handle_can_be_observed_and_result_recovered() -> None:
     result = await db.wait(handle, poll_interval_seconds=0)
 
     assert execution.state is ExecutionState.SUCCEEDED
+    # `submit`/`wait` is the provider-facing API and still speaks `ResultStatus`.
+    # `RunStatus` belongs to the governed path — `db.query(...)` — which is the
+    # one that records a run. Both appear in this file on purpose.
     assert result.status is ResultStatus.ACCEPTED
     assert result.handle == handle
-    assert len(result.outputs) >= 1
+    assert [output.uri for output in result.outputs] == [
+        "inline://sql-run",
+        "warehouse://temporary/sql-run",
+    ]
 
 
 async def test_read_only_policy_rejects_write_before_submission() -> None:

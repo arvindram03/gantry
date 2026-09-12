@@ -12,8 +12,6 @@ from gantry import ExecutionState, FailureKind
 from gantry.batch import BatchCapabilities, BatchConnection
 from gantry.flink.artifact import FlinkMode, FlinkSQLArtifact
 from gantry.flink.client import HTTPResponse
-from gantry.flink.execution import StreamingHealth
-from gantry.flink.metrics import FlinkMetrics
 from gantry.flink.operation import FlinkJobError, FlinkJobStatement
 from gantry.flink.target import FlinkTarget
 from gantry.runs.status import RunStatus
@@ -292,7 +290,6 @@ async def test_batch_waits_for_success_then_verifies_the_output() -> None:
     assert result.status is RunStatus.ACCEPTED
     assert result.execution is not None
     assert result.execution.status == "SUCCEEDED"
-    assert result.uri is not None
     assert result.uri == "flink-table:///snapshot"
     assert result.verification is not None
     assert {check.name: check.ok for check in result.verification.checks} == {
@@ -344,11 +341,9 @@ async def test_stream_accepts_a_healthy_running_job_and_returns_stream_uri() -> 
     assert result.handle is not None
     assert result.handle.metadata["mode"] == "stream"
     assert result.execution is not None and result.execution.status == "RUNNING"
-    health = cast("StreamingHealth", result.health)
-    assert health is not None and health.healthy
-    assert cast("FlinkMetrics", result.native["metrics"]).records_in == 19
-    assert cast("FlinkMetrics", result.native["metrics"]).records_out == 17
-    assert result.uri is not None
+    assert result.health is not None and result.health.healthy
+    assert result.native["metrics"].records_in == 19
+    assert result.native["metrics"].records_out == 17
     assert result.uri == "kafka://clean"
     assert "secret-token" not in repr(result.handle)
     assert transport.calls[0].headers["Authorization"] == "Bearer secret-token"

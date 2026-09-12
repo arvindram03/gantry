@@ -101,15 +101,16 @@ async def test_duckdb_materialization_returns_reference_and_verifies_destination
     result = await materialize(_sql())
 
     assert result.status is RunStatus.ACCEPTED
-    assert result.outputs
-    assert result.outputs and result.outputs[0].system
-    assert result.uri == "duckdb://agent_scratch/high_risk_customers"
+    # The destination is recorded as a reference, named the way the engine
+    # names it, and reachable through the URI form callers already match on.
+    assert [(ref.system, ref.resource) for ref in result.outputs] == [
+        ("duckdb", "agent_scratch.high_risk_customers")
+    ]
     assert result.uri == "duckdb://agent_scratch/high_risk_customers"
     assert result.execution is not None
     assert result.execution.status == "SUCCEEDED"
     assert result.verification is not None
     assert result.verification.ok
-    assert result.uri is not None
 
 
 async def test_materialization_enforces_source_destination_and_create_only_policy(
@@ -174,8 +175,7 @@ async def test_duckdb_adapter_optionally_materializes_a_view(tmp_path: Path) -> 
     )
 
     assert result.ok
-    assert result.outputs
-    assert result.uri is not None
+    assert result.uri == "duckdb://agent_scratch/invoice_view"
     assert result.verification is not None
     assert result.verification.checks[0].actual == 3
 

@@ -64,7 +64,6 @@ async def test_conflicting_count_contract_stops_before_execution(tmp_path: Path)
 
     assert result.status is RunStatus.VERIFICATION_CONFLICT
     assert result.failure is not None
-    assert result.failure is not None
     assert result.failure.kind is FailureKind.VERIFICATION_CONFLICT
     assert result.handle is None
 
@@ -94,7 +93,6 @@ async def test_agent_check_that_cannot_be_measured_fails_as_unsupported(
     result = await query("SELECT id FROM events", verify=[gantry.verify.row_count(min=1)])
 
     assert result.status is RunStatus.VERIFICATION_UNSUPPORTED
-    assert result.failure is not None
     assert result.failure is not None
     assert result.failure.kind is FailureKind.VERIFICATION_UNSUPPORTED
     assert result.verification is not None

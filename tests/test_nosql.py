@@ -20,7 +20,6 @@ from gantry import (
     OutputRef,
     ValidationResult,
 )
-from gantry.actor import UNKNOWN_ACTOR
 from gantry.nosql.bridge import NoSQLExecutionAdapter
 from gantry.nosql.capabilities import NoSQLCapabilities
 from gantry.nosql.enforcement import policy_errors
@@ -45,8 +44,10 @@ from gantry.nosql.verify import (
     required_fields,
 )
 from gantry.result import ResultStatus
-from gantry.runs.model import OperationKind, OperationRef, Run
+from gantry.runs.model import Run
 from gantry.runs.status import RunStatus
+
+from _runs import make_run
 
 
 def test_target_rejects_empty_provider_or_driver() -> None:
@@ -380,12 +381,7 @@ class _FakeConnection:
         agent_verify: Sequence[object] = (),
     ) -> Run:
         self.calls.append((collection, pipeline, policy))
-        return Run(
-            id="run_fake",
-            status=RunStatus.ACCEPTED,
-            actor=UNKNOWN_ACTOR,
-            operation=OperationRef(kind=OperationKind.QUERY, engine="mongodb"),
-        )
+        return make_run(id="run_fake", engine="mongodb")
 
 
 async def test_query_calls_connection_with_collection_and_pipeline() -> None:
@@ -448,6 +444,9 @@ class _FakeMaterializeConnection:
     async def wait(
         self, handle: ExecutionHandle, *, poll_interval_seconds: float = 0.05
     ) -> NoSQLResult:
+        # A stub standing in for a provider, so it reports a `ResultStatus`
+        # like a real one. The `RunStatus` elsewhere in this file belongs to
+        # the governed path above it, which is what turns this into a run.
         return NoSQLResult(
             ResultStatus.ACCEPTED,
             handle=handle,

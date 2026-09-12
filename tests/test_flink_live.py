@@ -25,12 +25,10 @@ import os
 import time
 import urllib.error
 import urllib.request
-from typing import cast
 
 import gantry
 import pytest
 from gantry.batch import BatchConnection
-from gantry.flink.metrics import FlinkMetrics
 from gantry.flink.operation import FlinkBatchJob
 
 from _live import require_live_or_skip
@@ -271,13 +269,13 @@ async def test_running_job_metrics_reach_the_health_checks(
     )
     if result.execution is None or result.execution.status != "RUNNING":
         pytest.skip("the job finished before it could be observed running")
-    if not cast("FlinkMetrics", result.native["metrics"]).native.get("job"):
+    if not result.native["metrics"].native.get("job"):
         # Flink registers job metrics a moment after the job reaches RUNNING,
         # so the earliest observation can legitimately have none. Skipping is
         # honest here; asserting would make this fail about one run in three
         # for a reason that is not the one under test.
         pytest.skip("Flink had not registered job metrics yet")
-    assert cast("FlinkMetrics", result.native["metrics"]).restart_count is not None, (
+    assert result.native["metrics"].restart_count is not None, (
         "a running job must report a restart count; None means the health "
         "checks are reading metrics from the wrong object"
     )

@@ -11,21 +11,24 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
 from gantry.actor import actor
 from gantry.evidence import EvidenceBundle, Observation, ObservationSource
-from gantry.runs.model import OperationKind, OperationRef, ResourceRef, Run, render
+from gantry.runs.model import OperationKind, ResourceRef, Run, render
 from gantry.runs.sqlite import SQLiteRunStore
 from gantry.runs.sqlite import evidence_from_dict as _bundle_from_dict
 from gantry.runs.status import RunStatus
 from gantry.runs.store import MemoryRunStore
 from gantry.verifier import CheckResult, VerificationResult
 
+from _runs import make_run
 
-def _bundle(**overrides: object) -> EvidenceBundle:
+
+def _bundle(**overrides: Any) -> EvidenceBundle:
     started = datetime(2026, 9, 12, 3, 0, tzinfo=UTC)
-    defaults: dict[str, object] = {
+    defaults: dict[str, Any] = {
         "run_id": "run_123",
         "engine": "sql",
         "operation": "CREATE_TABLE_AS",
@@ -47,24 +50,22 @@ def _bundle(**overrides: object) -> EvidenceBundle:
             ),
         ),
     }
-    return EvidenceBundle(**{**defaults, **overrides})  # type: ignore[arg-type]
+    return EvidenceBundle(**{**defaults, **overrides})
 
 
-def _run(**overrides: object) -> Run:
+def _run(**overrides: Any) -> Run:
     """A run carrying the bundle above, for the store tests."""
-    defaults: dict[str, object] = {
+    defaults: dict[str, Any] = {
         "id": "run_123",
-        "status": RunStatus.ACCEPTED,
         "actor": actor("agent", "test-agent"),
-        "operation": OperationRef(
-            kind=OperationKind.MATERIALIZE, engine="sql", provider="postgres"
-        ),
+        "kind": OperationKind.MATERIALIZE,
+        "provider": "postgres",
         "inputs": (ResourceRef(system="postgres", resource="raw.orders"),),
         "outputs": (ResourceRef(system="postgres", resource="analytics.customer_metrics"),),
         "evidence": _bundle(),
         "verification": VerificationResult(ok=True, checks=_bundle().checks),
     }
-    return Run(**{**defaults, **overrides})  # type: ignore[arg-type]
+    return make_run(**{**defaults, **overrides})
 
 
 def test_a_bundle_is_json_and_carries_both_sides_of_every_check() -> None:
