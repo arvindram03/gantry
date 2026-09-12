@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import re
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import suppress
 from datetime import UTC, datetime
@@ -23,6 +24,13 @@ from gantry.sql.capabilities import SQLCapabilities
 from gantry.sql.classification import SQLOperation
 from gantry.sql.dialect import ConservativeDialect
 from gantry.sql.explain import ExplainResult
+from gantry.sql.materialization import (
+    _DESTINATION_METADATA,
+    _OPERATION_METADATA,
+    _PLAN_METADATA,
+    MaterializationPlan,
+    TableRef,
+)
 from gantry.sql.output import InlineRows
 from gantry.sql.policy import SQLPolicy
 from gantry.sql.schema import Column, DatabaseSchema, Table
@@ -44,6 +52,10 @@ class _PreparedStatement(Protocol):
 
 
 class _Transaction(Protocol):
+    async def start(self) -> None: ...
+
+    async def rollback(self) -> None: ...
+
     async def __aenter__(self) -> object: ...
 
     async def __aexit__(
@@ -91,6 +103,10 @@ class PostgresAdapter:
             statement_timeout=True,
             row_limit=True,
             query_metrics=True,
+            create_table_as=True,
+            create_view_as=True,
+            destination_introspection=True,
+            materialization_reference=True,
         )
 
     async def describe(self, target: SQLTarget) -> DatabaseSchema:
@@ -128,6 +144,58 @@ class PostgresAdapter:
             tables=tables,
         )
 
+    async def inspect_table(
+        self,
+        reference: TableRef,
+        target: SQLTarget,
+        *,
+        include_row_count: bool = False,
+    ) -> Table | None:
+        """Look a destination up by name, for create-only and verification.
+
+        A targeted query rather than filtering `describe()`, because this runs
+        twice per materialization — once to refuse a destination that already
+        exists, once to check what was built — and `describe()` reads every
+        column of every table in the database.
+        """
+        connection = await self._open()
+        try:
+            rows = await connection.fetch(
+                f"""
+                SELECT c.table_catalog, c.table_schema, t.table_type,
+                       c.column_name, c.data_type, c.is_nullable
+                FROM information_schema.columns AS c
+                JOIN information_schema.tables AS t
+                  ON t.table_catalog = c.table_catalog
+                 AND t.table_schema = c.table_schema
+                 AND t.table_name = c.table_name
+                WHERE c.table_name = '{_escaped(reference.name)}'
+                  {_schema_filter(reference)}
+                ORDER BY c.ordinal_position
+                """
+            )
+            if not rows:
+                return None
+            catalog, schema, kind = str(rows[0][0]), str(rows[0][1]), str(rows[0][2]).lower()
+            columns = tuple(
+                Column(str(name), str(data_type), str(nullable).upper() == "YES")
+                for _, _, _, name, data_type, nullable in rows
+            )
+            metadata: dict[str, object] = {}
+            if include_row_count:
+                counted = await connection.fetch(
+                    f"SELECT COUNT(*) FROM {_quoted(schema)}.{_quoted(reference.name)}"
+                )
+                count = counted[0][0]
+                if not isinstance(count, int) or isinstance(count, bool):
+                    raise TypeError("PostgreSQL returned a non-integer row count")
+                # The key is `rows`; `gantry.verify.RowCount` reads that and
+                # nothing else.
+                metadata["rows"] = count
+        finally:
+            await connection.close()
+        return Table(reference.name, schema, catalog, columns, kind=kind, metadata=metadata)
+
     async def validate(
         self,
         sql: str,
@@ -137,14 +205,35 @@ class PostgresAdapter:
     ) -> ValidationResult:
         connection = await self._open()
         try:
-            async with connection.transaction(readonly=policy.read_only):
-                await self._set_timeout(connection, policy)
-                await connection.fetch(f"EXPLAIN (FORMAT JSON) {sql}")
+            if _explainable(sql):
+                async with connection.transaction(readonly=policy.read_only):
+                    await self._set_timeout(connection, policy)
+                    await connection.fetch(f"EXPLAIN (FORMAT JSON) {sql}")
+            else:
+                await self._dry_run(connection, sql, policy)
         except Exception as error:
             return ValidationResult.rejected(str(error))
         finally:
             await connection.close()
         return ValidationResult.accepted()
+
+    async def _dry_run(self, connection: _Connection, sql: str, policy: SQLPolicy) -> None:
+        """Run the statement in a transaction and roll it back.
+
+        `EXPLAIN` covers `CREATE TABLE AS` but not `CREATE VIEW`, which is a
+        syntax error there. PostgreSQL's DDL is transactional, so running the
+        view definition and rolling it back resolves every name in it — a
+        missing source is caught here rather than at execution — and leaves
+        nothing behind. Only for statements that define rather than move data:
+        dry-running a `CREATE TABLE AS` would copy the rows twice.
+        """
+        transaction = connection.transaction(readonly=False)
+        await transaction.start()
+        try:
+            await self._set_timeout(connection, policy)
+            await connection.execute(sql)
+        finally:
+            await transaction.rollback()
 
     async def explain(self, sql: str, target: SQLTarget) -> ExplainResult:
         connection = await self._open()
@@ -166,12 +255,17 @@ class PostgresAdapter:
         if not isinstance(policy, SQLPolicy):
             raise ValueError("governed SQL policy is missing from execution context")
         gantry_id = f"run_{uuid4().hex}"
+        metadata: dict[str, object] = {"provider": target.provider}
+        plan = context.metadata.get(_PLAN_METADATA)
+        if isinstance(plan, MaterializationPlan):
+            metadata[_DESTINATION_METADATA] = plan.destination.qualified_name
+            metadata[_OPERATION_METADATA] = plan.operation.value
         handle = ExecutionHandle(
             gantry_id,
             "sql",
             target.provider,
             f"postgres_{uuid4().hex}",
-            metadata={"provider": target.provider},
+            metadata=metadata,
         )
         self._jobs[gantry_id] = asyncio.create_task(self._execute(handle, sql, policy))
         return handle
@@ -258,7 +352,9 @@ class PostgresAdapter:
                     rows_read = len(rows)
                 else:
                     await connection.execute(sql)
-                    outputs = ()
+                    # A materialization has to come back as a reference to what
+                    # it built, or nothing downstream can verify the destination.
+                    outputs = _destination_output(handle)
                     rows_read = None
         except asyncio.CancelledError:
             return ExecutionResult.failed(
@@ -292,6 +388,62 @@ class PostgresAdapter:
     async def _set_timeout(connection: _Connection, policy: SQLPolicy) -> None:
         milliseconds = max(1, int(policy.timeout_seconds * 1_000))
         await connection.execute(f"SET LOCAL statement_timeout = {milliseconds}")
+
+
+# PostgreSQL can EXPLAIN a `CREATE TABLE AS`, but `EXPLAIN CREATE VIEW` is a
+# syntax error. Anything not explainable is validated by dry run instead.
+_UNEXPLAINABLE = re.compile(r"\A\s*CREATE\s+(OR\s+REPLACE\s+)?(RECURSIVE\s+)?VIEW\b", re.I)
+
+
+def _explainable(sql: str) -> bool:
+    return _UNEXPLAINABLE.search(sql) is None
+
+
+def _escaped(value: str) -> str:
+    """Single-quote escaping for a name interpolated into a metadata query.
+
+    asyncpg takes `$1` parameters, not the `%s` this file's other queries use,
+    and the surrounding query is a static string with one caller-influenced
+    name in it. Doubling the quote is what PostgreSQL asks for, and the name
+    has already been through `parse_materialization`.
+    """
+    return value.replace("'", "''")
+
+
+def _schema_filter(reference: TableRef) -> str:
+    """Constrain by schema only when the caller named one.
+
+    A materialization destination is always schema-qualified — the parser
+    refuses one that is not — so this is for sources and for direct callers.
+    """
+    if reference.schema is None:
+        return ""
+    return f"AND c.table_schema = '{_escaped(reference.schema)}'"
+
+
+def _quoted(identifier: str) -> str:
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _destination_output(handle: ExecutionHandle) -> tuple[OutputRef, ...]:
+    """A `postgres://schema/table` reference, when this run was a materialization.
+
+    Slashes rather than dots: `_materialized_output` matches the destination
+    against the URI with dots replaced by slashes, so a dotted name here would
+    not be recognised as the table that was asked for.
+    """
+    destination = handle.metadata.get(_DESTINATION_METADATA)
+    if not isinstance(destination, str):
+        return ()
+    operation = handle.metadata.get(_OPERATION_METADATA)
+    object_kind = "view" if isinstance(operation, str) and "VIEW" in operation.upper() else "table"
+    return (
+        OutputRef(
+            OutputKind.TABLE,
+            f"postgres://{destination.replace('.', '/')}",
+            metadata={"object_kind": object_kind},
+        ),
+    )
 
 
 def _failure(error: Exception) -> Failure:

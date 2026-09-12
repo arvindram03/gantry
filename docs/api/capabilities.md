@@ -45,10 +45,10 @@ python scripts/capability_matrix.py --write
 | `bytes_scanned` | no | no | yes | no | no |
 | `query_metrics` | yes | yes | yes | yes | yes |
 | `result_reference` | no | no | yes | yes | no |
-| `create_table_as` | no | yes | yes | no | writable conn |
-| `create_view_as` | no | yes | yes | no | writable conn |
-| `destination_introspection` | no | yes | yes | no | yes |
-| `materialization_reference` | no | yes | yes | no | writable conn |
+| `create_table_as` | yes | yes | yes | no | writable conn |
+| `create_view_as` | yes | yes | yes | no | writable conn |
+| `destination_introspection` | yes | yes | yes | no | yes |
+| `materialization_reference` | yes | yes | yes | no | writable conn |
 
 A cell reading *read-only conn* or *writable conn* is declared conditionally: the adapter has the capability only when the connection was opened that way. `gantry.sql.connect("duckdb", path=..., read_only=True)` is what makes DuckDB able to hold a read-only session, and a connection that was not opened read-only is refused rather than trusted.
 

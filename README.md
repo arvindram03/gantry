@@ -115,7 +115,7 @@ generated from the adapter source and lists which backend enforces what.
 
 | | What Gantry does there |
 | --- | --- |
-| **PostgreSQL**, Neon, Supabase | Governed queries, bounded inline results |
+| **PostgreSQL**, Neon, Supabase | Governed queries, bounded results, materialization |
 | **MySQL** | Governed queries and materialization, with an enforced timeout |
 | **DuckDB** | Governed queries, local materialization |
 | **Apache Flink** | Batch and streaming jobs, durable handles, cancellation |

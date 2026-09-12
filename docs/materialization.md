@@ -162,8 +162,16 @@ submission and engine failures, cancellation, and verification failure.
 | --- | --- | --- |
 | BigQuery | Tables and views | Durable, reconnectable job ID |
 | DuckDB | Tables and views | Process-local task |
-| PostgreSQL / Neon / Supabase | Not yet enabled | Fails closed |
+| MySQL | Tables and views | Local task, killed on timeout |
+| PostgreSQL / Neon / Supabase | Tables and views | Local task, transactional DDL |
 | Snowflake | Not yet enabled | Fails closed |
+
+PostgreSQL validates a `CREATE TABLE AS` with `EXPLAIN`, which does not execute
+it. `EXPLAIN CREATE VIEW` is a syntax error there, so a view is validated by
+running its definition in a transaction and rolling back — every name in it is
+resolved, and nothing is left behind. A statement that exceeds its timeout is
+cancelled by `statement_timeout` and the DDL rolls back with it, so a refused or
+timed-out materialization never leaves a half-built destination.
 
 Use native IAM, roles, dataset permissions, quotas, and network controls with Gantry policy. Static
 SQL inspection is an admission layer, not the sole security boundary.

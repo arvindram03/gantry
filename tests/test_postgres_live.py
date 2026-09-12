@@ -19,6 +19,7 @@ import os
 
 import gantry
 import pytest
+from gantry.result import ResultStatus
 
 from _live import require_live_or_skip
 
@@ -46,6 +47,26 @@ async def _reachable() -> bool:
         return False
     await connection.close()
     return True
+
+
+async def _raw_execute(*statements: str) -> None:
+    """Arrange and clean up with a connection Gantry knows nothing about.
+
+    Not through `db.query`: `DROP TABLE IF EXISTS x` classifies its table as
+    `IF` — the object regex reads the word after `TABLE` — so any allow-list
+    refuses it. That is the conservative classifier over-refusing, which is the
+    safe direction, but it makes the governed path the wrong tool for setting
+    up a test.
+    """
+    import importlib
+
+    asyncpg = importlib.import_module("asyncpg")
+    connection = await asyncpg.connect(URL, timeout=5)
+    try:
+        for statement in statements:
+            await connection.execute(statement)
+    finally:
+        await connection.close()
 
 
 @pytest.fixture
@@ -105,6 +126,110 @@ async def test_explain_runs_against_the_engine(db: gantry.sql.SQLConnection) -> 
     assert plan is not None
 
 
+async def test_materialize_creates_verifies_and_refuses_to_repeat(
+    db: gantry.sql.SQLConnection,
+) -> None:
+    """Materialization for PostgreSQL, which was "not yet enabled" until now.
+
+    Nothing about the engine prevented it — `CREATE TABLE AS` is explainable
+    and its DDL is transactional. The adapter simply never declared the
+    capabilities or implemented `inspect_table`, so every attempt was refused
+    with "adapter does not support CREATE TABLE AS".
+    """
+    import gantry.verify
+
+    schema = await db.describe()
+    if not any(table.schema == "analytics" for table in schema.tables):
+        pytest.skip("no analytics schema here; run examples/seed.sql first")
+
+    await _raw_execute("DROP TABLE IF EXISTS reporting.live_rollup")
+
+    build = db.materialize(
+        sources=["analytics.*"],
+        destinations=["reporting.*"],
+        verify=[gantry.verify.destination_exists(), gantry.verify.row_count(min=1)],
+    )
+    sql = (
+        "CREATE TABLE reporting.live_rollup AS "
+        "SELECT status, count(*) AS orders FROM analytics.orders GROUP BY status"
+    )
+
+    result = await build(sql)
+
+    assert result.status is ResultStatus.ACCEPTED, result.failure
+    assert result.uri == "postgres://reporting/live_rollup"
+    checks = {
+        check.name: check for check in (result.verification.checks if result.verification else ())
+    }
+    assert checks["destination_exists"].ok
+    # Reads `rows` from the table metadata, which is the key `RowCount` uses.
+    assert checks["row_count"].ok and isinstance(checks["row_count"].actual, int)
+
+    repeat = await build(sql)
+    assert repeat.status is ResultStatus.REJECTED
+    assert "already exists" in (repeat.failure.message if repeat.failure else "")
+
+    await _raw_execute("DROP TABLE IF EXISTS reporting.live_rollup")
+
+
+async def test_a_view_is_validated_by_dry_run_and_leaves_nothing_behind(
+    db: gantry.sql.SQLConnection,
+) -> None:
+    """`EXPLAIN CREATE VIEW` is a syntax error in PostgreSQL.
+
+    So a view is validated by running it in a transaction and rolling back,
+    which resolves every name in the definition. This asserts both halves: a
+    view over a missing table is refused at admission, and the refused
+    definition is not left behind by the dry run itself.
+    """
+    await _raw_execute("DROP VIEW IF EXISTS reporting.live_view")
+
+    build = db.materialize(sources=["analytics.*"], destinations=["reporting.*"])
+
+    refused = await build(
+        "CREATE VIEW reporting.live_view AS SELECT * FROM analytics.no_such_table"
+    )
+    assert refused.status is ResultStatus.REJECTED
+    assert "no_such_table" in (refused.failure.message if refused.failure else "")
+
+    absent = db.query(schemas=["information_schema"])
+    found = await absent(
+        "SELECT count(*) FROM information_schema.tables "
+        "WHERE table_schema = 'reporting' AND table_name = 'live_view'"
+    )
+    assert found.inline is not None
+    assert found.inline.rows[0][0] == 0, "the dry run left the view behind"
+
+    created = await build("CREATE VIEW reporting.live_view AS SELECT status FROM analytics.orders")
+    assert created.status is ResultStatus.ACCEPTED, created.failure
+    assert created.uri == "postgres://reporting/live_view"
+
+    await _raw_execute("DROP VIEW IF EXISTS reporting.live_view")
+
+
+async def test_inspect_table_reports_a_missing_destination_as_missing(
+    db: gantry.sql.SQLConnection,
+) -> None:
+    """Create-only rests on this telling absence from emptiness."""
+    from gantry.sql.adapters.postgres import PostgresAdapter
+    from gantry.sql.materialization import TableRef
+    from gantry.sql.target import SQLTarget
+
+    target = SQLTarget(PROVIDER, "postgres", "postgres", {"url": URL})
+    adapter = PostgresAdapter(target)
+
+    assert await adapter.inspect_table(TableRef("definitely_not_here", "reporting"), target) is None
+
+    orders = await adapter.inspect_table(
+        TableRef("orders", "analytics"), target, include_row_count=True
+    )
+    if orders is None:
+        pytest.skip("no analytics.orders here; run examples/seed.sql first")
+    assert orders.schema == "analytics"
+    assert orders.kind == "base table"
+    assert isinstance(orders.metadata["rows"], int)
+
+
 def test_the_transaction_pooler_rule_needs_no_database() -> None:
     """The statement-cache rule, checked without connecting to anything.
 
@@ -138,3 +263,113 @@ def test_the_transaction_pooler_rule_needs_no_database() -> None:
         "supabase", "postgresql://u:p@aws-0-us-west-2.pooler.supabase.com:6543/postgres", explicit
     )
     assert explicit == {"statement_cache_size": 100}, "an explicit setting must win"
+
+
+async def test_validating_a_create_table_as_does_not_execute_its_body(
+    db: gantry.sql.SQLConnection,
+) -> None:
+    """`EXPLAIN` for a CTAS, not a dry run — the difference is doing the work twice.
+
+    Validating a `CREATE TABLE AS` by running and rolling it back would produce
+    a correct answer and copy every row for nothing, silently doubling the cost
+    of every materialization. Nothing about the result distinguishes the two, so
+    this measures a side effect instead.
+
+    A sequence is the instrument: `nextval` is not rolled back in PostgreSQL, so
+    it still advances inside an aborted transaction, while `EXPLAIN` never calls
+    it at all. If the sequence moves, the body ran.
+    """
+    await _raw_execute(
+        "DROP TABLE IF EXISTS reporting.seq_probe",
+        "DROP SEQUENCE IF EXISTS reporting.validate_probe CASCADE",
+        "CREATE SEQUENCE reporting.validate_probe",
+        # Primed, because `last_value` on a never-called sequence reads 1 —
+        # the same as after one call — so an unprimed baseline cannot tell one
+        # execution from none.
+        "SELECT nextval('reporting.validate_probe')",
+    )
+    reader = db.query(schemas=["reporting"])
+
+    async def sequence_value() -> int:
+        result = await reader("SELECT last_value FROM reporting.validate_probe")
+        assert result.inline is not None, result.failure
+        value = result.inline.rows[0][0]
+        assert isinstance(value, int)
+        return value
+
+    before = await sequence_value()
+    build = db.materialize(sources=["reporting.*"], destinations=["reporting.*"])
+
+    await build(
+        "CREATE TABLE reporting.seq_probe AS SELECT nextval('reporting.validate_probe') AS n"
+    )
+
+    # The statement itself runs once, so the sequence advances once. Twice means
+    # validation executed the body as well.
+    assert await sequence_value() - before <= 1, (
+        "validation executed the CREATE TABLE AS body; it should be EXPLAINed"
+    )
+    await _raw_execute(
+        "DROP TABLE IF EXISTS reporting.seq_probe",
+        "DROP SEQUENCE IF EXISTS reporting.validate_probe CASCADE",
+    )
+
+
+def test_only_views_are_validated_by_dry_run() -> None:
+    """Which statements skip EXPLAIN, without needing a database.
+
+    Getting this wrong in the permissive direction means `EXPLAIN CREATE VIEW`
+    and a rejected materialization; getting it wrong in the other means
+    dry-running a `CREATE TABLE AS`, which copies every row twice.
+    """
+    from gantry.sql.adapters.postgres import _explainable
+
+    assert _explainable("CREATE TABLE reporting.x AS SELECT 1")
+    assert _explainable("SELECT 1")
+    assert _explainable("  select * from t")
+    assert not _explainable("CREATE VIEW reporting.v AS SELECT 1")
+    assert not _explainable("create or replace view v as select 1")
+    assert not _explainable("\n  CREATE RECURSIVE VIEW v(a) AS SELECT 1")
+    # A materialized view is explainable in PostgreSQL, unlike a plain one.
+    assert _explainable("CREATE MATERIALIZED VIEW m AS SELECT 1")
+
+
+def test_a_materialization_is_reported_as_a_reference_to_its_destination() -> None:
+    from gantry.output import OutputKind
+    from gantry.sql.adapters.postgres import _destination_output
+
+    handle = gantry.ExecutionHandle(
+        "run_1",
+        "sql",
+        "postgres",
+        "postgres_1",
+        metadata={
+            "gantry.sql.materialization.destination": "reporting.rollup",
+            "gantry.sql.materialization.operation": "CREATE_VIEW_AS",
+        },
+    )
+
+    outputs = _destination_output(handle)
+
+    assert len(outputs) == 1
+    assert outputs[0].kind is OutputKind.TABLE
+    # Slashes: `_materialized_output` matches the destination in that form.
+    assert outputs[0].uri == "postgres://reporting/rollup"
+    assert outputs[0].metadata["object_kind"] == "view"
+
+
+def test_an_ordinary_query_reports_no_destination() -> None:
+    from gantry.sql.adapters.postgres import _destination_output
+
+    assert _destination_output(gantry.ExecutionHandle("r", "sql", "postgres", "p")) == ()
+
+
+def test_metadata_lookups_quote_and_escape_what_they_interpolate() -> None:
+    from gantry.sql.adapters.postgres import _escaped, _quoted, _schema_filter
+    from gantry.sql.materialization import TableRef
+
+    assert _escaped("o'brien") == "o''brien"
+    assert _quoted('we"ird') == '"we""ird"'
+    assert _schema_filter(TableRef("t")) == ""
+    assert _schema_filter(TableRef("t", "analytics")) == "AND c.table_schema = 'analytics'"
+    assert _schema_filter(TableRef("t", "an'alytics")) == "AND c.table_schema = 'an''alytics'"

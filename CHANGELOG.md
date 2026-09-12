@@ -7,6 +7,18 @@ Notable changes. Dates are release dates; the format follows
 
 ### Added
 
+- **Materialization for PostgreSQL, Neon and Supabase.** `db.materialize(...)`
+  was refused on those providers with "adapter does not support CREATE TABLE
+  AS" — not because PostgreSQL lacked anything, but because the adapter never
+  declared the capabilities or implemented `inspect_table`. It does both now,
+  for tables and views.
+
+  `CREATE TABLE AS` is validated with `EXPLAIN`, which does not execute it.
+  `EXPLAIN CREATE VIEW` is a syntax error, so a view is validated by running
+  its definition in a transaction and rolling back — every name resolves, and
+  nothing is left behind. PostgreSQL's `statement_timeout` already covers
+  writes, unlike MySQL's, and its DDL is transactional, so a timed-out
+  materialization leaves no half-built destination.
 - **MySQL as a SQL provider** (#13): `gantry.sql.connect("mysql", url=...)`, with
   `query` and `materialize` behind the same contract as every other provider.
   `pip install "data-gantry[mysql]"`.
