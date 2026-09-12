@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+from collections.abc import Mapping
 
 import gantry
 import pytest
@@ -131,7 +132,7 @@ async def test_a_lookup_referencing_a_disallowed_collection_is_rejected(
     db: gantry.nosql.NoSQLConnection,
 ) -> None:
     query = db.query(read_only=True, collections=["orders"], timeout=15)
-    pipeline = [
+    pipeline: list[Mapping[str, object]] = [
         {"$match": {}},
         {
             "$lookup": {
@@ -164,7 +165,7 @@ async def test_materialize_rejects_a_source_outside_the_allowed_sources(
     db: gantry.nosql.NoSQLConnection,
 ) -> None:
     materialize = db.materialize(sources=["orders"], destinations=["reporting.rollup"])
-    pipeline = [
+    pipeline: list[Mapping[str, object]] = [
         {"$match": {"status": "open"}},
         {
             "$lookup": {
@@ -187,7 +188,9 @@ async def test_materialize_rejects_a_destination_outside_the_allowed_destination
     db: gantry.nosql.NoSQLConnection,
 ) -> None:
     materialize = db.materialize(sources=["orders"], destinations=["reporting.rollup"])
-    result = await materialize("orders", [{"$match": {"status": "open"}}, {"$out": "scratch.other"}])
+    result = await materialize(
+        "orders", [{"$match": {"status": "open"}}, {"$out": "scratch.other"}]
+    )
 
     assert result.status.value == "REJECTED"
     assert result.failure is not None
@@ -198,7 +201,10 @@ async def test_materialize_out_refuses_to_overwrite_an_existing_destination(
     db: gantry.nosql.NoSQLConnection,
 ) -> None:
     materialize = db.materialize(sources=["orders"], destinations=["reporting.rollup"])
-    pipeline = [{"$match": {"status": "open"}}, {"$out": "reporting.rollup"}]
+    pipeline: list[Mapping[str, object]] = [
+        {"$match": {"status": "open"}},
+        {"$out": "reporting.rollup"},
+    ]
 
     first = await materialize("orders", pipeline)
     assert first.ok
@@ -213,7 +219,7 @@ async def test_merge_with_a_disallowed_when_matched_is_rejected(
     db: gantry.nosql.NoSQLConnection,
 ) -> None:
     materialize = db.materialize(sources=["orders"], destinations=["reporting.rollup"])
-    pipeline = [
+    pipeline: list[Mapping[str, object]] = [
         {"$match": {"status": "open"}},
         {"$merge": {"into": "reporting.rollup", "whenMatched": "keepExisting"}},
     ]
@@ -239,7 +245,7 @@ async def test_merge_with_an_allowed_when_matched_writes_into_an_existing_destin
         destinations=["reporting.rollup"],
         verify=[gantry.nosql.destination_exists(), gantry.nosql.document_count(min=1)],
     )
-    pipeline = [
+    pipeline: list[Mapping[str, object]] = [
         {"$match": {"status": "open"}},
         {"$group": {"_id": "$region", "total": {"$sum": "$amount"}}},
         {"$merge": {"into": "reporting.rollup", "whenMatched": "replace"}},
@@ -258,7 +264,7 @@ async def test_document_count_verification_fails_outside_the_configured_range(
         destinations=["reporting.rollup"],
         verify=[gantry.nosql.document_count(min=5)],
     )
-    pipeline = [
+    pipeline: list[Mapping[str, object]] = [
         {"$match": {"status": "open"}},
         {"$group": {"_id": "$region", "total": {"$sum": "$amount"}}},
         {"$out": "reporting.rollup"},
@@ -278,7 +284,7 @@ async def test_required_fields_verification_fails_when_a_field_is_missing(
         destinations=["reporting.rollup"],
         verify=[gantry.nosql.required_fields(["total", "nonexistent_field"])],
     )
-    pipeline = [
+    pipeline: list[Mapping[str, object]] = [
         {"$match": {"status": "open"}},
         {"$group": {"_id": "$region", "total": {"$sum": "$amount"}}},
         {"$out": "reporting.rollup"},
