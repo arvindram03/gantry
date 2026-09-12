@@ -20,6 +20,7 @@ gateway up, so an unreachable one fails loudly instead of skipping.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -269,13 +270,19 @@ async def test_running_job_metrics_reach_the_health_checks(
     )
     if result.execution is None or result.execution.status != "RUNNING":
         pytest.skip("the job finished before it could be observed running")
-    if not result.native["metrics"].native.get("job"):
-        # Flink registers job metrics a moment after the job reaches RUNNING,
-        # so the earliest observation can legitimately have none. Skipping is
-        # honest here; asserting would make this fail about one run in three
-        # for a reason that is not the one under test.
-        pytest.skip("Flink had not registered job metrics yet")
-    assert result.native["metrics"].restart_count is not None, (
-        "a running job must report a restart count; None means the health "
-        "checks are reading metrics from the wrong object"
+    assert result.handle is not None
+    # Flink serves job metrics from the JobManager's fetcher cache, which only
+    # fills while the job is alive. A short job can finish between fetches and
+    # then report nothing for the rest of its life, so this polls for the raw
+    # metrics and skips only when Flink itself never produced any.
+    deadline = time.monotonic() + 30
+    health = await job.health(result.handle)
+    while not health.metrics.native.get("job") and time.monotonic() < deadline:
+        await asyncio.sleep(1.0)
+        health = await job.health(result.handle)
+    if not health.metrics.native.get("job"):
+        pytest.skip("Flink never registered job metrics for this job")
+    assert health.metrics.restart_count is not None, (
+        "a running job must report a restart count; Flink served the metrics "
+        "and None here means the health path is reading the wrong object"
     )

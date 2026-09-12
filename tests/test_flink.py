@@ -341,9 +341,13 @@ async def test_stream_accepts_a_healthy_running_job_and_returns_stream_uri() -> 
     assert result.handle is not None
     assert result.handle.metadata["mode"] == "stream"
     assert result.execution is not None and result.execution.status == "RUNNING"
-    assert result.health is not None and result.health.healthy
-    assert result.native["metrics"].records_in == 19
-    assert result.native["metrics"].records_out == 17
+    assert result.status.accepted
+    # The counters the health checks read must also reach the durable record,
+    # or a run read back later cannot show what the decision rested on.
+    assert result.execution.metrics["records_in"] == 19
+    assert result.execution.metrics["records_out"] == 17
+    assert result.execution.metrics["restart_count"] == 1
+    assert "watermark_lag_seconds" in result.execution.metrics
     assert result.uri == "kafka://clean"
     assert "secret-token" not in repr(result.handle)
     assert transport.calls[0].headers["Authorization"] == "Bearer secret-token"

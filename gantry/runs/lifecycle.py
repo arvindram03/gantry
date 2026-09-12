@@ -146,7 +146,7 @@ class RunRecorder:
         outputs: Sequence[ResourceRef] = (),
         result_ref: QueryResultRef | None = None,
         inline: object | None = None,
-        native: Mapping[str, object] | None = None,
+        metrics: Mapping[str, object] | None = None,
     ) -> Run:
         """The final transition, and the only one that can say ACCEPTED."""
         return self._save(
@@ -156,8 +156,10 @@ class RunRecorder:
             outputs=tuple(outputs),
             result_ref=result_ref,
             inline=inline,
-            native=dict(native or {}),
-            execution=self.run.execution or self._finished("SUCCEEDED"),
+            execution=replace(
+                self.run.execution or self._finished("SUCCEEDED"),
+                metrics=dict(metrics or (self.run.execution.metrics if self.run.execution else {})),
+            ),
         )
 
     def _finished(self, status: str) -> ExecutionRecord:
@@ -210,7 +212,7 @@ def run_from_evidence(
     handle: ExecutionHandle | None = None,
     inline: object | None = None,
     result_ref: QueryResultRef | None = None,
-    native: Mapping[str, object] | None = None,
+    metrics: Mapping[str, object] | None = None,
     failure: Failure | None = None,
 ) -> Run | None:
     """Record a terminal run for an operation that reports once, at the end.
@@ -260,7 +262,7 @@ def run_from_evidence(
         outputs=tuple(ResourceRef(system=engine, resource=name) for name in evidence.outputs),
         inline=inline,
         result_ref=result_ref,
-        native=dict(native or {}),
+        metrics=dict(metrics or {}),
     )
 
 

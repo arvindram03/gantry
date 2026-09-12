@@ -21,7 +21,6 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from hashlib import sha256
-from typing import Any
 
 from gantry.actor import ActorRef
 from gantry.evidence import EvidenceBundle, _plain
@@ -230,15 +229,6 @@ class Run:
     rather than wrong when the operation produced nothing.
     """
 
-    native: Mapping[str, Any] = field(default_factory=dict, compare=False, repr=False)
-    """Provider-shaped observations that have no place in the common model.
-
-    One generic field rather than a field per engine: `Run` is not meant to
-    become the union of everything any provider returns, so Flink's
-    `StreamingHealth` lives here under `native["health"]` instead of on the
-    model. What matters for a decision — the checks it produced — is already in
-    `verification`.
-    """
     failure: Failure | None = field(default=None, compare=False, repr=False)
     handle: ExecutionHandle | None = field(default=None, compare=False, repr=False)
     """The engine handle, for callers that submit and wait separately.
@@ -283,17 +273,6 @@ class Run:
     def documents(self) -> tuple[object, ...]:
         """A document query's results, when it returned any."""
         return tuple(getattr(self.inline, "documents", ()) or ())
-
-    @property
-    def health(self) -> Any:
-        """A streaming job's health, for engines that report one.
-
-        Typed `Any` deliberately. What comes back is the provider's own shape —
-        Flink returns a `StreamingHealth` — and the core model does not know
-        those types by design. Pretending otherwise would push a `cast` into
-        every caller that reads it.
-        """
-        return self.native.get("health")
 
     @property
     def uri(self) -> str | None:

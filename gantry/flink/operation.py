@@ -232,9 +232,9 @@ class FlinkJob:
     ) -> Run:
         """Run the job, and record it.
 
-        Returns the `Run`, as the SQL paths do. A streaming job's health and
-        the Flink metrics travel on `run.native`; the checks they produced are
-        in `run.verification` like any other.
+        Returns the `Run`, as the SQL paths do. The job's counters travel on
+        `run.execution.metrics`, and the checks they produced are in
+        `run.verification`, like any other operation's.
         """
         recorder = RunRecorder(
             kind=OperationKind.STREAM if self._kind is FlinkJobKind.STREAM else OperationKind.BATCH,
@@ -549,13 +549,28 @@ def _refuse(recorder: RunRecorder, error: Exception, status: RunStatus) -> Run:
     )
 
 
-def _recorded(result: FlinkResult, *, recorder: RunRecorder | None = None) -> Run:
-    """Record the run for a Flink job and return it.
+def _stream_metrics(result: FlinkResult) -> dict[str, object]:
+    """Flink's numbers as bounded scalars on the execution record.
 
-    The job's own shape — `StreamingHealth`, the Flink metrics — goes into
-    `run.native`, which is one generic field rather than a per-engine one. What
-    the decision rested on is already in `verification`.
+    `StreamingHealth` has nothing of its own to carry here: its `execution` and
+    `verification` are already fields of the run, and `healthy` is what the
+    run's status says. Only the counters are left, and they are ordinary
+    streaming quantities rather than Flink-shaped ones, so they travel as
+    metrics — which, unlike a live-only blob, survive the store.
     """
+    metrics = result.metrics
+    values: dict[str, object] = {
+        "records_in": metrics.records_in,
+        "records_out": metrics.records_out,
+        "runtime_seconds": metrics.runtime_seconds,
+        "restart_count": metrics.restart_count,
+        "watermark_lag_seconds": metrics.watermark_lag_seconds,
+    }
+    return {key: value for key, value in values.items() if value is not None}
+
+
+def _recorded(result: FlinkResult, *, recorder: RunRecorder | None = None) -> Run:
+    """Record the run for a Flink job and return it."""
     from gantry.runs.lifecycle import run_from_evidence
     from gantry.runs.model import OperationKind
 
@@ -579,7 +594,7 @@ def _recorded(result: FlinkResult, *, recorder: RunRecorder | None = None) -> Ru
             outputs=tuple(
                 ResourceRef(system="flink", resource=output.uri) for output in result.outputs
             ),
-            native={"health": result.health, "metrics": result.metrics},
+            metrics=_stream_metrics(result),
         ).with_failure(result.failure)
     run = run_from_evidence(
         result.evidence,
@@ -589,7 +604,7 @@ def _recorded(result: FlinkResult, *, recorder: RunRecorder | None = None) -> Ru
         status=result.status,
         verification=result.verification,
         handle=result.handle,
-        native={"health": result.health, "metrics": result.metrics},
+        metrics=_stream_metrics(result),
         failure=result.failure,
     )
     if run is None:
