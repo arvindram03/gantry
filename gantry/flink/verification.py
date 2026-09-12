@@ -36,7 +36,7 @@ class JobRunning:
         del metrics
         ok = execution.state is ExecutionState.RUNNING
         return CheckResult(
-            "job_running",
+            "running",
             ok,
             ExecutionState.RUNNING.value,
             execution.state.value,
@@ -59,7 +59,7 @@ class MaxRestartCount:
         actual = metrics.restart_count
         ok = actual is not None and actual <= self.maximum
         return CheckResult(
-            "max_restarts",
+            "restart_count",
             ok,
             f"<= {self.maximum}",
             actual,
@@ -83,7 +83,7 @@ class MaxWatermarkLag:
         maximum = float(self.seconds)
         ok = actual is not None and actual <= maximum
         return CheckResult(
-            "max_watermark_lag",
+            "watermark_lag",
             ok,
             f"<= {maximum}s",
             actual,

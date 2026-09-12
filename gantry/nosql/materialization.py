@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import json
 from collections.abc import Collection, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from fnmatch import fnmatchcase
+from hashlib import sha256
 from typing import NoReturn, Protocol, runtime_checkable
 
 from gantry.context import Context
+from gantry.evidence import EvidenceBundle, Observation, ObservationSource
 from gantry.failure import Failure, FailureKind
 from gantry.handle import ExecutionHandle
 from gantry.metrics import ExecutionMetrics
@@ -20,7 +23,19 @@ from gantry.output import OutputKind, OutputRef
 from gantry.result import ResultStatus
 from gantry.runtime import SubmissionError
 from gantry.tool import Tool
-from gantry.verifier import VerificationResult
+from gantry.verifier import CheckResult, CheckSource, VerificationResult
+from gantry.verify import (
+    VerificationConflict,
+    VerificationInputError,
+    VerificationUnsupported,
+    check_config,
+    check_type,
+    detect_conflicts,
+    parse_agent_checks,
+    sourced_result,
+    validate_agent_checks,
+    verification_schema,
+)
 
 _PLAN_METADATA = "gantry.nosql.materialization.plan"
 _DESTINATION_METADATA = "gantry.nosql.materialization.destination"
@@ -110,6 +125,7 @@ class MaterializationResult:
     metrics: ExecutionMetrics = field(default_factory=ExecutionMetrics)
     verification: VerificationResult | None = None
     failure: Failure | None = None
+    evidence: EvidenceBundle | None = None
 
     @property
     def ok(self) -> bool:
@@ -159,11 +175,16 @@ class _MaterializerConnection(Protocol):
 class NoSQLMaterializer:
     name = "materialize_nosql"
     description = "Create a governed derived collection from approved MongoDB sources."
+    _agent_capabilities = frozenset(
+        {"destination_exists", "not_empty", "document_count", "required_fields"}
+    )
 
     _connection: _MaterializerConnection
     _policy: MaterializationPolicy
     _verify: Sequence[DocumentCheck]
     _plans: dict[str, MaterializationPlan] = field(default_factory=dict, init=False)
+    _agent_checks: dict[str, tuple[DocumentCheck, ...]] = field(default_factory=dict, init=False)
+    _proposal_hashes: dict[str, str] = field(default_factory=dict, init=False)
 
     def __init__(
         self,
@@ -178,6 +199,8 @@ class NoSQLMaterializer:
         self._policy = policy
         self._verify = tuple(verify)
         self._plans = {}
+        self._agent_checks = {}
+        self._proposal_hashes = {}
 
     @property
     def input_schema(self) -> Mapping[str, object]:
@@ -186,6 +209,7 @@ class NoSQLMaterializer:
             "properties": {
                 "collection": {"type": "string"},
                 "pipeline": {"type": ["object", "array"]},
+                "verify": verification_schema(self._agent_capabilities),
             },
             "required": ["collection", "pipeline"],
             "additionalProperties": False,
@@ -233,7 +257,15 @@ class NoSQLMaterializer:
         )
         return MaterializationPlan(operation, collection, sources, classification.write_destination)
 
-    async def submit(self, collection: str, pipeline: Pipeline) -> ExecutionHandle:
+    async def submit(
+        self,
+        collection: str,
+        pipeline: Pipeline,
+        *,
+        verify: Sequence[DocumentCheck] = (),
+    ) -> ExecutionHandle:
+        agent_checks = validate_agent_checks(verify, capabilities=self._agent_capabilities)
+        detect_conflicts(self._verify, agent_checks)
         try:
             plan = self.inspect(collection, pipeline)
             await self._admit(plan)
@@ -251,7 +283,18 @@ class NoSQLMaterializer:
                 _normalize_submission_failure(failure),
                 error.result.status,
             ) from error
+        digest = sha256(json.dumps(pipeline, sort_keys=True, default=str).encode()).hexdigest()
+        handle = replace(
+            handle,
+            metadata={
+                **handle.metadata,
+                "gantry.proposal_hash": digest,
+                "gantry.agent_verification": [check_config(check) for check in agent_checks],
+            },
+        )
         self._plans[handle.gantry_id] = plan
+        self._proposal_hashes[handle.gantry_id] = digest
+        self._agent_checks[handle.gantry_id] = agent_checks  # type: ignore[assignment]
         return handle
 
     async def wait(
@@ -261,25 +304,78 @@ class NoSQLMaterializer:
         nosql_result = await self._connection.wait(
             handle, poll_interval_seconds=poll_interval_seconds
         )
+        agent_checks = self._agent_checks_for(handle)
         if nosql_result.status is not ResultStatus.ACCEPTED or plan is None:
-            return MaterializationResult(
+            result = MaterializationResult(
                 nosql_result.status,
                 handle=nosql_result.handle,
                 outputs=nosql_result.outputs,
                 metrics=nosql_result.metrics,
                 verification=nosql_result.verification,
                 failure=nosql_result.failure,
+                evidence=(
+                    None
+                    if plan is None
+                    else _evidence(
+                        plan,
+                        handle,
+                        nosql_result.outputs,
+                        nosql_result.metrics,
+                        nosql_result.verification,
+                        nosql_result.status,
+                        self._proposal_hash(handle),
+                        agent_checks,
+                    )
+                ),
             )
-        verification = await self._verification(plan.destination)
-        status = ResultStatus.ACCEPTED if verification.ok else ResultStatus.VERIFICATION_FAILED
+            return _recorded(result)
+        verification = await self._verification(plan.destination, agent_checks)
+        unsupported = verification.unsupported_checks
+        agent_unsupported = any(check.source == CheckSource.AGENT for check in unsupported)
+        status = (
+            ResultStatus.ACCEPTED
+            if verification.ok
+            else ResultStatus.VERIFICATION_UNSUPPORTED
+            if agent_unsupported
+            else ResultStatus.VERIFICATION_FAILED
+        )
         output = _materialized_output(nosql_result.outputs, plan.destination)
-        return MaterializationResult(
+        reasons = unsupported or verification.failed_checks
+        failure = None
+        if not verification.ok:
+            message = next(
+                (check.message for check in reasons if check.message),
+                "MongoDB materialization verification failed",
+            )
+            failure = Failure(
+                FailureKind.VERIFICATION_UNSUPPORTED
+                if agent_unsupported
+                else FailureKind.UNSUPPORTED_VERIFICATION
+                if unsupported
+                else FailureKind.VERIFICATION_FAILED,
+                False,
+                message,
+            )
+        outputs = (output,) if output is not None else nosql_result.outputs
+        result = MaterializationResult(
             status,
             handle=nosql_result.handle,
-            outputs=(output,) if output is not None else nosql_result.outputs,
+            outputs=outputs,
             metrics=nosql_result.metrics,
             verification=verification,
+            failure=failure,
+            evidence=_evidence(
+                plan,
+                handle,
+                outputs,
+                nosql_result.metrics,
+                verification,
+                status,
+                self._proposal_hash(handle),
+                agent_checks,
+            ),
         )
+        return _recorded(result)
 
     async def status(self, handle: ExecutionHandle) -> object:
         return await self._connection.status(handle)
@@ -287,9 +383,30 @@ class NoSQLMaterializer:
     async def cancel(self, handle: ExecutionHandle, *, mode: str = "default") -> object:
         return await self._connection.cancel(handle, mode=mode)
 
-    async def __call__(self, collection: str, pipeline: Pipeline) -> MaterializationResult:
+    async def __call__(
+        self,
+        collection: str,
+        pipeline: Pipeline,
+        *,
+        verify: Sequence[DocumentCheck] = (),
+    ) -> MaterializationResult:
         try:
-            handle = await self.submit(collection, pipeline)
+            handle = await self.submit(collection, pipeline, verify=verify)
+        except VerificationUnsupported as error:
+            return _failed(
+                ResultStatus.VERIFICATION_UNSUPPORTED,
+                Failure(FailureKind.VERIFICATION_UNSUPPORTED, False, str(error)),
+            )
+        except VerificationConflict as error:
+            return _failed(
+                ResultStatus.VERIFICATION_CONFLICT,
+                Failure(FailureKind.VERIFICATION_CONFLICT, False, str(error)),
+            )
+        except VerificationInputError as error:
+            return _failed(
+                ResultStatus.REJECTED,
+                Failure(FailureKind.VALIDATION_ERROR, False, str(error)),
+            )
         except MaterializationError as error:
             return _failed(error.status, error.failure)
         except (TypeError, ValueError) as error:
@@ -299,7 +416,7 @@ class NoSQLMaterializer:
         return await self.wait(handle, poll_interval_seconds=0.05)
 
     async def _invoke_tool(self, arguments: Mapping[str, object]) -> MaterializationResult:
-        unexpected = set(arguments) - {"collection", "pipeline"}
+        unexpected = set(arguments) - {"collection", "pipeline", "verify"}
         if unexpected:
             names = ", ".join(sorted(unexpected))
             raise ValueError(f"unexpected materialize tool arguments: {names}")
@@ -311,7 +428,21 @@ class NoSQLMaterializer:
             isinstance(pipeline, (Mapping, Sequence)) and not isinstance(pipeline, (str, bytes))
         ):
             raise TypeError("pipeline must be a mapping or a sequence of stage mappings")
-        return await self(collection, pipeline)
+        try:
+            checks = parse_agent_checks(
+                arguments.get("verify"), capabilities=self._agent_capabilities
+            )
+        except VerificationUnsupported as error:
+            return _failed(
+                ResultStatus.VERIFICATION_UNSUPPORTED,
+                Failure(FailureKind.VERIFICATION_UNSUPPORTED, False, str(error)),
+            )
+        except VerificationInputError as error:
+            return _failed(
+                ResultStatus.REJECTED,
+                Failure(FailureKind.VALIDATION_ERROR, False, str(error)),
+            )
+        return await self(collection, pipeline, verify=checks)  # type: ignore[arg-type]
 
     async def _admit(self, plan: MaterializationPlan) -> None:
         capabilities = self._connection.capabilities()
@@ -379,15 +510,82 @@ class NoSQLMaterializer:
                     f"destination already exists: {plan.destination.name}",
                 )
 
-    async def _verification(self, destination: CollectionRef) -> VerificationResult:
+    async def _verification(
+        self,
+        destination: CollectionRef,
+        agent_checks: Sequence[DocumentCheck] = (),
+    ) -> VerificationResult:
+        effective = (*self._verify, *agent_checks)
         include_document_count = any(
-            getattr(check, "requires_document_count", False) for check in self._verify
+            getattr(check, "requires_document_count", False) for check in effective
         )
-        snapshot = await self._connection._inspect_collection(
-            destination, include_document_count=include_document_count
+        try:
+            snapshot = await self._connection._inspect_collection(
+                destination, include_document_count=include_document_count
+            )
+        except Exception as error:
+            message = f"destination inspection raised {type(error).__name__}: {error}"
+            effective_results: tuple[CheckResult, ...]
+            if not effective:
+                effective_results = (
+                    sourced_result(
+                        CheckResult(
+                            "destination_introspection",
+                            False,
+                            message=message,
+                            supported=False,
+                        ),
+                        CheckSource.TRUSTED,
+                        observation_source="destination",
+                    ),
+                )
+            else:
+                effective_results = tuple(
+                    sourced_result(
+                        CheckResult(
+                            check_type(check) or type(check).__name__,
+                            False,
+                            message=message,
+                            supported=False,
+                        ),
+                        CheckSource.TRUSTED if index < len(self._verify) else CheckSource.AGENT,
+                        observation_source="destination",
+                    )
+                    for index, check in enumerate(effective)
+                )
+            return VerificationResult(ok=False, checks=effective_results)
+        results: list[CheckResult] = []
+        for index, check in enumerate(effective):
+            source = CheckSource.TRUSTED if index < len(self._verify) else CheckSource.AGENT
+            try:
+                result = check.evaluate(snapshot)
+            except Exception as error:
+                result = CheckResult(
+                    check_type(check) or type(check).__name__,
+                    False,
+                    message=f"verification raised {type(error).__name__}: {error}",
+                )
+            results.append(sourced_result(result, source, observation_source="destination"))
+        return VerificationResult(ok=all(check.ok for check in results), checks=tuple(results))
+
+    def _agent_checks_for(self, handle: ExecutionHandle) -> tuple[DocumentCheck, ...]:
+        local = self._agent_checks.get(handle.gantry_id)
+        if local is not None:
+            return local
+        try:
+            checks = parse_agent_checks(
+                handle.metadata.get("gantry.agent_verification"),
+                capabilities=self._agent_capabilities,
+            )
+        except VerificationInputError:
+            return ()
+        return checks  # type: ignore[return-value]
+
+    def _proposal_hash(self, handle: ExecutionHandle) -> str | None:
+        stored = handle.metadata.get("gantry.proposal_hash")
+        return self._proposal_hashes.get(handle.gantry_id) or (
+            stored if isinstance(stored, str) else None
         )
-        checks = tuple(check.evaluate(snapshot) for check in self._verify)
-        return VerificationResult(ok=all(check.ok for check in checks), checks=checks)
 
     def _nosql_policy(self) -> NoSQLPolicy:
         return NoSQLPolicy(
@@ -429,6 +627,55 @@ def _normalize_submission_failure(failure: Failure) -> Failure:
     if "bytes scanned" in lowered or "cost" in lowered:
         return Failure(FailureKind.COST_LIMIT_EXCEEDED, failure.retryable, failure.message)
     return failure
+
+
+def _evidence(
+    plan: MaterializationPlan,
+    handle: ExecutionHandle,
+    outputs: Sequence[OutputRef],
+    metrics: ExecutionMetrics,
+    verification: VerificationResult | None,
+    decision: ResultStatus,
+    proposal_hash: str | None,
+    agent_checks: Sequence[DocumentCheck],
+) -> EvidenceBundle:
+    observations: list[Observation] = []
+    for name, value, unit in (
+        ("rows_read", metrics.rows_read, "documents"),
+        ("rows_written", metrics.rows_written, "documents"),
+        ("bytes_read", metrics.bytes_read, "bytes"),
+        ("runtime_seconds", metrics.runtime_seconds, "seconds"),
+    ):
+        if value is not None:
+            observations.append(Observation(name, value, ObservationSource.ENGINE, unit=unit))
+    for check in verification.checks if verification is not None else ():
+        if check.actual is not None:
+            observations.append(Observation(check.name, check.actual, ObservationSource.OUTPUT))
+    return EvidenceBundle(
+        run_id=handle.gantry_id,
+        engine=handle.engine,
+        operation=plan.operation.value,
+        decision=decision.value,
+        native_execution_id=handle.native_id,
+        proposal_hash=proposal_hash,
+        inputs=tuple(source.name for source in plan.sources),
+        outputs=tuple(output.uri for output in outputs),
+        started_at=handle.submitted_at,
+        execution={"status": decision.value, "engine": handle.engine},
+        proposal={
+            "hash": proposal_hash,
+            "agent_verification": [check_config(check) for check in agent_checks],
+        },
+        observations=tuple(observations),
+        checks=() if verification is None else verification.checks,
+    )
+
+
+def _recorded(result: MaterializationResult) -> MaterializationResult:
+    from gantry.runs import record
+
+    record(result.evidence)
+    return result
 
 
 def _failed(status: ResultStatus, failure: Failure) -> MaterializationResult:

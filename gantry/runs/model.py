@@ -61,9 +61,17 @@ def render(evidence: EvidenceBundle) -> str:
     if evidence.duration_ms is not None:
         lines.append(f"  runtime: {evidence.duration_ms / 1000:.1f}s")
 
-    if evidence.checks:
-        lines.extend(["", "Verification"])
-        for check in evidence.checks:
+    groups = (
+        ("Trusted verification", evidence.trusted_checks),
+        ("Agent-proposed verification", evidence.agent_checks),
+    )
+    grouped = {id(check) for _, checks in groups for check in checks}
+    legacy = tuple(check for check in evidence.checks if id(check) not in grouped)
+    for label, checks in (*groups, ("Verification", legacy)):
+        if not checks:
+            continue
+        lines.extend(["", label])
+        for check in checks:
             mark = "✓" if check.ok else ("?" if not check.supported else "✗")
             lines.append(f"  {mark} {check.name}")
             if check.expected is not None:

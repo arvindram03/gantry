@@ -106,7 +106,7 @@ async def main() -> int:
     materialize = db.materialize(
         sources=("analytics.customers", "analytics.orders"),
         destinations=("feature_store.customer_features",),
-        verify=checks,
+        checks=checks,
     )
     good = await materialize(FEATURES)
     print(f"1. features, built with a LEFT JOIN -> {good.status.value}")
@@ -118,7 +118,7 @@ async def main() -> int:
     strict = db.materialize(
         sources=("analytics.customers", "analytics.orders"),
         destinations=("feature_store.customer_features_v2",),
-        verify=checks,
+        checks=checks,
     )
     thin = await strict(FEATURES_INNER_JOIN)
     print(f"\n2. the same features, built with an inner join -> {thin.status.value}")

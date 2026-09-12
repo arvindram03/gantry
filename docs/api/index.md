@@ -18,8 +18,9 @@ here is the real one — the package is checked with `mypy --strict` and ships a
 ## The shape of every operation
 
 Configuration and enforcement are separated on purpose. Application code holds
-the credential and decides the policy; the agent receives a tool whose only
-input is the SQL.
+the credential and decides policy and trusted checks; the agent receives a
+tool whose inputs are the SQL and an optional allowlisted verification
+commitment.
 
 ```python
 import gantry
@@ -29,5 +30,7 @@ query = db.query(read_only=True, schemas=("analytics",))  # application code
 tool = query.tool()  # what the agent gets
 ```
 
-`tool.input_schema` contains `sql` and nothing else. A policy is not something
-a model can widen, because it is not an argument a model can pass.
+`tool.input_schema` contains `sql` and `verify`. The latter exposes only
+declarative checks supported by that operation/provider. Policy and trusted
+checks are not arguments a model can pass, so the model cannot widen authority
+or weaken the application acceptance contract.

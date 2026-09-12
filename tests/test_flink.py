@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Any, cast
 
 import gantry
 import pytest
@@ -392,7 +393,14 @@ async def test_tool_exposes_only_sql_and_uses_the_same_governed_job() -> None:
 
     assert result.ok
     assert tool.name == "flink_stream_job"
-    assert tool.input_schema["properties"] == {"sql": {"type": "string"}}
+    schema = cast(dict[str, Any], tool.input_schema)
+    assert set(schema["properties"]) == {"sql", "verify"}
+    variants = schema["properties"]["verify"]["items"]["oneOf"]
+    assert {item["properties"]["type"]["const"] for item in variants} == {
+        "restart_count",
+        "running",
+        "watermark_lag",
+    }
     assert "password" not in repr(tool)
     assert "inputs" not in repr(tool.input_schema)
     with pytest.raises(ValueError, match="unexpected"):

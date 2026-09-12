@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import duckdb
 import gantry
@@ -270,11 +270,15 @@ async def test_materialization_tool_exposes_only_native_sql(tmp_path: Path) -> N
     result = await tool.invoke(sql=_sql("agent_scratch.from_tool"))
 
     assert tool.name == "materialize_sql"
-    assert tool.input_schema == {
-        "type": "object",
-        "properties": {"sql": {"type": "string"}},
-        "required": ["sql"],
-        "additionalProperties": False,
+    schema = cast(dict[str, Any], tool.input_schema)
+    assert schema["required"] == ["sql"]
+    assert set(schema["properties"]) == {"sql", "verify"}
+    variants = schema["properties"]["verify"]["items"]["oneOf"]
+    assert {item["properties"]["type"]["const"] for item in variants} == {
+        "destination_exists",
+        "not_empty",
+        "required_columns",
+        "row_count",
     }
     assert result.ok
     with pytest.raises(ValueError, match="unexpected materialization tool arguments"):

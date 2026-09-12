@@ -40,12 +40,16 @@ Or expose its narrow framework-neutral form to an agent:
 tool = query.tool()
 
 tool.name  # "query_sql"
-tool.input_schema  # only {"sql": "..."}
-result = await tool.invoke(sql="SELECT COUNT(*) FROM analytics.payments")
+tool.input_schema  # SQL plus supported declarative verification
+result = await tool.invoke(
+    sql="SELECT COUNT(*) FROM analytics.payments",
+    verify=[{"type": "not_empty"}],
+)
 ```
 
 `db.describe()` and `db.explain(sql)` remain direct application operations. Query policy never
-appears in the agent tool schema.
+appears in the agent tool schema. Agent verification is additive and cannot
+change that policy or remove trusted checks.
 
 ## Worked examples
 

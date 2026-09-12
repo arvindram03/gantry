@@ -149,11 +149,12 @@ tool = query.tool()
 
 tool.name  # "query_sql"
 tool.description
-tool.input_schema  # only {"sql": "..."}
+tool.input_schema  # SQL plus allowlisted agent verification
 ```
 
-`query.tool()` requires `read_only=True`. Expose agent writes through a separately scoped
-`db.materialize(...)` operation.
+Policy and trusted checks are still absent from that schema. `query.tool()` requires
+`read_only=True`. Expose agent writes through a separately scoped `db.materialize(...)`
+operation.
 
 Keep schema discovery and explanation in trusted application code through `db.describe()` and
 `db.explain(sql)` unless a separate integration deliberately exposes them.

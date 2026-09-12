@@ -22,7 +22,7 @@ from typing import Protocol
 
 from gantry.evidence import EvidenceBundle, Observation, ObservationSource
 from gantry.runs.model import RunRecord
-from gantry.verifier import CheckResult
+from gantry.verifier import CheckResult, CheckSource
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -162,6 +162,7 @@ def _bundle_from_dict(payload: dict[str, object]) -> EvidenceBundle:
         started_at=_optional_time(payload.get("started_at")),
         finished_at=_optional_time(payload.get("finished_at")),
         execution=_mapping(payload.get("execution")),
+        proposal=_mapping(payload.get("proposal")),
         observations=tuple(
             Observation(
                 name=str(item["name"]),
@@ -181,7 +182,10 @@ def _bundle_from_dict(payload: dict[str, object]) -> EvidenceBundle:
                 message=_optional_str(item.get("message")),
                 metadata=_mapping(item.get("metadata")),
                 supported=bool(item.get("supported", True)),
-                source=_optional_str(item.get("source")),
+                source=_check_source(item.get("source")),
+                evidence_refs=tuple(
+                    str(value) for value in _plain_sequence(item.get("evidence_refs"))
+                ),
             )
             for item in _sequence(payload.get("checks"))
         ),
@@ -192,12 +196,26 @@ def _sequence(value: object) -> list[dict[str, object]]:
     return list(value) if isinstance(value, list) else []
 
 
+def _plain_sequence(value: object) -> list[object]:
+    return list(value) if isinstance(value, list) else []
+
+
 def _mapping(value: object) -> dict[str, object]:
     return {str(key): item for key, item in value.items()} if isinstance(value, dict) else {}
 
 
 def _optional_str(value: object) -> str | None:
     return None if value is None else str(value)
+
+
+def _check_source(value: object) -> CheckSource | str | None:
+    normalized = _optional_str(value)
+    if normalized is None:
+        return None
+    try:
+        return CheckSource(normalized)
+    except ValueError:
+        return normalized
 
 
 def _optional_time(value: object) -> datetime | None:

@@ -8,6 +8,7 @@ from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from fnmatch import fnmatchcase
+from hashlib import sha256
 from typing import NoReturn
 
 from gantry.context import Context
@@ -24,8 +25,19 @@ from gantry.runtime import SubmissionError
 from gantry.sql.classification import SQLOperation
 from gantry.sql.dialect import ConservativeDialect
 from gantry.tool import Tool
-from gantry.verifier import CheckResult, VerificationResult
-from gantry.verify import MaterializationCheck
+from gantry.verifier import CheckResult, CheckSource, VerificationResult
+from gantry.verify import (
+    MaterializationCheck,
+    VerificationConflict,
+    VerificationInputError,
+    VerificationUnsupported,
+    check_config,
+    detect_conflicts,
+    parse_agent_checks,
+    sourced_result,
+    validate_agent_checks,
+    verification_schema,
+)
 
 _LEADING_COMMENTS = re.compile(r"\A(?:\s+|--[^\n]*(?:\n|$)|/\*.*?\*/)*", re.DOTALL)
 _IDENTIFIER = r'(?:[A-Za-z_][A-Za-z0-9_$-]*|"(?:""|[^"])+"|`(?:``|[^`])+`)'
@@ -93,6 +105,7 @@ class FlinkJob:
         self._timeout = None if timeout is None else float(timeout)
         self._poll_interval = float(poll_interval)
         self._checks = tuple(checks)
+        self._agent_checks: dict[str, tuple[FlinkHealthCheck | MaterializationCheck, ...]] = {}
         self._validate_checks()
 
     @property
@@ -101,9 +114,13 @@ class FlinkJob:
 
     @property
     def input_schema(self) -> Mapping[str, object]:
+        capabilities = self._agent_capabilities
         return {
             "type": "object",
-            "properties": {"sql": {"type": "string"}},
+            "properties": {
+                "sql": {"type": "string"},
+                "verify": verification_schema(capabilities),
+            },
             "required": ["sql"],
             "additionalProperties": False,
         }
@@ -131,11 +148,30 @@ class FlinkJob:
             },
         )
 
-    async def submit(self, sql: str, *, context: Context | None = None) -> ExecutionHandle:
+    async def submit(
+        self,
+        sql: str,
+        *,
+        context: Context | None = None,
+        verify: Sequence[FlinkHealthCheck | MaterializationCheck] = (),
+    ) -> ExecutionHandle:
+        agent_checks = validate_agent_checks(verify, capabilities=self._agent_capabilities)
+        detect_conflicts(self._checks, agent_checks)
         plan = self.inspect(sql)
         self._admit(plan)
         try:
-            return await self._runtime.submit(self._artifact(sql, plan), context=context)
+            handle = await self._runtime.submit(self._artifact(sql, plan), context=context)
+            proposal_hash = sha256(sql.encode()).hexdigest()
+            handle = replace(
+                handle,
+                metadata={
+                    **handle.metadata,
+                    "gantry.proposal_hash": proposal_hash,
+                    "gantry.agent_verification": [check_config(check) for check in agent_checks],
+                },
+            )
+            self._agent_checks[handle.gantry_id] = agent_checks  # type: ignore[assignment]
+            return handle
         except SubmissionError as error:
             failure = error.result.failure or Failure(
                 FailureKind.SUBMISSION_ERROR,
@@ -164,24 +200,50 @@ class FlinkJob:
             self._poll_interval if poll_interval_seconds is None else poll_interval_seconds
         )
         timeout = self._timeout if timeout_seconds is None else timeout_seconds
+        entries = self._check_entries(handle)
         result = await self._runtime.wait(
             handle,
-            checks=self._health_checks,
+            checks=tuple(check for check, _ in entries if isinstance(check, FlinkHealthCheck)),
             poll_interval_seconds=poll_interval,
             timeout_seconds=timeout,
         )
+        result = self._source_health_result(result, entries)
         if self._kind is FlinkJobKind.BATCH and result.ok:
-            return await self._verify_batch(result)
-        return result
+            return _recorded(await self._verify_batch(result, entries))
+        return _recorded(self._with_agent_commitment(result, handle))
 
     async def health(self, handle: ExecutionHandle) -> StreamingHealth:
         if self._kind is not FlinkJobKind.STREAM:
             raise AttributeError("health is available only for streaming jobs")
-        return await self._runtime.health(handle, checks=self._health_checks)
+        checks = tuple(
+            check for check, _ in self._check_entries(handle) if isinstance(check, FlinkHealthCheck)
+        )
+        return await self._runtime.health(handle, checks=checks)
 
-    async def __call__(self, sql: str, *, context: Context | None = None) -> FlinkResult:
+    async def __call__(
+        self,
+        sql: str,
+        *,
+        context: Context | None = None,
+        verify: Sequence[FlinkHealthCheck | MaterializationCheck] = (),
+    ) -> FlinkResult:
         try:
-            handle = await self.submit(sql, context=context)
+            handle = await self.submit(sql, context=context, verify=verify)
+        except VerificationUnsupported as error:
+            return _failed(
+                ResultStatus.VERIFICATION_UNSUPPORTED,
+                Failure(FailureKind.VERIFICATION_UNSUPPORTED, False, str(error)),
+            )
+        except VerificationConflict as error:
+            return _failed(
+                ResultStatus.VERIFICATION_CONFLICT,
+                Failure(FailureKind.VERIFICATION_CONFLICT, False, str(error)),
+            )
+        except VerificationInputError as error:
+            return _failed(
+                ResultStatus.REJECTED,
+                Failure(FailureKind.VALIDATION_ERROR, False, str(error)),
+            )
         except FlinkJobError as error:
             return _failed(error.status, error.failure)
         except (TypeError, ValueError) as error:
@@ -211,14 +273,42 @@ class FlinkJob:
         )
 
     async def _invoke_tool(self, arguments: Mapping[str, object]) -> FlinkResult:
-        unexpected = set(arguments) - {"sql"}
+        unexpected = set(arguments) - {"sql", "verify"}
         if unexpected:
             names = ", ".join(sorted(unexpected))
             raise ValueError(f"unexpected Flink job tool arguments: {names}")
         sql = arguments.get("sql")
         if not isinstance(sql, str):
             raise TypeError("sql must be a string")
-        return await self(sql)
+        try:
+            checks = parse_agent_checks(
+                arguments.get("verify"), capabilities=self._agent_capabilities
+            )
+        except VerificationUnsupported as error:
+            return _failed(
+                ResultStatus.VERIFICATION_UNSUPPORTED,
+                Failure(FailureKind.VERIFICATION_UNSUPPORTED, False, str(error)),
+            )
+        except VerificationInputError as error:
+            return _failed(
+                ResultStatus.REJECTED,
+                Failure(FailureKind.VALIDATION_ERROR, False, str(error)),
+            )
+        return await self(sql, verify=checks)  # type: ignore[arg-type]
+
+    @property
+    def _agent_capabilities(self) -> frozenset[str]:
+        if self._kind is FlinkJobKind.STREAM:
+            runtime = self._runtime.capabilities()
+            capabilities: set[str] = set()
+            if runtime.remote_status:
+                capabilities.add("running")
+            if runtime.metrics:
+                capabilities.update({"restart_count", "watermark_lag"})
+            return frozenset(capabilities)
+        if not self._runtime.capabilities().result_reference:
+            return frozenset()
+        return frozenset({"output_exists", "not_empty", "row_count", "required_columns"})
 
     @property
     def _health_checks(self) -> tuple[FlinkHealthCheck, ...]:
@@ -266,8 +356,93 @@ class FlinkJob:
             declared_outputs=(plan.output,),
         )
 
-    async def _verify_batch(self, result: FlinkResult) -> FlinkResult:
-        table_checks = self._table_checks
+    def _check_entries(
+        self, handle: ExecutionHandle
+    ) -> tuple[tuple[FlinkHealthCheck | MaterializationCheck, CheckSource], ...]:
+        return (
+            *((check, CheckSource.TRUSTED) for check in self._checks),
+            *((check, CheckSource.AGENT) for check in self._agent_checks_for(handle)),
+        )
+
+    def _agent_checks_for(
+        self, handle: ExecutionHandle
+    ) -> tuple[FlinkHealthCheck | MaterializationCheck, ...]:
+        local = self._agent_checks.get(handle.gantry_id)
+        if local is not None:
+            return local
+        try:
+            checks = parse_agent_checks(
+                handle.metadata.get("gantry.agent_verification"),
+                capabilities=self._agent_capabilities,
+            )
+        except VerificationInputError:
+            return ()
+        return checks  # type: ignore[return-value]
+
+    def _source_health_result(
+        self,
+        result: FlinkResult,
+        entries: Sequence[tuple[FlinkHealthCheck | MaterializationCheck, CheckSource]],
+    ) -> FlinkResult:
+        if result.verification is None:
+            return result
+        sources = [source for check, source in entries if isinstance(check, FlinkHealthCheck)]
+        checks = tuple(
+            sourced_result(check, source, observation_source="flink")
+            for check, source in zip(result.verification.checks, sources, strict=False)
+        )
+        verification = replace(result.verification, checks=checks)
+        health = (
+            None if result.health is None else replace(result.health, verification=verification)
+        )
+        evidence = None if result.evidence is None else replace(result.evidence, checks=checks)
+        return replace(result, verification=verification, health=health, evidence=evidence)
+
+    def _with_agent_commitment(self, result: FlinkResult, handle: ExecutionHandle) -> FlinkResult:
+        if result.evidence is None:
+            return result
+        agent = self._agent_checks_for(handle)
+        proposal_hash = handle.metadata.get("gantry.proposal_hash")
+        evidence = replace(
+            result.evidence,
+            proposal_hash=proposal_hash if isinstance(proposal_hash, str) else None,
+            proposal={
+                "hash": proposal_hash if isinstance(proposal_hash, str) else None,
+                "agent_verification": [check_config(check) for check in agent],
+            },
+        )
+        return replace(result, evidence=evidence)
+
+    def _with_batch_evidence(
+        self,
+        result: FlinkResult,
+        verification: VerificationResult,
+    ) -> FlinkResult:
+        evidence = (
+            None
+            if result.evidence is None
+            else replace(
+                result.evidence,
+                decision=result.status.value,
+                checks=verification.checks,
+            )
+        )
+        updated = replace(result, verification=verification, evidence=evidence)
+        return (
+            self._with_agent_commitment(updated, result.handle)
+            if result.handle is not None
+            else updated
+        )
+
+    async def _verify_batch(
+        self,
+        result: FlinkResult,
+        entries: Sequence[tuple[FlinkHealthCheck | MaterializationCheck, CheckSource]],
+    ) -> FlinkResult:
+        table_entries = tuple(
+            (check, source) for check, source in entries if isinstance(check, MaterializationCheck)
+        )
+        table_checks = tuple(check for check, _ in table_entries)
         health_results: tuple[CheckResult, ...] = ()
         if result.verification is not None:
             health_results = result.verification.checks
@@ -276,7 +451,7 @@ class FlinkJob:
                 ok=all(item.ok for item in health_results),
                 checks=health_results,
             )
-            return replace(result, verification=verification)
+            return self._with_batch_evidence(result, verification)
         output_name = _output_name(result)
         if output_name is None:
             return _verification_failed(result, "Flink did not return an output reference")
@@ -289,21 +464,25 @@ class FlinkJob:
             return _verification_failed(result, f"Flink output inspection failed: {error}")
         checks: tuple[CheckResult, ...] = (
             *health_results,
-            *(check.evaluate(table) for check in table_checks),
+            *(
+                sourced_result(check.evaluate(table), source, observation_source="flink output")
+                for check, source in table_entries
+            ),
         )
         verification = VerificationResult(ok=all(check.ok for check in checks), checks=checks)
         if verification.ok:
-            return replace(result, verification=verification)
+            return self._with_batch_evidence(result, verification)
         message = next(
             (check.message for check in checks if not check.ok and check.message),
             "Flink batch verification failed",
         )
-        return replace(
+        failed = replace(
             result,
             status=ResultStatus.VERIFICATION_FAILED,
             verification=verification,
             failure=Failure(FailureKind.VERIFICATION_FAILED, False, message),
         )
+        return self._with_batch_evidence(failed, verification)
 
 
 class FlinkBatchJob(FlinkJob):
@@ -348,6 +527,13 @@ class FlinkStreamJob(FlinkJob):
             timeout=timeout,
             poll_interval=poll_interval,
         )
+
+
+def _recorded(result: FlinkResult) -> FlinkResult:
+    from gantry.runs import record
+
+    record(result.evidence)
+    return result
 
 
 def _parse_job(sql: str) -> FlinkJobPlan:

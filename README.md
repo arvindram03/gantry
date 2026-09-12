@@ -11,7 +11,8 @@
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](https://github.com/arvindram03/gantry/blob/main/LICENSE)
 
 Gantry is the layer between your agent and your database. Your application holds the
-credentials and writes the policy. The agent gets a tool whose only input is `sql`.
+credentials and writes the policy and trusted checks. The agent gets a tool
+whose inputs are `sql` and an optional declarative `verify` commitment.
 
 Every statement is classified, checked against the policy, validated by the engine,
 bounded, executed, and **verified** before its result is marked accepted.
@@ -55,11 +56,16 @@ tool = query.tool()
 schema = {
     "name": tool.name,  # "query_sql"
     "description": tool.description,
-    "input_schema": tool.input_schema,  # one property: sql
+    "input_schema": tool.input_schema,  # sql + allowlisted verify checks
 }
 
 # When the model calls it:
-result = await tool.invoke({"sql": "SELECT plan, COUNT(*) ..."})
+result = await tool.invoke(
+    {
+        "sql": "SELECT plan, COUNT(*) ...",
+        "verify": [{"type": "not_empty"}],
+    }
+)
 
 result.status  # ACCEPTED
 result.inline.rows  # (('free', 1250), ('team', 1250), ...)
@@ -67,9 +73,10 @@ result.inline.rows  # (('free', 1250), ('team', 1250), ...)
 
 ## What the agent cannot do
 
-The agent sees one string field. It cannot:
+The agent sees the SQL field and a constrained verification vocabulary. It cannot:
 
 - **widen its own policy** — raise the row cap, extend the timeout, or add a schema
+- **weaken trusted checks** — its checks are added to the application contract, never substituted
 - **reach the connection or the credentials** — those stay in your code, never in the tool schema
 - **turn a read into a write** — `query.tool()` refuses to be created unless the policy is read-only
 - **smuggle in a second statement** — a multi-statement submission is refused as a batch
@@ -93,7 +100,7 @@ Everything below is set once, in your code, on `db.query(...)`:
 | `max_bytes_scanned` | off | Refused before running, from the engine's own estimate |
 | `max_cost_usd` | off | Refused before running, on engines that price a query |
 | `allow_multiple_statements` | `False` | Whether a batch is a batch or a refusal |
-| `verify` | none | Checks that must pass before the result is accepted |
+| `checks` | none | Trusted checks that must pass before the result is accepted |
 
 Schema, table and statement rules are enforced by Gantry. The bounds are enforced by
 the engine — and a bound the adapter cannot apply is **refused rather than ignored**,
@@ -141,14 +148,16 @@ already exist:
 build = db.materialize(
     sources=["analytics.*"],
     destinations=["reporting.*"],
-    verify=[gantry.verify.row_count(max=1_000_000)],
+    checks=[gantry.verify.row_count(max=1_000_000)],
 )
 
 tools = [query.tool(), build.tool()]
 ```
 
 No `DROP`, no `REPLACE`, no writing outside `reporting`, and no accepted result
-until the destination has been checked.
+until the destination has been checked. At invocation time the agent can make
+the contract stricter, for example `verify=[gantry.verify.not_empty()]` in
+Python or `{"verify": [{"type": "not_empty"}]}` through the tool.
 
 ## It's a library, not a proxy — your data doesn't route through it
 
@@ -164,7 +173,7 @@ to get where it is going.
   in front of the database, no broker between the agent and the engine.
 - **Credentials stay in your code.** What Gantry hands the engine adapter deliberately
   excludes provider configuration and credentials; what it hands the agent is a JSON
-  schema with one string field.
+  schema containing SQL and only the verification primitives that operation supports.
 - **Long jobs are handles, not held-open calls.** `submit()` returns an
   `ExecutionHandle` carrying the engine's own job id. Any process holding those four
   fields can poll it, read its metrics, and cancel it — no local run record, no live

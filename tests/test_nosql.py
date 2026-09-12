@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from typing import Any, cast
 
+import gantry
 import pytest
 from gantry import (
     Artifact,
@@ -371,7 +373,8 @@ class _FakeConnection:
         *,
         policy: NoSQLPolicy,
         context: Context | None = None,
-        verify: tuple[object, ...] = (),
+        trusted_verify: Sequence[object] = (),
+        agent_verify: Sequence[object] = (),
     ) -> NoSQLResult:
         self.calls.append((collection, pipeline, policy))
         return NoSQLResult(ResultStatus.ACCEPTED)
@@ -380,7 +383,7 @@ class _FakeConnection:
 async def test_query_calls_connection_with_collection_and_pipeline() -> None:
     connection = _FakeConnection()
     policy = NoSQLPolicy(max_documents=5)
-    query = NoSQLQuery(connection, policy, ())  # type: ignore[arg-type]
+    query = NoSQLQuery(connection, policy, ())
 
     result = await query("orders", {"status": "open"})
 
@@ -391,22 +394,19 @@ async def test_query_calls_connection_with_collection_and_pipeline() -> None:
 async def test_query_tool_exposes_collection_and_pipeline_only() -> None:
     connection = _FakeConnection()
     policy = NoSQLPolicy()
-    query = NoSQLQuery(connection, policy, ())  # type: ignore[arg-type]
+    query = NoSQLQuery(connection, policy, ())
     tool = query.tool()
 
     result = await tool.invoke(collection="orders", pipeline={"status": "open"})
 
-    assert tool.input_schema == {
-        "type": "object",
-        "properties": {
-            "collection": {"type": "string"},
-            "pipeline": {
-                "type": ["object", "array"],
-                "description": "A MongoDB filter document or aggregation pipeline stages",
-            },
-        },
-        "required": ["collection", "pipeline"],
-        "additionalProperties": False,
+    schema = cast(dict[str, Any], tool.input_schema)
+    assert schema["required"] == ["collection", "pipeline"]
+    assert set(schema["properties"]) == {"collection", "pipeline", "verify"}
+    variants = schema["properties"]["verify"]["items"]["oneOf"]
+    assert {item["properties"]["type"]["const"] for item in variants} == {
+        "document_count",
+        "not_empty",
+        "required_fields",
     }
     assert result.ok
     with pytest.raises(TypeError, match="collection must be a string"):
@@ -506,6 +506,50 @@ async def test_materializer_allows_merge_into_an_existing_destination() -> None:
     assert result.uri == "mongodb://reporting.rollup"
 
 
+async def test_materializer_accepts_agent_document_checks_and_records_evidence() -> None:
+    connection = _FakeMaterializeConnection(
+        capabilities=_full_capabilities(),
+        snapshot=CollectionSnapshot(
+            "reporting.rollup", {"document_count": 3}, ("customer_id", "total")
+        ),
+    )
+    policy = MaterializationPolicy(sources=["orders"], destinations=["reporting.rollup"])
+    materializer = NoSQLMaterializer(connection, policy, (gantry.verify.document_count(max=10),))
+
+    result = await materializer(
+        "orders",
+        [{"$match": {}}, {"$merge": "reporting.rollup"}],
+        verify=[
+            gantry.verify.not_empty(),
+            gantry.verify.required_fields(["customer_id", "total"]),
+        ],
+    )
+
+    assert result.status is ResultStatus.ACCEPTED
+    assert result.verification is not None
+    assert [check.source for check in result.verification.checks] == [
+        gantry.CheckSource.TRUSTED,
+        gantry.CheckSource.AGENT,
+        gantry.CheckSource.AGENT,
+    ]
+    assert result.evidence is not None
+    assert len(result.evidence.agent_checks) == 2
+
+
+def test_materializer_tool_schema_exposes_only_mongodb_checks() -> None:
+    connection = _FakeMaterializeConnection(capabilities=_full_capabilities(), snapshot=None)
+    policy = MaterializationPolicy(sources=["orders"], destinations=["reporting.rollup"])
+    schema = cast(dict[str, Any], NoSQLMaterializer(connection, policy, ()).input_schema)
+
+    variants = schema["properties"]["verify"]["items"]["oneOf"]
+    assert {item["properties"]["type"]["const"] for item in variants} == {
+        "destination_exists",
+        "document_count",
+        "not_empty",
+        "required_fields",
+    }
+
+
 async def test_materializer_rejects_sources_outside_policy() -> None:
     connection = _FakeMaterializeConnection(capabilities=_full_capabilities(), snapshot=None)
     policy = MaterializationPolicy(sources=["orders"], destinations=["reporting.rollup"])
@@ -578,6 +622,75 @@ async def test_connect_query_runs_lifecycle_and_bounds_inline_documents() -> Non
     assert adapter.submitted_collection == "orders"
     assert adapter.policy is not None
     assert adapter.policy.max_documents == 1
+
+
+async def test_mongodb_query_merges_trusted_and_agent_verification() -> None:
+    adapter = StubMongoAdapter()
+    register("test-nosql-verification", adapter=adapter, replace=True)
+    query = gantry.nosql.connect(
+        "test-nosql-verification", uri="mongodb://localhost", database="d"
+    ).query(checks=[gantry.verify.document_count(max=3)])
+
+    result = await query(
+        "orders",
+        {"status": "open"},
+        verify=[gantry.verify.not_empty(), gantry.verify.required_fields(["_id"])],
+    )
+
+    assert result.status is ResultStatus.ACCEPTED
+    assert result.verification is not None
+    assert [check.source for check in result.verification.checks] == [
+        gantry.CheckSource.TRUSTED,
+        gantry.CheckSource.AGENT,
+        gantry.CheckSource.AGENT,
+    ]
+    assert result.evidence is not None
+    assert result.evidence.proposal["agent_verification"] == [
+        {"type": "not_empty"},
+        {"type": "required_fields", "fields": ["_id"]},
+    ]
+
+
+async def test_mongodb_query_conflict_stops_before_submission() -> None:
+    adapter = StubMongoAdapter()
+    register("test-nosql-conflict", adapter=adapter, replace=True)
+    query = gantry.nosql.connect(
+        "test-nosql-conflict", uri="mongodb://localhost", database="d"
+    ).query(checks=[gantry.verify.document_count(max=1)])
+
+    result = await query("orders", {}, verify=[gantry.verify.document_count(min=2)])
+
+    assert result.status is ResultStatus.VERIFICATION_CONFLICT
+    assert adapter.submissions == 0
+
+
+async def test_mongodb_not_empty_conflicts_with_zero_document_limit() -> None:
+    adapter = StubMongoAdapter()
+    register("test-nosql-empty-conflict", adapter=adapter, replace=True)
+    query = gantry.nosql.connect(
+        "test-nosql-empty-conflict", uri="mongodb://localhost", database="d"
+    ).query(checks=[gantry.verify.document_count(max=0)])
+
+    result = await query("orders", {}, verify=[gantry.verify.not_empty()])
+
+    assert result.status is ResultStatus.VERIFICATION_CONFLICT
+    assert adapter.submissions == 0
+
+
+async def test_mongodb_truncated_document_count_is_unsupported() -> None:
+    adapter = StubMongoAdapter()
+    register("test-nosql-truncated-verification", adapter=adapter, replace=True)
+    query = gantry.nosql.connect(
+        "test-nosql-truncated-verification", uri="mongodb://localhost", database="d"
+    ).query(max_documents=1)
+
+    result = await query("orders", {}, verify=[gantry.verify.document_count(max=10)])
+
+    assert result.status is ResultStatus.VERIFICATION_UNSUPPORTED
+    assert result.failure is not None
+    assert result.failure.kind is FailureKind.VERIFICATION_UNSUPPORTED
+    assert result.verification is not None
+    assert result.verification.unsupported_checks[0].name == "document_count"
 
 
 async def test_connect_rejects_writes_under_a_read_only_query_policy() -> None:

@@ -14,6 +14,10 @@ Gantry took at the destination.
 
 ::: gantry.ObservationSource
 
+::: gantry.CheckSource
+
+::: gantry.VerificationSource
+
 ## The bundle
 
 ::: gantry.EvidenceBundle
@@ -33,9 +37,33 @@ returned, described as a table so one check means one thing.
 ```python
 checks = [gantry.verify.row_count(min=1), gantry.verify.required_columns(["id"])]
 
-await db.query(schemas=["analytics"], verify=checks)(sql)
-await db.materialize(sources=["analytics.*"], destinations=["reporting.*"], verify=checks)(sql)
+await db.query(schemas=["analytics"], checks=checks)(sql)
+await db.materialize(sources=["analytics.*"], destinations=["reporting.*"], checks=checks)(sql)
 ```
+
+Configured `checks=` are trusted application commitments. A caller may add
+task-specific checks at invocation time; the merge is additive and Gantry
+assigns provenance itself:
+
+```python
+query = db.query(
+    schemas=["analytics"],
+    checks=[gantry.verify.row_count(max=1000)],
+)
+
+result = await query(
+    sql,
+    verify=[
+        gantry.verify.not_empty(),
+        gantry.verify.required_columns(["customer_id", "revenue"]),
+    ],
+)
+```
+
+`query.tool()` exposes `verify` as an allowlisted declarative JSON schema. An
+unsupported check, attempted `source` override, or
+executable callback is rejected. Statically contradictory count bounds return
+`VERIFICATION_CONFLICT` before the engine is started.
 
 Two cases cannot be the same, and both fail closed rather than pretending:
 
@@ -59,7 +87,7 @@ store keeps it past the process, and past the agent conversation.
 gantry.runs.configure(gantry.runs.SQLiteRunStore(".gantry/runs.db"))
 
 result = await build(sql)
-gantry.runs.record(result.evidence)
+# Governed operations record their evidence automatically.
 
 # …in another process, holding only the id
 run = gantry.runs.get(run_id)

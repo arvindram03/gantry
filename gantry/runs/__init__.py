@@ -6,12 +6,11 @@ answers is the one that comes later and from someone else — why did last
 night's rollup get accepted, and what was checked — at a point when the agent
 conversation that produced it is gone.
 
-    gantry.runs.record(result.evidence)
     run = gantry.runs.get("run_123")
     print(run.render())
 
-SQLite by default, which is enough for v0 and needs nothing running. The store
-is swappable for anything implementing `RunStore`.
+Governed operations record automatically. Storage is in-memory until the
+application configures SQLite (or another `RunStore`) for durable evidence.
 """
 
 from __future__ import annotations

@@ -17,7 +17,7 @@ materialize = warehouse.materialize(
     create_only=True,
     max_bytes_scanned=10_000_000_000,
     timeout=300,
-    verify=[
+    checks=[
         gantry.verify.destination_exists(),
         gantry.verify.row_count(min=1),
         gantry.verify.required_columns(["customer_id", "outstanding_balance"]),
@@ -39,18 +39,21 @@ result = await materialize(
 )
 ```
 
-An agent receives only its narrow tool form:
+An agent receives only its narrow tool form. The schema includes SQL and the
+declarative verification primitives this provider can evaluate:
 
 ```python
 tool = materialize.tool()
 
 tool.name  # "materialize_sql"
-tool.input_schema  # only {"sql": "..."}
-result = await tool.invoke(sql="CREATE TABLE agent_scratch.out AS SELECT * FROM raw.input")
+result = await tool.invoke(
+    sql="CREATE TABLE agent_scratch.out AS SELECT * FROM raw.input",
+    verify=[{"type": "not_empty"}],
+)
 ```
 
-The connection, credentials, policy, limits, and verification checks do not appear in the tool
-schema.
+The connection, credentials, policy, limits, and trusted verification checks do not appear in
+the tool schema. Agent checks are additive and cannot replace those trusted checks.
 
 ## Admission
 
@@ -92,7 +95,7 @@ handle = await materialize.submit(sql)
 materialize = warehouse.materialize(
     sources=["raw.*"],
     destinations=["agent_scratch.*"],
-    verify=[gantry.verify.destination_exists()],
+    checks=[gantry.verify.destination_exists()],
 )
 result = await materialize.wait(handle)
 ```

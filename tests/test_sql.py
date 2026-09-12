@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any, cast
 
 import duckdb
 import gantry
@@ -207,11 +208,15 @@ async def test_query_tool_is_narrow_and_framework_neutral() -> None:
     result = await tool.invoke({"sql": "SELECT 1"})
 
     assert tool.name == "query_analytics"
-    assert tool.input_schema == {
-        "type": "object",
-        "properties": {"sql": {"type": "string"}},
-        "required": ["sql"],
-        "additionalProperties": False,
+    schema = cast(dict[str, Any], tool.input_schema)
+    assert schema["required"] == ["sql"]
+    assert set(schema["properties"]) == {"sql", "verify"}
+    variants = schema["properties"]["verify"]["items"]["oneOf"]
+    assert {item["properties"]["type"]["const"] for item in variants} == {
+        "not_empty",
+        "null_rate",
+        "required_columns",
+        "row_count",
     }
     assert result.ok
     with pytest.raises(TypeError, match="sql must be a string"):

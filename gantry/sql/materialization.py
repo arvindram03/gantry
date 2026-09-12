@@ -23,8 +23,19 @@ from gantry.sql.policy import SQLPolicy
 from gantry.sql.schema import Table
 from gantry.sql.target import SQLTarget
 from gantry.tool import Tool
-from gantry.verifier import CheckResult, VerificationResult
-from gantry.verify import MaterializationCheck
+from gantry.verifier import CheckResult, CheckSource, VerificationResult
+from gantry.verify import (
+    MaterializationCheck,
+    VerificationConflict,
+    VerificationInputError,
+    VerificationUnsupported,
+    check_config,
+    detect_conflicts,
+    parse_agent_checks,
+    sourced_result,
+    validate_agent_checks,
+    verification_schema,
+)
 
 if TYPE_CHECKING:
     from gantry.sql.api import SQLConnection
@@ -306,6 +317,22 @@ class SQLMaterializer:
 
     name = "materialize_sql"
     description = "Create a governed derived table from approved SQL sources."
+    _base_agent_capabilities = frozenset(
+        {
+            "destination_exists",
+            "not_empty",
+            "row_count",
+            "required_columns",
+            "null_rate",
+        }
+    )
+
+    @property
+    def _agent_capabilities(self) -> frozenset[str]:
+        capabilities = self._base_agent_capabilities
+        if not isinstance(self._connection._materialization_adapter(), ColumnStatistics):
+            capabilities = capabilities - {"null_rate"}
+        return capabilities
 
     def __init__(
         self,
@@ -317,15 +344,19 @@ class SQLMaterializer:
             raise TypeError("verify must contain materialization verification checks")
         self._connection = connection
         self._policy = policy
-        self._verify = tuple(verify)
+        self._trusted_checks = tuple(verify)
         self._plans: dict[str, MaterializationPlan] = {}
         self._proposals: dict[str, str] = {}
+        self._agent_checks: dict[str, tuple[MaterializationCheck, ...]] = {}
 
     @property
     def input_schema(self) -> dict[str, object]:
         return {
             "type": "object",
-            "properties": {"sql": {"type": "string"}},
+            "properties": {
+                "sql": {"type": "string"},
+                "verify": verification_schema(self._agent_capabilities),
+            },
             "required": ["sql"],
             "additionalProperties": False,
         }
@@ -366,12 +397,19 @@ class SQLMaterializer:
         )
         return parse_materialization(value.sql)
 
-    async def submit(self, proposal: str | MaterializationProposal) -> ExecutionHandle:
+    async def submit(
+        self,
+        proposal: str | MaterializationProposal,
+        *,
+        verify: Sequence[MaterializationCheck] = (),
+    ) -> ExecutionHandle:
         value = (
             proposal
             if isinstance(proposal, MaterializationProposal)
             else MaterializationProposal(proposal)
         )
+        agent_checks = validate_agent_checks(verify, capabilities=self._agent_capabilities)
+        detect_conflicts(self._trusted_checks, agent_checks)
         plan = self.inspect(value)
         await self._admit(plan)
         context = Context(metadata={_PLAN_METADATA: plan})
@@ -395,7 +433,17 @@ class SQLMaterializer:
         # Identifies the proposal without storing it. Evidence should say which
         # statement was run without becoming a place agent-written SQL
         # accumulates, and a digest is enough to match a run to its proposal.
-        self._proposals[handle.gantry_id] = sha256(value.sql.encode()).hexdigest()
+        proposal_hash = sha256(value.sql.encode()).hexdigest()
+        handle = replace(
+            handle,
+            metadata={
+                **handle.metadata,
+                "gantry.proposal_hash": proposal_hash,
+                "gantry.agent_verification": [check_config(check) for check in agent_checks],
+            },
+        )
+        self._proposals[handle.gantry_id] = proposal_hash
+        self._agent_checks[handle.gantry_id] = agent_checks  # type: ignore[assignment]
         return handle
 
     async def wait(
@@ -420,15 +468,26 @@ class SQLMaterializer:
         )
         execution = await self._connection.status(handle)
         if not sql_result.ok:
-            return MaterializationResult(
+            verification = VerificationResult.passed()
+            result = MaterializationResult(
                 status=sql_result.status,
                 execution=execution,
                 failure=sql_result.failure,
+                evidence=_evidence(
+                    plan,
+                    execution,
+                    None,
+                    verification,
+                    sql_result.status,
+                    self._proposal_hash(handle),
+                    self._agent_checks_for(handle),
+                ),
             )
+            return _recorded(result)
 
         output = _materialized_output(sql_result.outputs, plan.destination)
         if output is None:
-            return MaterializationResult(
+            result = MaterializationResult(
                 status=ResultStatus.FAILED,
                 execution=execution,
                 failure=Failure(
@@ -436,9 +495,20 @@ class SQLMaterializer:
                     False,
                     "adapter did not return a reference to the materialized destination",
                 ),
+                evidence=_evidence(
+                    plan,
+                    execution,
+                    None,
+                    VerificationResult.passed(),
+                    ResultStatus.FAILED,
+                    self._proposal_hash(handle),
+                    self._agent_checks_for(handle),
+                ),
             )
+            return _recorded(result)
 
-        verification = await self._verification(plan.destination)
+        agent_checks = self._agent_checks_for(handle)
+        verification = await self._verification(plan.destination, agent_checks)
         if not verification.ok:
             unsupported = verification.unsupported_checks
             reasons = unsupported or verification.failed_checks
@@ -447,7 +517,7 @@ class SQLMaterializer:
                 "materialization verification failed",
             )
             status = ResultStatus.VERIFICATION_FAILED
-            return MaterializationResult(
+            result = MaterializationResult(
                 status=status,
                 output=output,
                 execution=execution,
@@ -460,10 +530,17 @@ class SQLMaterializer:
                     message,
                 ),
                 evidence=_evidence(
-                    plan, execution, output, verification, status, self._proposal_hash(handle)
+                    plan,
+                    execution,
+                    output,
+                    verification,
+                    status,
+                    self._proposal_hash(handle),
+                    agent_checks,
                 ),
             )
-        return MaterializationResult(
+            return _recorded(result)
+        result = MaterializationResult(
             status=ResultStatus.ACCEPTED,
             output=output,
             execution=execution,
@@ -475,8 +552,10 @@ class SQLMaterializer:
                 verification,
                 ResultStatus.ACCEPTED,
                 self._proposal_hash(handle),
+                agent_checks,
             ),
         )
+        return _recorded(result)
 
     async def status(self, handle: ExecutionHandle) -> Execution:
         return await self._connection.status(handle)
@@ -484,9 +563,29 @@ class SQLMaterializer:
     async def cancel(self, handle: ExecutionHandle, *, mode: str = "default") -> Execution:
         return await self._connection.cancel(handle, mode=mode)
 
-    async def __call__(self, proposal: str | MaterializationProposal) -> MaterializationResult:
+    async def __call__(
+        self,
+        proposal: str | MaterializationProposal,
+        *,
+        verify: Sequence[MaterializationCheck] = (),
+    ) -> MaterializationResult:
         try:
-            handle = await self.submit(proposal)
+            handle = await self.submit(proposal, verify=verify)
+        except VerificationUnsupported as error:
+            return _failed(
+                ResultStatus.VERIFICATION_UNSUPPORTED,
+                Failure(FailureKind.VERIFICATION_UNSUPPORTED, False, str(error)),
+            )
+        except VerificationConflict as error:
+            return _failed(
+                ResultStatus.VERIFICATION_CONFLICT,
+                Failure(FailureKind.VERIFICATION_CONFLICT, False, str(error)),
+            )
+        except VerificationInputError as error:
+            return _failed(
+                ResultStatus.REJECTED,
+                Failure(FailureKind.VALIDATION_ERROR, False, str(error)),
+            )
         except MaterializationError as error:
             return _failed(error.status, error.failure)
         except (TypeError, ValueError) as error:
@@ -497,14 +596,28 @@ class SQLMaterializer:
         return await self.wait(handle, poll_interval_seconds=0.05)
 
     async def _invoke_tool(self, arguments: Mapping[str, object]) -> MaterializationResult:
-        unexpected = set(arguments) - {"sql"}
+        unexpected = set(arguments) - {"sql", "verify"}
         if unexpected:
             names = ", ".join(sorted(unexpected))
             raise ValueError(f"unexpected materialization tool arguments: {names}")
         sql = arguments.get("sql")
         if not isinstance(sql, str):
             raise TypeError("sql must be a string")
-        return await self(sql)
+        try:
+            checks = parse_agent_checks(
+                arguments.get("verify"), capabilities=self._agent_capabilities
+            )
+        except VerificationUnsupported as error:
+            return _failed(
+                ResultStatus.VERIFICATION_UNSUPPORTED,
+                Failure(FailureKind.VERIFICATION_UNSUPPORTED, False, str(error)),
+            )
+        except VerificationInputError as error:
+            return _failed(
+                ResultStatus.REJECTED,
+                Failure(FailureKind.VALIDATION_ERROR, False, str(error)),
+            )
+        return await self(sql, verify=checks)  # type: ignore[arg-type]
 
     async def _admit(self, plan: MaterializationPlan) -> None:
         capabilities = self._connection.capabilities()
@@ -572,32 +685,49 @@ class SQLMaterializer:
                 f"destination already exists: {plan.destination.qualified_name}",
             )
 
-    async def _verification(self, destination: TableRef) -> VerificationResult:
-        if not self._verify:
+    async def _verification(
+        self,
+        destination: TableRef,
+        agent_checks: Sequence[MaterializationCheck] = (),
+    ) -> VerificationResult:
+        effective = (*self._trusted_checks, *agent_checks)
+        if not effective:
             return VerificationResult.passed()
         try:
             table = await self._connection._inspect_table(
                 destination,
                 include_row_count=any(
-                    getattr(verifier, "requires_row_count", False) for verifier in self._verify
+                    getattr(verifier, "requires_row_count", False) for verifier in effective
                 ),
             )
         except Exception as error:
-            return VerificationResult.failed(
+            failure = VerificationResult.failed(
                 f"destination inspection raised {type(error).__name__}: {error}",
                 name="destination_introspection",
             )
-        table = await self._with_null_rates(table, destination)
+            check = sourced_result(
+                failure.checks[0],
+                CheckSource.TRUSTED,
+                observation_source="destination",
+            )
+            return replace(failure, checks=(check,))
+        table = await self._with_null_rates(table, destination, effective)
         checks: list[CheckResult] = []
-        for verifier in self._verify:
+        for index, verifier in enumerate(effective):
+            source = CheckSource.TRUSTED if index < len(self._trusted_checks) else CheckSource.AGENT
             try:
-                checks.append(verifier.evaluate(table))
+                checks.append(
+                    sourced_result(
+                        verifier.evaluate(table), source, observation_source="destination"
+                    )
+                )
             except Exception as error:
                 checks.append(
                     CheckResult(
                         name=type(verifier).__name__,
                         ok=False,
                         message=f"verification raised {type(error).__name__}: {error}",
+                        source=source,
                     )
                 )
         return VerificationResult(
@@ -606,16 +736,37 @@ class SQLMaterializer:
         )
 
     def _proposal_hash(self, handle: ExecutionHandle) -> str | None:
-        return self._proposals.get(handle.gantry_id)
+        stored = handle.metadata.get("gantry.proposal_hash")
+        return self._proposals.get(handle.gantry_id) or (
+            stored if isinstance(stored, str) else None
+        )
 
-    async def _with_null_rates(self, table: Table | None, destination: TableRef) -> Table | None:
+    def _agent_checks_for(self, handle: ExecutionHandle) -> tuple[MaterializationCheck, ...]:
+        local = self._agent_checks.get(handle.gantry_id)
+        if local is not None:
+            return local
+        try:
+            checks = parse_agent_checks(
+                handle.metadata.get("gantry.agent_verification"),
+                capabilities=self._agent_capabilities,
+            )
+        except VerificationInputError:
+            return ()
+        return checks  # type: ignore[return-value]
+
+    async def _with_null_rates(
+        self,
+        table: Table | None,
+        destination: TableRef,
+        checks: Sequence[MaterializationCheck],
+    ) -> Table | None:
         """Attach null rates to the destination metadata, if any check needs them.
 
         Gathered only when asked for: it is a scan per column, and a check that
         nobody configured should cost nothing.
         """
         wanted: list[str] = []
-        for verifier in self._verify:
+        for verifier in checks:
             wanted.extend(getattr(verifier, "null_rate_columns", ()))
         if table is None or not wanted:
             return table
@@ -820,6 +971,13 @@ def _matches(reference: TableRef, patterns: Collection[str]) -> bool:
     return any(fnmatchcase(candidate, pattern) for pattern in patterns for candidate in candidates)
 
 
+def _recorded(result: MaterializationResult) -> MaterializationResult:
+    from gantry.runs import record
+
+    record(result.evidence)
+    return result
+
+
 def _evidence(
     plan: MaterializationPlan,
     execution: Execution,
@@ -827,6 +985,7 @@ def _evidence(
     verification: VerificationResult,
     decision: ResultStatus,
     proposal_hash: str | None = None,
+    agent_checks: Sequence[MaterializationCheck] = (),
 ) -> EvidenceBundle:
     """Assemble the record of what was seen, from the three sources.
 
@@ -869,6 +1028,10 @@ def _evidence(
             "status": execution.state.value,
             "engine": handle.engine,
             "target": handle.target,
+        },
+        proposal={
+            "hash": proposal_hash,
+            "agent_verification": [check_config(check) for check in agent_checks],
         },
         observations=tuple(observations),
         checks=verification.checks,

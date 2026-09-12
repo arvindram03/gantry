@@ -67,7 +67,7 @@ async def main() -> int:
     build = db.materialize(
         sources=["analytics.*"],
         destinations=["reporting.*"],
-        verify=[gantry.verify.destination_exists(), gantry.verify.row_count(min=1)],
+        checks=[gantry.verify.destination_exists(), gantry.verify.row_count(min=1)],
     )
     tools = [ask.tool(), build.tool()]
     print("tools handed to the agent:", [tool.name for tool in tools])

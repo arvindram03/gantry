@@ -35,7 +35,8 @@ from gantry.sql.schema import DatabaseSchema, Table
 from gantry.sql.target import SQLTarget
 from gantry.store import MemoryExecutionStore
 from gantry.target import ExecutionTarget
-from gantry.verifier import CheckResult, VerificationResult, Verifier
+from gantry.verifier import CheckResult, CheckSource, VerificationResult, Verifier
+from gantry.verify import check_config, sourced_result
 
 if TYPE_CHECKING:
     from gantry.sql.capabilities import SQLCapabilities
@@ -151,11 +152,12 @@ class SQLConnection:
         max_bytes_scanned: int | None = None,
         max_cost_usd: float | None = None,
         allow_multiple_statements: bool = False,
-        verify: Sequence[Verifier | MaterializationCheck] = (),
+        checks: Sequence[Verifier | MaterializationCheck] = (),
+        verify: Sequence[Verifier | MaterializationCheck] | None = None,
     ) -> SQLQuery:
         """Configure a governed query operation.
 
-        `verify` takes the same `gantry.verify` checks a materialization takes,
+        `checks` takes the same `gantry.verify` checks a materialization takes,
         evaluated against the rows the query returns rather than a destination,
         plus any `Verifier` that inspects the execution itself.
         """
@@ -173,7 +175,10 @@ class SQLConnection:
             max_cost_usd=max_cost_usd,
             allow_multiple_statements=allow_multiple_statements,
         )
-        return SQLQuery(self, configured_policy, tuple(verify))
+        if verify is not None and checks:
+            raise TypeError("pass trusted checks with checks= (verify= is a compatibility alias)")
+        trusted = checks if verify is None else verify
+        return SQLQuery(self, configured_policy, tuple(trusted))
 
     async def _query(
         self,
@@ -181,7 +186,8 @@ class SQLConnection:
         *,
         policy: SQLPolicy,
         context: Context | None = None,
-        verify: Sequence[Verifier | MaterializationCheck] = (),
+        trusted_verify: Sequence[Verifier | MaterializationCheck] = (),
+        agent_verify: Sequence[MaterializationCheck] = (),
     ) -> SQLResult:
         """Execute SQL for a configured query operation.
 
@@ -191,13 +197,20 @@ class SQLConnection:
         that came back, described as a table, so the same `row_count` means the
         same thing whether the caller is querying or materializing.
         """
-        verifiers = tuple(item for item in verify if isinstance(item, Verifier))
-        checks = tuple(item for item in verify if not isinstance(item, Verifier))
+        verifiers = tuple(item for item in trusted_verify if isinstance(item, Verifier))
+        trusted_checks = tuple(item for item in trusted_verify if not isinstance(item, Verifier))
         result = await self.execute(sql, policy=policy, context=context, verify=verifiers)
         inline = _find_inline(result, policy.max_rows)
-        verification = _merge(result.verification, _result_set_checks(checks, inline))
+        base = _source_existing(result.verification, CheckSource.TRUSTED)
+        verification = _merge(
+            base,
+            (
+                *_result_set_checks(trusted_checks, inline, CheckSource.TRUSTED),
+                *_result_set_checks(agent_verify, inline, CheckSource.AGENT),
+            ),
+        )
         status, failure = _decide(result, verification)
-        return SQLResult(
+        response = SQLResult(
             status=status,
             handle=result.handle,
             inline=inline,
@@ -205,8 +218,14 @@ class SQLConnection:
             metrics=result.metrics,
             verification=verification,
             failure=failure,
-            evidence=_query_evidence(sql, result, inline, verification, status),
+            evidence=_query_evidence(
+                sql, result, inline, verification, status, agent_verify=agent_verify
+            ),
         )
+        from gantry.runs import record
+
+        record(response.evidence)
+        return response
 
     async def status(self, handle: ExecutionHandle) -> Execution:
         return await self._adapter.status(handle)
@@ -275,7 +294,8 @@ class SQLConnection:
         max_bytes_scanned: int | None = None,
         max_cost_usd: float | None = None,
         timeout: float = 300,
-        verify: Sequence[MaterializationCheck] = (),
+        checks: Sequence[MaterializationCheck] = (),
+        verify: Sequence[MaterializationCheck] | None = None,
     ) -> SQLMaterializer:
         """Configure a governed, create-only native SQL materialization operation."""
 
@@ -285,11 +305,14 @@ class SQLConnection:
         )
         from gantry.verify import MaterializationCheck
 
-        checks: list[MaterializationCheck] = []
-        for check in verify:
+        if verify is not None and checks:
+            raise TypeError("pass trusted checks with checks= (verify= is a compatibility alias)")
+        configured = checks if verify is None else verify
+        trusted_checks: list[MaterializationCheck] = []
+        for check in configured:
             if not isinstance(check, MaterializationCheck):
                 raise TypeError("verify must contain materialization verification checks")
-            checks.append(check)
+            trusted_checks.append(check)
         policy = MaterializationPolicy(
             sources=sources,
             destinations=destinations,
@@ -298,7 +321,7 @@ class SQLConnection:
             max_bytes_scanned=max_bytes_scanned,
             max_cost_usd=max_cost_usd,
         )
-        return SQLMaterializer(self, policy, checks)
+        return SQLMaterializer(self, policy, trusted_checks)
 
     async def _inspect_table(
         self,
@@ -353,7 +376,9 @@ def connect(provider: str, **config: object) -> SQLConnection:
 
 
 def _result_set_checks(
-    checks: Sequence[MaterializationCheck], inline: InlineRows | None
+    checks: Sequence[MaterializationCheck],
+    inline: InlineRows | None,
+    source: CheckSource,
 ) -> tuple[CheckResult, ...]:
     """Evaluate the shared check library against the rows a query returned."""
     if not checks:
@@ -367,19 +392,38 @@ def _result_set_checks(
     for check in checks:
         reason = applies_to_result_set(check, truncated=truncated)
         if reason is not None:
-            results.append(unsupported_for_query(check, reason))
+            results.append(
+                sourced_result(
+                    unsupported_for_query(check, reason), source, observation_source="result set"
+                )
+            )
             continue
         try:
-            results.append(replace(check.evaluate(table), source="result set"))
+            results.append(
+                sourced_result(check.evaluate(table), source, observation_source="result set")
+            )
         except Exception as error:
             results.append(
                 CheckResult(
                     name=type(check).__name__,
                     ok=False,
                     message=f"verification raised {type(error).__name__}: {error}",
+                    source=source,
                 )
             )
     return tuple(results)
+
+
+def _source_existing(
+    verification: VerificationResult | None, source: CheckSource
+) -> VerificationResult | None:
+    if verification is None:
+        return None
+    checks = tuple(
+        sourced_result(check, source, observation_source="verifier")
+        for check in verification.checks
+    )
+    return replace(verification, checks=checks)
 
 
 def _merge(
@@ -408,8 +452,17 @@ def _decide(
     unsupported = verification.unsupported_checks
     reasons = unsupported or verification.failed_checks
     message = next((check.message for check in reasons if check.message), "verification failed")
-    return ResultStatus.VERIFICATION_FAILED, Failure(
-        FailureKind.UNSUPPORTED_VERIFICATION if unsupported else FailureKind.VERIFICATION_FAILED,
+    agent_unsupported = any(check.source == CheckSource.AGENT for check in unsupported)
+    return (
+        ResultStatus.VERIFICATION_UNSUPPORTED
+        if agent_unsupported
+        else ResultStatus.VERIFICATION_FAILED
+    ), Failure(
+        FailureKind.VERIFICATION_UNSUPPORTED
+        if agent_unsupported
+        else FailureKind.UNSUPPORTED_VERIFICATION
+        if unsupported
+        else FailureKind.VERIFICATION_FAILED,
         False,
         message,
     )
@@ -421,6 +474,8 @@ def _query_evidence(
     inline: InlineRows | None,
     verification: VerificationResult | None,
     decision: ResultStatus,
+    *,
+    agent_verify: Sequence[MaterializationCheck] = (),
 ) -> EvidenceBundle | None:
     """A query's evidence, in the shape a materialization emits.
 
@@ -467,6 +522,10 @@ def _query_evidence(
             "status": "UNKNOWN" if execution is None else execution.state.value,
             "engine": handle.engine,
             "target": handle.target,
+        },
+        proposal={
+            "hash": sha256(sql.encode()).hexdigest(),
+            "agent_verification": [check_config(check) for check in agent_verify],
         },
         observations=tuple(observations),
         checks=() if verification is None else verification.checks,

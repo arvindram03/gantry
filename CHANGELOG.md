@@ -7,18 +7,32 @@ Notable changes. Dates are release dates; the format follows
 
 ### Added
 
+- **Trusted plus agent-proposed verification.** Configure immutable trusted
+  checks with `checks=` and add task-specific commitments with call-time
+  `verify=`. SQL and MongoDB query/materialization, Flink batch, and Flink
+  stream operations merge them additively, label every result `trusted` or
+  `agent`, and reject statically impossible count bounds before starting the
+  engine.
+- Tool schemas now expose a provider-filtered declarative `verify` vocabulary.
+  Unknown, executable, provenance-spoofing, and unsupported checks fail closed;
+  agent commitments survive reconnect in the execution handle and are stored
+  with observations and the final decision. Governed operations record their
+  evidence automatically in the configured run store.
+- `not_empty`, `document_count`, and `required_fields` verification
+  constructors, plus `CheckSource`/`VerificationSource` provenance.
+
 - **Verification evidence.** Every governed run now carries a serializable
   record of what Gantry observed while deciding: `result.evidence`. Three
   sources kept apart because they are trusted differently — the engine's
   account of its own execution, measurements Gantry took at the destination,
   and what the control plane was configured to require. `EvidenceBundle`,
   `Observation` and `ObservationSource` are on the top-level namespace.
-- **Durable run records.** `gantry.runs.record(result.evidence)` persists a
-  run; `gantry.runs.get(run_id)` reads it back in another process, and
+- **Durable run records.** Governed operations persist `result.evidence` in the
+  configured store; `gantry.runs.get(run_id)` reads it back in another process, and
   `run.render()` lays it out for a person. SQLite-backed by default, in memory
   until a caller configures a store, because writing a file into someone's
   working directory on import is not a default worth having.
-- **`db.query(verify=...)` takes the same checks as `db.materialize(...)`.** The
+- **`db.query(checks=...)` takes the same trusted checks as `db.materialize(...)`.** The
   `gantry.verify` library is evaluated against the rows a query returned,
   described as a table, so `row_count` means one thing on both paths. Query
   results carry `evidence` in the same shape too. Two checks cannot mean the
@@ -29,8 +43,9 @@ Notable changes. Dates are release dates; the format follows
   by the provider. This is the check `row_count` cannot stand in for: a query
   that runs, produces the expected number of rows, and joins wrongly, so the
   column everything downstream keys on is null in most of them.
-- `CheckResult.source` and `CheckResult.supported`, so a check says where its
-  observation came from and whether it could be evaluated at all.
+- `CheckResult.source` and `CheckResult.supported`, so a check says whether its
+  requirement came from trusted configuration or the agent and whether it
+  could be evaluated at all. Observation origin remains in evidence metadata.
 
 ### Changed
 

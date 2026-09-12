@@ -17,13 +17,18 @@ query = db.query(
     collections=("orders",),
     max_documents=500,
     timeout=30,
+    checks=[gantry.verify.document_count(max=500)],
 )
 ```
 
 Call the governed operation directly, with a plain filter dict:
 
 ```python
-result = await query("orders", {"status": "open"})
+result = await query(
+    "orders",
+    {"status": "open"},
+    verify=[gantry.verify.not_empty(), gantry.verify.required_fields(["_id"])],
+)
 ```
 
 or a read-only aggregation pipeline:
@@ -44,8 +49,12 @@ Or expose its narrow, framework-neutral form to an agent:
 tool = query.tool()
 
 tool.name  # "query_nosql"
-tool.input_schema  # {"collection": "...", "pipeline": ...}
-result = await tool.invoke(collection="orders", pipeline={"status": "open"})
+tool.input_schema  # collection, pipeline, and a capability-filtered verify array
+result = await tool.invoke(
+    collection="orders",
+    pipeline={"status": "open"},
+    verify=[{"type": "not_empty"}],
+)
 ```
 
 Query policy — allowed/denied collections, document/timeout/byte/cost limits — never appears in
@@ -60,7 +69,7 @@ naming a destination the operator has approved:
 materialize = db.materialize(
     sources=["orders"],
     destinations=["reporting.daily_rollup"],
-    verify=[gantry.nosql.destination_exists(), gantry.nosql.document_count(min=1)],
+    checks=[gantry.verify.destination_exists()],
 )
 
 result = await materialize(
@@ -70,8 +79,18 @@ result = await materialize(
         {"$group": {"_id": "$region", "total": {"$sum": "$amount"}}},
         {"$out": "reporting.daily_rollup"},
     ],
+    verify=[
+        gantry.verify.document_count(min=1),
+        gantry.verify.required_fields(["_id", "total"]),
+    ],
 )
 ```
+
+Checks passed to `checks=` are trusted application commitments. Checks passed at invocation time
+through `verify=` are additional agent-proposed commitments: they can strengthen acceptance but
+cannot remove or weaken trusted checks. Gantry assigns each result's provenance, evaluates both
+sets against the bounded query result or the destination collection, and records them in
+`result.evidence`.
 
 `$out` is create-only: if the destination collection already exists, the run is rejected with
 `DESTINATION_EXISTS` before anything is written. `$merge` is allowed to write into an existing
@@ -114,14 +133,18 @@ admission before the pipeline reaches MongoDB — see `gantry/nosql/enforcement.
 
 ## Verification checks
 
-`gantry.nosql.verify` mirrors `gantry.verify`'s SQL checks, adapted to Mongo's schemaless
-documents:
+The public `gantry.verify` vocabulary includes MongoDB checks adapted to schemaless documents:
 
 - `destination_exists()` — the destination collection exists after materialization.
 - `document_count(min=, max=)` — reads `CollectionSnapshot.metadata["document_count"]`.
 - `required_fields([...])` — checks field presence within a **bounded sample** (default 100
   documents) of the destination. Fields absent from every sampled document read as missing even
   if present in unsampled documents — a documented limitation, not a bug.
+
+Query tools expose `not_empty`, `document_count`, and `required_fields`. Materialization tools also
+expose `destination_exists`. Unsupported or malformed agent requests fail closed; contradictory
+count bounds are rejected before MongoDB executes the pipeline. The older `gantry.nosql` check
+constructors and trusted configuration `verify=` spelling remain available for compatibility.
 
 ## What is out of scope (v0)
 

@@ -77,7 +77,11 @@ def applies_to_result_set(check: object, *, truncated: bool) -> str | None:
     """Why this check cannot be evaluated against a result set, if it cannot."""
     if getattr(check, "requires_destination", False):
         return "this check needs a destination, and a query does not create one"
-    if truncated and getattr(check, "requires_row_count", False):
+    if (
+        truncated
+        and getattr(check, "requires_row_count", False)
+        and not getattr(check, "allows_truncated", False)
+    ):
         return (
             "the result was truncated by max_rows, so its row count describes "
             "the rows returned rather than the rows matched"

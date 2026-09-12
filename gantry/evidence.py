@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 
-from gantry.verifier import CheckResult, VerificationResult
+from gantry.verifier import CheckResult, CheckSource, VerificationResult
 
 
 class ObservationSource(StrEnum):
@@ -91,8 +91,21 @@ class EvidenceBundle:
     started_at: datetime | None = None
     finished_at: datetime | None = None
     execution: Mapping[str, object] = field(default_factory=dict)
+    proposal: Mapping[str, object] = field(default_factory=dict)
     observations: tuple[Observation, ...] = ()
     checks: tuple[CheckResult, ...] = ()
+
+    @property
+    def trusted_checks(self) -> tuple[CheckResult, ...]:
+        return tuple(check for check in self.checks if check.source == CheckSource.TRUSTED)
+
+    @property
+    def agent_checks(self) -> tuple[CheckResult, ...]:
+        return tuple(check for check in self.checks if check.source == CheckSource.AGENT)
+
+    @property
+    def verification(self) -> VerificationResult:
+        return VerificationResult(ok=all(check.ok for check in self.checks), checks=self.checks)
 
     @property
     def duration_ms(self) -> int | None:
@@ -121,8 +134,15 @@ class EvidenceBundle:
             "finished_at": None if self.finished_at is None else self.finished_at.isoformat(),
             "duration_ms": self.duration_ms,
             "execution": {key: _plain(value) for key, value in self.execution.items()},
+            "proposal": {key: _plain(value) for key, value in self.proposal.items()},
             "observations": [item.as_dict() for item in self.observations],
             "checks": [_check_as_dict(check) for check in self.checks],
+            "trusted_checks": [_check_as_dict(check) for check in self.trusted_checks],
+            "agent_checks": [_check_as_dict(check) for check in self.agent_checks],
+            "verification": {
+                "passed": all(check.ok for check in self.checks),
+                "checks": [_check_as_dict(check) for check in self.checks],
+            },
         }
 
     def to_json(self, *, indent: int | None = None) -> str:
@@ -145,8 +165,12 @@ def _check_as_dict(check: CheckResult) -> dict[str, object]:
         payload["source"] = check.source
     if check.message is not None:
         payload["message"] = check.message
+    if not check.supported:
+        payload["supported"] = False
     if check.metadata:
         payload["metadata"] = {key: _plain(value) for key, value in check.metadata.items()}
+    if check.evidence_refs:
+        payload["evidence_refs"] = list(check.evidence_refs)
     return payload
 
 

@@ -29,7 +29,13 @@ from gantry.runtime import (
 from gantry.store import ExecutionStore, MemoryExecutionStore, RunRecord
 from gantry.target import ExecutionTarget
 from gantry.tool import Tool
-from gantry.verifier import CheckResult, VerificationResult, Verifier
+from gantry.verifier import (
+    CheckResult,
+    CheckSource,
+    VerificationResult,
+    VerificationSource,
+    Verifier,
+)
 
 __version__ = "0.5.0"
 
@@ -38,6 +44,7 @@ __all__ = [
     "AdmissionDecision",
     "Artifact",
     "CheckResult",
+    "CheckSource",
     "Context",
     "ControlPlane",
     "EvidenceBundle",
@@ -64,6 +71,7 @@ __all__ = [
     "Tool",
     "ValidationResult",
     "VerificationResult",
+    "VerificationSource",
     "Verifier",
     "__version__",
     "admit",

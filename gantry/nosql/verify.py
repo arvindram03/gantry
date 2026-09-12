@@ -27,6 +27,7 @@ class DocumentCheck(Protocol):
 @dataclass(frozen=True, slots=True)
 class DestinationExists:
     requires_document_count: ClassVar[bool] = False
+    requires_destination: ClassVar[bool] = True
 
     def evaluate(self, collection: CollectionSnapshot | None) -> CheckResult:
         exists = collection is not None
