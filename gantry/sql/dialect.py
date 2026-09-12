@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator, Sequence
 from typing import Protocol
 
 from gantry.sql.classification import ParsedSQL, SQLClassification, SQLObjectRef, SQLOperation
@@ -19,6 +20,25 @@ _OBJECT = re.compile(
 _FUNCTION = re.compile(r"\b([A-Za-z_][A-Za-z0-9_$]*)\s*\(")
 _DOLLAR_QUOTE = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$")
 _DDL = {"CREATE", "ALTER", "DROP", "TRUNCATE", "GRANT", "REVOKE", "COMMENT"}
+# A `FOR` followed by one of these opens a row-locking clause. PostgreSQL counts
+# the locks as writes: `SELECT ... FOR UPDATE` is refused by a read-only
+# transaction, so a classifier that calls it read-only disagrees with the engine.
+_LOCKING = {"UPDATE", "SHARE", "NO", "KEY"}
+# Functions that write despite appearing in a `SELECT`. This is a floor, not a
+# boundary: any user-defined function can write, and no scanner can know that.
+# The guarantee comes from the adapter holding a read-only session, which
+# `policy_errors` requires before it will admit `read_only=True` at all.
+#
+# Membership is measured, not assumed. `nextval` and `setval` are here because
+# PostgreSQL 16 refuses them in a read-only transaction; `pg_advisory_lock` and
+# `pg_logical_emit_message` were in an earlier draft of this list and are not
+# here because it permits those.
+#
+# `dblink_exec` is the one that matters most, and for the opposite reason: the
+# read-only transaction *permits* it, because the write happens on another
+# server. Measured — the inserted row survived the ROLLBACK. It is the only
+# member the session cannot also catch.
+_WRITING_FUNCTIONS = frozenset({"nextval", "setval", "dblink_exec"})
 _OPERATIONS = {
     "SELECT": SQLOperation.SELECT,
     "INSERT": SQLOperation.INSERT,
@@ -65,7 +85,10 @@ class ConservativeDialect:
             )
 
         statement = _LEADING_COMMENTS.sub("", parsed.statements[0])
-        words = [match.group(0).upper() for match in _WORD.finditer(statement)]
+        # Keyword scanning runs on the statement with comments blanked, so a
+        # comment neither hides a keyword nor contributes words of its own.
+        scanned = _blank_comments(statement)
+        words = [match.group(0).upper() for match in _WORD.finditer(scanned)]
         first = words[0] if words else ""
         if first == "WITH":
             dangerous = {*_DDL, "INSERT", "UPDATE", "DELETE", "MERGE"}
@@ -75,6 +98,11 @@ class ConservativeDialect:
         operation = (
             SQLOperation.DDL if first in _DDL else _OPERATIONS.get(first, SQLOperation.UNKNOWN)
         )
+        if operation is SQLOperation.SELECT and "INTO" in words:
+            # `SELECT ... INTO new_table` creates a table. PostgreSQL refuses it
+            # in a read-only transaction for exactly that reason, and MySQL's
+            # `SELECT ... INTO OUTFILE` writes a file. It is a create, not a read.
+            operation = SQLOperation.DDL
         tables = self.referenced_objects(statement)
         write_targets = (
             tables[:1]
@@ -89,9 +117,11 @@ class ConservativeDialect:
             else ()
         )
         functions = tuple(dict.fromkeys(match.group(1) for match in _FUNCTION.finditer(statement)))
+        reason = _why_not_read_only(words, functions) if operation is SQLOperation.SELECT else None
         return SQLClassification(
             operation=operation,
-            read_only=operation is SQLOperation.SELECT,
+            read_only=operation is SQLOperation.SELECT and reason is None,
+            read_only_reason=reason,
             tables=tables,
             write_targets=write_targets,
             functions=functions,
@@ -101,7 +131,10 @@ class ConservativeDialect:
     def referenced_objects(self, sql: str) -> tuple[SQLObjectRef, ...]:
         references: list[SQLObjectRef] = []
         seen: set[str] = set()
-        for match in _OBJECT.finditer(sql):
+        # `/* FROM secret */` names no table. Scanning the comment would add a
+        # reference the engine never resolves, and let the text of a comment
+        # decide whether an allow-list matches.
+        for match in _OBJECT.finditer(_blank_comments(sql)):
             qualified = match.group(1)
             if qualified.lower() in seen:
                 continue
@@ -117,52 +150,120 @@ class ConservativeDialect:
         return tuple(references)
 
 
-def _split_statements(sql: str) -> tuple[str, ...]:
-    parts: list[str] = []
-    start = 0
-    quote: str | None = None
-    backslash_escapes = False
+def _spans(sql: str) -> Iterator[tuple[str, int, int]]:
+    """Walk `sql` once, yielding `(kind, start, end)` covering every character.
+
+    `kind` is `"code"`, `"quoted"` for a string or quoted identifier, or
+    `"comment"`. One scanner serves both consumers below, because the previous
+    arrangement — each consumer tracking quote state itself — is how a `;`
+    inside `$$...$$` (#7) and a `\'` inside `E''` (#8) each got read as a
+    separator in one place while being handled correctly in another.
+
+    Unterminated constructs run to the end of the input, the way PostgreSQL
+    treats them: the statement is malformed, and swallowing the rest refuses it
+    rather than splitting it into something that looks executable.
+    """
     index = 0
+    code_start = 0
     while index < len(sql):
         char = sql[index]
-        if quote is not None:
-            if backslash_escapes and char == "\\" and index + 1 < len(sql):
-                # Inside an E'' string a backslash escapes whatever follows,
-                # including the closing quote. Skip the pair so `E'O\'Brien'`
-                # stays one string rather than ending at the escaped quote.
-                index += 1
-            elif char == quote:
-                if index + 1 < len(sql) and sql[index + 1] == quote:
-                    index += 1
-                else:
-                    quote = None
-                    backslash_escapes = False
-        elif char in {"'", '"', "`"}:
-            quote = char
-            backslash_escapes = char == "'" and _has_escape_prefix(sql, index)
-        elif char == "-" and index + 1 < len(sql) and sql[index + 1] == "-":
+        if char in {"'", '"', "`"}:
+            yield "code", code_start, index
+            stop = _end_of_quoted(sql, index)
+            yield "quoted", index, stop
+            index = code_start = stop
+            continue
+        if char == "-" and sql.startswith("--", index):
+            yield "code", code_start, index
             newline = sql.find("\n", index + 2)
-            index = len(sql) if newline == -1 else newline
-        elif char == "/" and index + 1 < len(sql) and sql[index + 1] == "*":
+            # The newline ends the comment and belongs to the code after it.
+            stop = len(sql) if newline == -1 else newline
+            yield "comment", index, stop
+            index = code_start = stop
+            continue
+        if char == "/" and sql.startswith("/*", index):
+            yield "code", code_start, index
             end = sql.find("*/", index + 2)
-            index = len(sql) if end == -1 else end + 1
-        elif char == "$" and _starts_token(sql, index):
+            stop = len(sql) if end == -1 else end + 2
+            yield "comment", index, stop
+            index = code_start = stop
+            continue
+        if char == "$" and _starts_token(sql, index):
             match = _DOLLAR_QUOTE.match(sql, index)
             if match is not None:
-                # A dollar-quoted body is opaque: `$$a; b$$` is one string, not
-                # two statements. Tags close only on an exact match, and an
-                # unterminated one runs to the end the way an unterminated block
-                # comment does — the statement is malformed either way, and
-                # swallowing the rest refuses it rather than splitting it.
+                yield "code", code_start, index
                 tag = match.group(0)
                 end = sql.find(tag, match.end())
-                index = len(sql) if end == -1 else end + len(tag) - 1
-        elif char == ";":
-            parts.append(sql[start:index])
-            start = index + 1
+                stop = len(sql) if end == -1 else end + len(tag)
+                yield "quoted", index, stop
+                index = code_start = stop
+                continue
         index += 1
+    yield "code", code_start, len(sql)
+
+
+def _end_of_quoted(sql: str, index: int) -> int:
+    """The index just past the string or quoted identifier opening at `index`."""
+    quote = sql[index]
+    backslash_escapes = quote == "'" and _has_escape_prefix(sql, index)
+    cursor = index + 1
+    while cursor < len(sql):
+        char = sql[cursor]
+        if backslash_escapes and char == "\\" and cursor + 1 < len(sql):
+            # Inside an E'' string a backslash escapes whatever follows,
+            # including the closing quote, so `E'O\'Brien'` is one string.
+            cursor += 2
+            continue
+        if char == quote:
+            if cursor + 1 < len(sql) and sql[cursor + 1] == quote:
+                cursor += 2
+                continue
+            return cursor + 1
+        cursor += 1
+    return len(sql)
+
+
+def _split_statements(sql: str) -> tuple[str, ...]:
+    """Split on the semicolons that actually separate statements.
+
+    A `;` only separates when it is code: inside a string, a quoted identifier,
+    a dollar-quoted body or a comment it is just a character.
+    """
+    parts: list[str] = []
+    start = 0
+    for kind, span_start, span_end in _spans(sql):
+        if kind != "code":
+            continue
+        offset = sql.find(";", span_start, span_end)
+        while offset != -1:
+            parts.append(sql[start:offset])
+            start = offset + 1
+            offset = sql.find(";", start, span_end)
     parts.append(sql[start:])
     return tuple(parts)
+
+
+def _blank_comments(sql: str) -> str:
+    """Replace each comment with spaces, as the engine's lexer treats them.
+
+    Two reasons this has to happen before tokenizing. A comment is whitespace,
+    so `SELECT ... FOR /* x */ UPDATE` really is a locking clause and has to be
+    seen as one — found by the property tests, confirmed against PostgreSQL 16.
+    And a comment's *contents* are not SQL, so the words inside it must not
+    reach the keyword scan at all.
+
+    Spaces rather than nothing, because a comment is a token boundary:
+    PostgreSQL reads `DEL/**/ETE` as two tokens and rejects it, so gluing the
+    halves into `DELETE` would invent a keyword the engine never saw. The
+    replacement is the same width as what it replaces, so an offset into the
+    result still points at the same character of the original.
+    """
+    if "--" not in sql and "/*" not in sql:
+        return sql
+    return "".join(
+        " " * (end - start) if kind == "comment" else sql[start:end]
+        for kind, start, end in _spans(sql)
+    )
 
 
 def _has_escape_prefix(sql: str, index: int) -> bool:
@@ -181,6 +282,33 @@ def _has_escape_prefix(sql: str, index: int) -> bool:
     if index == 0 or sql[index - 1] not in {"E", "e"}:
         return False
     return _starts_token(sql, index - 1)
+
+
+def _why_not_read_only(words: Sequence[str], functions: Sequence[str]) -> str | None:
+    """Why this `SELECT` is not a read, or `None` when it is one.
+
+    Both answers are things PostgreSQL refuses in a read-only transaction, so
+    the classifier and the engine agree about what counts as a write.
+    """
+    if _locks_rows(words):
+        return "the statement takes row locks with a FOR UPDATE or FOR SHARE clause"
+    writing = sorted({name for name in functions if name.lower() in _WRITING_FUNCTIONS})
+    if writing:
+        return f"the statement calls a function that writes: {', '.join(writing)}"
+    return None
+
+
+def _locks_rows(words: Sequence[str]) -> bool:
+    """Whether a `SELECT` carries a row-locking clause.
+
+    `FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE` and `FOR KEY SHARE` all take
+    locks that PostgreSQL treats as writes. Matching on the word list means a
+    `FOR` inside a string literal counts too, which over-refuses rather than
+    under-refuses — the same trade the rest of this module makes.
+    """
+    return any(
+        word == "FOR" and words[index + 1] in _LOCKING for index, word in enumerate(words[:-1])
+    )
 
 
 def _starts_token(sql: str, index: int) -> bool:

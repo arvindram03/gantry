@@ -49,6 +49,7 @@ docs = [
 dev = [
     "build>=1.2",
     "duckdb>=1.1",
+    "hypothesis>=6.100",
     "mypy>=1.11",
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
@@ -70,6 +71,14 @@ src = ["gantry", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "SIM", "TID", "RUF", "ASYNC"]
+
+[tool.ruff.lint.per-file-ignores]
+# RUF001 flags characters that look like ASCII but are not. In these two files
+# that is the subject matter: the corpus feeds the classifier a non-breaking
+# space, a zero-width space and a fullwidth S precisely because they are
+# confusable, and a linter rewriting them to ASCII would delete the test.
+"tests/test_sql_corpus.py" = ["RUF001"]
+"tests/test_sql_properties.py" = ["RUF001"]
 
 [tool.mypy]
 # `scripts/` is on the path because tests/test_capability_matrix.py imports the

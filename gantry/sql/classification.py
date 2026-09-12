@@ -63,6 +63,13 @@ class SQLClassification:
     conservative: a statement must be recognizably read-only to be treated as
     such. `tables` is everything referenced, `write_targets` only what is
     written, so a policy can allow reading a table it forbids writing.
+
+    A `SELECT` is not automatically a read. `SELECT ... FOR UPDATE` takes row
+    locks and `SELECT nextval(...)` advances a sequence, both of which
+    PostgreSQL refuses in a read-only transaction. When `operation` is `SELECT`
+    and `read_only` is false, `read_only_reason` says which of those it was, so
+    a refusal can explain itself instead of reporting that a SELECT is not
+    allowed by a read-only policy.
     """
 
     operation: SQLOperation
@@ -71,3 +78,4 @@ class SQLClassification:
     write_targets: tuple[SQLObjectRef, ...] = ()
     functions: tuple[str, ...] = ()
     statement_count: int = 1
+    read_only_reason: str | None = None

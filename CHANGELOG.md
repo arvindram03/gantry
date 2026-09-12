@@ -34,6 +34,47 @@ Notable changes. Dates are release dates; the format follows
   3.12 and 3.13, rather than one unpinned one. `mypy`'s `python_version` pin is
   removed so each leg checks under its own interpreter's semantics.
 
+### Security
+
+- `SELECT ... INTO new_table` is no longer classified as a read. It creates a
+  table — PostgreSQL refuses it in a read-only transaction — and a read-only
+  policy admitted it (#9).
+- `SELECT ... FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE` and `FOR KEY SHARE`
+  are no longer classified as reads. The locks are writes as far as the engine
+  is concerned.
+- `SELECT nextval(...)`, `setval(...)` and `dblink_exec(...)` are no longer
+  classified as reads. The list is a floor and not a boundary — a function's
+  body is not in the text — but the gap is narrower than it looks: a read-only
+  session cannot create the function it would need, and an ordinary in-database
+  write is refused inside the read-only transaction even from a
+  `SECURITY DEFINER` function. What escapes is an effect that lands outside the
+  transaction, which is why `dblink_exec` is on the list: writing to another
+  server is permitted by the read-only transaction, and the row survives the
+  rollback.
+- Comments are blanked before the keyword scan, so `SELECT ... FOR /* x */
+  UPDATE` is recognised as the locking clause it is. The words inside a comment
+  no longer reach classification either way, so a comment can neither hide a
+  keyword nor invent a table reference. Found by the new property tests.
+
+### Added
+
+- An adversarial corpus for SQL classification (#9): `tests/test_sql_corpus.py`
+  asserts `(operation, read_only, statement_count)` over comment obfuscation,
+  writing CTEs, quoting, unicode and procedural forms, with one rule — a write
+  must never classify as `read_only=True`.
+- `tests/test_sql_properties.py` generates the cases nobody thought of with
+  Hypothesis: obfuscation never turns a write into a read, a write beside a
+  read is never a read, and arbitrary text never crashes the classifier.
+- `tests/test_sql_corpus_live.py` measures the corpus's ground truth against a
+  real PostgreSQL rather than trusting it. A read-only transaction is the
+  engine's own answer to "does this write", and it corrected two entries that
+  were wrong by inspection. It also asserts that Gantry *refuses* each write at
+  admission — `REJECTED`, before submission — rather than that the statement
+  merely failed, which the read-only transaction would satisfy on its own.
+- `SQLClassification.read_only_reason` says why a `SELECT` is not a read, so a
+  refusal reports the `FOR UPDATE` clause or the writing function instead of
+  "SELECT is not allowed by read-only policy".
+
 ### Fixed
 
 - The statement splitter treats PostgreSQL dollar-quoted strings as opaque, so

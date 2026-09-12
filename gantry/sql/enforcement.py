@@ -17,7 +17,15 @@ def policy_errors(
     if classification.statement_count != 1 and not policy.allow_multiple_statements:
         errors.append("multiple SQL statements are not allowed")
     if policy.read_only and not classification.read_only:
-        errors.append(f"{classification.operation.value} is not allowed by read-only policy")
+        # A SELECT that is not a read has to say why, or the refusal reads as a
+        # bug: "SELECT is not allowed by read-only policy" tells an operator
+        # nothing about the FOR UPDATE clause that caused it.
+        errors.append(
+            f"{classification.operation.value} is not allowed by read-only policy"
+            if classification.read_only_reason is None
+            else f"{classification.operation.value} is not read-only: "
+            f"{classification.read_only_reason}"
+        )
     if policy.read_only and not capabilities.read_only_session:
         errors.append("adapter cannot enforce a read-only session")
     if classification.operation is SQLOperation.UNKNOWN:
