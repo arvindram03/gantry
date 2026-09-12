@@ -273,3 +273,204 @@ async def test_a_provider_that_cannot_measure_a_check_fails_closed(tmp_path: obj
     assert checks["row_count"].ok, "the checks it can evaluate still run"
     assert not checks["null_rate"].supported
     assert not checks["null_rate"].ok, "unsupported fails closed rather than passing"
+
+
+def _seeded(tmp_path: object, *statements: str, name: str = "probe") -> str:
+    """A DuckDB file arranged outside Gantry, and its path.
+
+    Seeded with the driver rather than through a governed connection for two
+    reasons. Tests should not arrange state through the thing under test, and
+    DuckDB refuses a second connection to the same file with a different
+    configuration — so a writable Gantry connection held open would stop the
+    read-only one these tests need.
+    """
+    duckdb = pytest.importorskip("duckdb")
+    path = f"{tmp_path}/{name}.duckdb"
+    connection = duckdb.connect(path)
+    try:
+        for statement in statements:
+            connection.execute(statement)
+    finally:
+        connection.close()
+    return path
+
+
+async def test_the_same_checks_serve_a_query_and_a_materialization(tmp_path: object) -> None:
+    """One library, both paths — the point of the change.
+
+    `row_count` against a materialization asks about the destination it built;
+    against a query it asks about the rows that came back. Same object, same
+    meaning, and the caller does not have to know which protocol they are in.
+    """
+    import gantry
+    import gantry.verify
+    from gantry.result import ResultStatus
+
+    read_path = _seeded(
+        tmp_path, "CREATE TABLE main.people AS SELECT 1 AS id UNION ALL SELECT 2", name="read"
+    )
+    write_path = _seeded(
+        tmp_path, "CREATE TABLE main.people AS SELECT 1 AS id UNION ALL SELECT 2", name="write"
+    )
+    db = gantry.sql.connect("duckdb", path=read_path, read_only=True)
+    writable = gantry.sql.connect("duckdb", path=write_path)
+    checks: list[gantry.verify.MaterializationCheck] = [
+        gantry.verify.row_count(min=1, max=10),
+        gantry.verify.required_columns(["id"]),
+    ]
+
+    queried = await db.query(schemas=["main"], verify=checks)("SELECT id FROM main.people")
+    built = await writable.materialize(sources=["main.*"], destinations=["main.*"], verify=checks)(
+        "CREATE TABLE main.copy AS SELECT id FROM main.people"
+    )
+
+    assert queried.status is ResultStatus.ACCEPTED, queried.failure
+    assert built.status is ResultStatus.ACCEPTED, built.failure
+    for result in (queried, built):
+        assert result.verification is not None
+        assert [c.name for c in result.verification.checks] == ["row_count", "required_columns"]
+    # Both emit evidence, in the same shape.
+    for result in (queried, built):
+        assert result.evidence is not None
+        assert result.evidence.decision == "ACCEPTED"
+        assert result.evidence.checks
+        assert json.loads(result.evidence.to_json())["run_id"] == result.evidence.run_id
+
+
+async def test_a_check_that_cannot_mean_anything_on_a_query_is_unsupported(
+    tmp_path: object,
+) -> None:
+    """The first thing that cannot be the same on both paths.
+
+    `destination_exists` asks about something a query never creates. Answering
+    it against the result set would make it trivially true, which is worse than
+    refusing: a caller would believe a destination was checked.
+    """
+    import gantry
+    import gantry.verify
+    from gantry.failure import FailureKind
+    from gantry.result import ResultStatus
+
+    db = gantry.sql.connect(
+        "duckdb", path=_seeded(tmp_path, "CREATE TABLE main.t AS SELECT 1 AS a"), read_only=True
+    )
+
+    result = await db.query(schemas=["main"], verify=[gantry.verify.destination_exists()])(
+        "SELECT a FROM main.t"
+    )
+
+    assert result.status is ResultStatus.VERIFICATION_FAILED
+    assert result.failure is not None
+    assert result.failure.kind is FailureKind.UNSUPPORTED_VERIFICATION
+    assert result.verification is not None
+    check = result.verification.checks[0]
+    assert not check.supported and not check.ok
+    assert "does not create one" in (check.message or "")
+
+
+async def test_a_truncated_result_cannot_have_its_rows_counted(tmp_path: object) -> None:
+    """The second, and the subtler one.
+
+    `max_rows` clips the answer. Counting what came back would measure the
+    policy rather than the data, and a caller asserting `row_count(min=1000)`
+    against a result capped at 10 would be told something untrue either way it
+    landed. So a truncated result makes the count unsupported.
+    """
+    import gantry
+    import gantry.verify
+    from gantry.result import ResultStatus
+
+    db = gantry.sql.connect(
+        "duckdb",
+        path=_seeded(
+            tmp_path,
+            "CREATE TABLE main.many AS SELECT unnest(generate_series(1, 100)) AS id",
+        ),
+        read_only=True,
+    )
+
+    result = await db.query(schemas=["main"], max_rows=5, verify=[gantry.verify.row_count(min=1)])(
+        "SELECT id FROM main.many"
+    )
+
+    assert result.inline is not None and result.inline.truncated
+    assert result.status is ResultStatus.VERIFICATION_FAILED
+    assert result.verification is not None
+    check = result.verification.checks[0]
+    assert not check.supported
+    assert "truncated" in (check.message or "")
+
+
+async def test_a_query_result_carries_the_same_evidence_shape(tmp_path: object) -> None:
+    """Spec §7: one model across surfaces, not one per surface."""
+    import gantry
+    import gantry.verify
+
+    db = gantry.sql.connect(
+        "duckdb", path=_seeded(tmp_path, "CREATE TABLE main.t AS SELECT 1 AS id"), read_only=True
+    )
+
+    result = await db.query(schemas=["main"], verify=[gantry.verify.row_count(min=1)])(
+        "SELECT id FROM main.t"
+    )
+
+    evidence = result.evidence
+    assert evidence is not None
+    assert evidence.operation == "query"
+    assert evidence.proposal_hash is not None
+    names = {item.name for item in evidence.observations}
+    assert {"rows_returned", "truncated", "row_count"} <= names
+    # Whether the answer was the whole answer changes what every other
+    # observation means, so it is recorded rather than implied.
+    truncated = evidence.observation("truncated")
+    assert truncated is not None and truncated.value is False
+    assert json.loads(evidence.to_json())["operation"] == "query"
+
+
+async def test_execution_failure_is_not_overridden_by_result_set_checks(
+    tmp_path: object,
+) -> None:
+    """Re-deciding can only take acceptance away, never grant it."""
+    import gantry
+    import gantry.verify
+    from gantry.result import ResultStatus
+
+    db = gantry.sql.connect(
+        "duckdb", path=_seeded(tmp_path, "CREATE TABLE main.t AS SELECT 1 AS id"), read_only=True
+    )
+
+    result = await db.query(schemas=["main"], verify=[gantry.verify.row_count(min=0)])(
+        "SELECT * FROM main.no_such_table"
+    )
+
+    assert result.status is not ResultStatus.ACCEPTED
+    assert result.status is not ResultStatus.VERIFICATION_FAILED
+
+
+async def test_a_null_rate_over_no_rows_is_not_a_null_rate_of_zero(tmp_path: object) -> None:
+    """An empty result has nothing to be null in.
+
+    Reporting zero would read as "this column is fully populated" when the
+    truth is that nothing was measured — the most misleading direction a check
+    can fail in, because it looks like a pass.
+    """
+    import gantry
+    import gantry.verify
+    from gantry.result import ResultStatus
+
+    db = gantry.sql.connect(
+        "duckdb",
+        path=_seeded(tmp_path, "CREATE TABLE main.t AS SELECT 1 AS id WHERE false"),
+        read_only=True,
+    )
+
+    result = await db.query(
+        schemas=["main"], verify=[gantry.verify.null_rate(column="id", max=0.01)]
+    )("SELECT id FROM main.t")
+
+    assert result.inline is not None and result.inline.rows == ()
+    assert result.status is ResultStatus.VERIFICATION_FAILED
+    assert result.verification is not None
+    check = result.verification.checks[0]
+    assert not check.supported, "no rows measured is not a measurement of zero"
+    assert not check.ok

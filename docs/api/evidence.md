@@ -24,6 +24,32 @@ Gantry took at the destination.
     is one integer. Gantry is not the data plane, and evidence is not a copy of
     the data.
 
+## The same checks on both paths
+
+`gantry.verify` serves a query and a materialization. A materialization is
+checked against the destination it created; a query against the rows it
+returned, described as a table so one check means one thing.
+
+```python
+checks = [gantry.verify.row_count(min=1), gantry.verify.required_columns(["id"])]
+
+await db.query(schemas=["analytics"], verify=checks)(sql)
+await db.materialize(sources=["analytics.*"], destinations=["reporting.*"], verify=checks)(sql)
+```
+
+Two cases cannot be the same, and both fail closed rather than pretending:
+
+- `destination_exists` and `output_exists` ask about something a query never
+  creates, so on a query they report themselves unsupported. Answering them
+  against the result set would make them trivially true, and a caller would
+  believe a destination had been checked.
+- A result truncated by `max_rows` describes the rows returned, not the rows
+  matched, so the count-based checks are unsupported there. Counting what came
+  back would measure the policy rather than the data.
+
+Both arrive as `FailureKind.UNSUPPORTED_VERIFICATION`, which is distinct from a
+check that ran and failed.
+
 ## Durable runs
 
 Evidence that lives only in the calling process answers nothing later. The run

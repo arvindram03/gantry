@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from gantry.evidence import EvidenceBundle
 from gantry.failure import Failure
 from gantry.handle import ExecutionHandle
 from gantry.metrics import ExecutionMetrics
@@ -28,6 +29,8 @@ class SQLResult:
     metrics: ExecutionMetrics = field(default_factory=ExecutionMetrics)
     verification: VerificationResult | None = None
     failure: Failure | None = None
+    evidence: EvidenceBundle | None = None
+    """What Gantry observed while deciding — the same shape a materialization emits."""
 
     @property
     def ok(self) -> bool:

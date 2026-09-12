@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from gantry.artifact import Artifact
 from gantry.context import Context
@@ -100,6 +100,7 @@ class VerificationResult:
         )
 
 
+@runtime_checkable
 class Verifier(Protocol):
     """A check run after the engine succeeds, deciding whether to accept.
 

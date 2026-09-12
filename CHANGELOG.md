@@ -18,6 +18,13 @@ Notable changes. Dates are release dates; the format follows
   `run.render()` lays it out for a person. SQLite-backed by default, in memory
   until a caller configures a store, because writing a file into someone's
   working directory on import is not a default worth having.
+- **`db.query(verify=...)` takes the same checks as `db.materialize(...)`.** The
+  `gantry.verify` library is evaluated against the rows a query returned,
+  described as a table, so `row_count` means one thing on both paths. Query
+  results carry `evidence` in the same shape too. Two checks cannot mean the
+  same thing and say so instead of guessing: `destination_exists` on a query,
+  and any count-based check on a result truncated by `max_rows`, both report
+  `UNSUPPORTED_VERIFICATION`.
 - `gantry.verify.null_rate(column=..., max=...)`, measured at the destination
   by the provider. This is the check `row_count` cannot stand in for: a query
   that runs, produces the expected number of rows, and joins wrongly, so the

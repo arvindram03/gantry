@@ -21,7 +21,15 @@ if TYPE_CHECKING:
 
 @runtime_checkable
 class MaterializationCheck(Protocol):
-    """A trusted check evaluated against destination metadata."""
+    """A trusted check evaluated against a table's metadata.
+
+    The same checks serve a materialization and a query. A materialization is
+    checked against the destination it created; a query is checked against the
+    shape of the rows it returned, described as a table so one check can do
+    both. Two of them do need a destination and say so with
+    `requires_destination`, which makes them unsupported on a query rather than
+    quietly true.
+    """
 
     def evaluate(self, table: Table | None) -> CheckResult: ...
 
@@ -29,6 +37,7 @@ class MaterializationCheck(Protocol):
 @dataclass(frozen=True, slots=True)
 class DestinationExists:
     requires_row_count: ClassVar[bool] = False
+    requires_destination: ClassVar[bool] = True
 
     def evaluate(self, table: Table | None) -> CheckResult:
         exists = table is not None
@@ -44,6 +53,7 @@ class DestinationExists:
 @dataclass(frozen=True, slots=True)
 class OutputExists:
     requires_row_count: ClassVar[bool] = False
+    requires_destination: ClassVar[bool] = True
 
     def evaluate(self, table: Table | None) -> CheckResult:
         exists = table is not None
@@ -80,7 +90,7 @@ class RowCount:
                 False,
                 {"min": self.minimum, "max": self.maximum},
                 actual_value,
-                "destination row count is unavailable",
+                "row count is unavailable",
                 supported=False,
             )
         actual = actual_value
@@ -90,10 +100,7 @@ class RowCount:
         if ok and self.maximum is not None:
             ok = actual <= self.maximum
         expected = {"min": self.minimum, "max": self.maximum}
-        if not ok:
-            message = f"destination row count {actual} is outside the accepted range"
-        else:
-            message = None
+        message = None if ok else f"row count {actual} is outside the accepted range"
         return CheckResult("row_count", ok, expected, actual, message)
 
 
@@ -182,7 +189,7 @@ class NullRate:
                 False,
                 expected,
                 None,
-                "destination does not exist",
+                "there is nothing to measure",
             )
         rates = table.metadata.get("null_rates")
         observed = rates.get(self.column) if isinstance(rates, Mapping) else None
