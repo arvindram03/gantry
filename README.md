@@ -14,8 +14,16 @@ Gantry is the layer between your agent and your database. Your application holds
 credentials and writes the policy and trusted checks. The agent gets a tool
 whose inputs are `sql` and an optional declarative `verify` commitment.
 
-Every statement is classified, checked against the policy, validated by the engine,
-bounded, executed, and **verified** before its result is marked accepted.
+Four questions, answered in this order, for every statement the agent writes:
+
+| | |
+| --- | --- |
+| **Policy** | may this actor do this, to these tables, in this environment? |
+| **Confirmation** | should a human be told before it happens? |
+| **Execution** | did it run? |
+| **Verification** | can the result be believed? |
+
+Each answer lands on a durable **run** you can read back months later.
 
 ```bash
 pip install data-gantry
@@ -52,23 +60,13 @@ schema, and an async handler — so it drops into any agent loop:
 ```python
 tool = query.tool()
 
-# Anthropic, OpenAI, LangChain, or your own loop:
-schema = {
-    "name": tool.name,  # "query_sql"
-    "description": tool.description,
-    "input_schema": tool.input_schema,  # sql + allowlisted verify checks
-}
+tool.name, tool.description, tool.input_schema  # Anthropic, OpenAI, LangChain, or your own loop
 
-# When the model calls it:
-result = await tool.invoke(
-    {
-        "sql": "SELECT plan, COUNT(*) ...",
-        "verify": [{"type": "not_empty"}],
-    }
-)
+run = await tool.invoke({"sql": "SELECT plan, COUNT(*) ...", "verify": [{"type": "not_empty"}]})
 
-result.status  # ACCEPTED
-result.inline.rows  # (('free', 1250), ('team', 1250), ...)
+run.status  # RunStatus.ACCEPTED
+run.rows  # (('free', 1250), ('team', 1250), ...)
+run.id  # "run_01M2C…" — readable long after the conversation ends
 ```
 
 ## What the agent cannot do
@@ -80,14 +78,20 @@ The agent sees the SQL field and a constrained verification vocabulary. It canno
 - **reach the connection or the credentials** — those stay in your code, never in the tool schema
 - **turn a read into a write** — `query.tool()` refuses to be created unless the policy is read-only
 - **smuggle in a second statement** — a multi-statement submission is refused as a batch
-- **be trusted because the engine said yes** — a run that produced the wrong table comes back `VERIFICATION_FAILED`, not success
+- **be trusted because the engine said yes** — a run that produced the wrong table comes back `REJECTED`, not success
+- **wave through its own sensitive operation** — confirmation is a separate host-side call, absent from every tool schema
 
 "It ran" and "it can be believed" are different questions, and only the first is the
-engine's to answer. `result.status is gantry.ResultStatus.ACCEPTED` means both.
+engine's to answer. `run.ok` means both.
 
 ## What you can enforce
 
-Everything below is set once, in your code, on `db.query(...)`:
+Two layers, both trusted configuration, and they compose toward *less* authority —
+attaching a policy can never widen what a call site already bounded.
+
+### On the operation
+
+Set once, in your code, on `db.query(...)`:
 
 | Policy | Default | What it does |
 | --- | --- | --- |
@@ -109,6 +113,107 @@ of silently passing. The
 [capability matrix](https://arvindram03.github.io/gantry/api/capabilities/) is
 generated from the adapter source and lists which backend enforces what.
 
+### As a reusable policy
+
+One policy, written once, for every engine and every operation — who may do what, to
+which tables, in which environment:
+
+```python
+policy = gantry.Policy(
+    name="data-agents",
+    rules=[
+        gantry.allow.query(actors=["research-agent"], sources=["analytics.*"]),
+        gantry.allow.materialize(sources=["raw.*"], destinations=["agent_scratch.*"]),
+        gantry.deny.materialize(destinations=["prod.*"]),
+    ],
+)
+
+db = gantry.sql.connect("postgres", url=DATABASE_URL, policy=policy)
+mongo = gantry.nosql.connect("mongodb", uri=URI, database="analytics", policy=policy)
+stream = gantry.stream.connect("flink", endpoint=GATEWAY, policy=policy)
+```
+
+- **Deny wins, and silence denies.** No rule matched means refused, so a policy is a
+  list of what may happen rather than a list of what may not.
+- **Gantry decides what the proposal touches**, not the agent, and every resource is
+  authorized on its own. Allowing `analytics.*` does not authorize the `finance` table
+  joined to it; a `$lookup` reaching an unauthorized collection, or an `INSERT` hidden
+  in a query, is refused before anything runs.
+- **The actor is yours to assert.** It comes from
+  `gantry.actor.context(...)` in your code, never from a tool argument — an agent
+  that could name itself could name someone else.
+- **Refusals are structured.** `run.admission.codes` is
+  `("DESTINATION_DENIED",)`, not a string to grep, and the exact policy version that
+  decided is recorded on the run.
+
+## Ask me first
+
+Some work is allowed and still deserves a question. A rule can say so without
+turning the answer into a refusal:
+
+```python
+gantry.allow.materialize(
+    sources=["raw.*"],
+    destinations=["prod.*"],
+    require_confirmation=True,
+    confirmation_message="This will write to production data.",
+)
+```
+
+The run parks, durable and allowed, having touched nothing — no connection opened,
+no job submitted, no table created:
+
+```python
+run = await build(sql)
+
+if run.status is gantry.RunStatus.AWAITING_CONFIRMATION:
+    print(run.confirmation.message)  # "This will write to production data."
+    run = await gantry.runs.confirm(run.id)  # or gantry.runs.decline(run.id)
+```
+
+The agent learns that it must ask and gets no way to answer: `gantry.runs.confirm`
+appears in no tool schema, and a tool call carrying `confirmed=True` is refused
+rather than ignored. Confirming resumes the same run and the same statement;
+declining ends it without executing.
+
+This is a user-interaction gate, not an authentication one. Gantry records that your
+application supplied confirmation before execution — it never claims a particular
+authenticated person approved anything, which is why no field names one.
+
+## Every run is a record you can read back
+
+```python
+gantry.runs.configure(gantry.runs.SQLiteRunStore(".gantry/runs.db"))
+
+# …in another process, holding only the id
+print(gantry.runs.get(run_id).render())
+```
+
+```text
+Run run_01M2CRNRC9CH6MATYFFQCABRA9
+
+Actor
+  agent:research-agent
+
+Operation
+  materialize
+
+Admission
+  ✗ refused
+  policy: data-agents
+    ✓ read raw.orders
+    ✗ write prod.orders
+    DESTINATION_DENIED
+      writing prod.orders is denied by rule deny-materialize-2
+
+Decision
+  POLICY_REJECTED
+```
+
+Who asked, what they asked for, which policy version allowed or refused it, what the
+engine did, which checks ran, and what was decided — without the conversation that
+produced it.
+
 ## Supported systems
 
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-4169E1?style=for-the-badge&logo=postgresql&logoColor=white)](https://arvindram03.github.io/gantry/sql/)
@@ -121,29 +226,20 @@ generated from the adapter source and lists which backend enforces what.
 [![Snowflake](https://img.shields.io/badge/Snowflake-29B5E8?style=for-the-badge&logo=snowflake&logoColor=white)](https://arvindram03.github.io/gantry/sql/)
 [![MongoDB](https://img.shields.io/badge/MongoDB-47A248?style=for-the-badge&logo=mongodb&logoColor=white)](https://arvindram03.github.io/gantry/nosql/)
 
-| | What Gantry does there |
-| --- | --- |
-| **PostgreSQL**, Neon, Supabase | Governed queries, bounded results, materialization |
-| **MySQL** | Governed queries and materialization, with an enforced timeout |
-| **DuckDB** | Governed queries, local materialization |
-| **Apache Flink** | Batch and streaming jobs, durable handles, cancellation |
-| **BigQuery** \* | Governed queries, output references, materialization |
-| **Snowflake** \* | Governed queries, reconnectable jobs |
-| **MongoDB** | Governed queries/pipelines, bounded results, `$out`/`$merge` materialization |
+Governed queries and materialization everywhere; batch and streaming jobs with
+durable handles on Flink; `$out`/`$merge` on MongoDB. One policy covers all of them.
 
-\* The adapter ships and declares its capabilities, but has not yet been exercised
-against a live account. Everything else is tested against a real engine on every change.
+BigQuery and Snowflake adapters ship and declare their capabilities but have not yet
+been exercised against a live account. Everything else is tested against a real
+engine on every change.
 
-A policy is only admitted when the adapter can actually enforce it — asking for
-`read_only=True` on a backend that cannot hold a read-only session is refused rather
-than quietly trusted. The [capability matrix](https://arvindram03.github.io/gantry/api/capabilities/)
-is generated from the adapter source, so it cannot drift from what the code does.
+Asking for `read_only=True` on a backend that cannot hold a read-only session is
+refused rather than quietly trusted.
 
 ## Letting an agent write
 
-Reads are the easy half. When an agent needs to produce data, Gantry gives it a
-create-only path — one `CREATE TABLE AS`, to a destination you named, that must not
-already exist:
+Reads are the easy half. To produce data the agent gets a create-only path — one
+`CREATE TABLE AS`, to a destination you named, that must not already exist:
 
 ```python
 build = db.materialize(
@@ -155,33 +251,24 @@ build = db.materialize(
 tools = [query.tool(), build.tool()]
 ```
 
-No `DROP`, no `REPLACE`, no writing outside `reporting`, and no accepted result
-until the destination has been checked. At invocation time the agent can make
-the contract stricter, for example `verify=[gantry.verify.not_empty()]` in
-Python or `{"verify": [{"type": "not_empty"}]}` through the tool.
+No `DROP`, no `REPLACE`, no writing outside `reporting`, and no accepted result until
+the destination has been checked. The agent can make the contract *stricter* at
+invocation time — `{"verify": [{"type": "not_empty"}]}` — and never looser.
 
 ## It's a library, not a proxy — your data doesn't route through it
 
 You add an import, not a service. Gantry decides whether a statement may run and
-whether its result can be believed — it is not a stop on the route your data takes
-to get where it is going.
+whether its result can be believed — it is not a stop on the route your data takes.
 
-- **Bulk output never passes through Gantry.** The engine writes where it was told to,
-  and you get an `OutputRef` — a URI to the result. Rows are carried back inline only
-  up to the `max_rows` you set, so what crosses the boundary is a bounded sample you
-  asked for rather than the whole result set.
-- **There is no server.** It is a library in your process. Nothing to deploy, no proxy
-  in front of the database, no broker between the agent and the engine.
-- **Credentials stay in your code.** What Gantry hands the engine adapter deliberately
-  excludes provider configuration and credentials; what it hands the agent is a JSON
-  schema containing SQL and only the verification primitives that operation supports.
+- **Bulk output never passes through it.** The engine writes where it was told to and
+  you get an `OutputRef`. Only the `max_rows` you set come back inline.
+- **There is no server.** A library in your process: nothing to deploy, no proxy in
+  front of the database, no broker between the agent and the engine.
+- **Credentials stay in your code.** What reaches the adapter excludes provider
+  configuration; what reaches the agent is a JSON schema of SQL and verification.
 - **Long jobs are handles, not held-open calls.** `submit()` returns an
-  `ExecutionHandle` carrying the engine's own job id. Any process holding those four
-  fields can poll it, read its metrics, and cancel it — no local run record, no live
-  connection to whichever process started it.
-
-That last one is the difference between a tool call and a job. A forty-minute Flink
-job does not need the agent, or the process that launched it, to still be alive.
+  `ExecutionHandle` carrying the engine's own job id, so a forty-minute Flink job does
+  not need the agent — or the process that launched it — to still be alive.
 
 ---
 
