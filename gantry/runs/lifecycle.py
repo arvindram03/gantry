@@ -17,6 +17,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 
 from gantry.actor import ActorRef, current_actor
+from gantry.confirmation.model import ConfirmationRecord, ConfirmationRequirement
 from gantry.evidence import EvidenceBundle
 from gantry.failure import Failure, FailureKind
 from gantry.handle import ExecutionHandle
@@ -143,6 +144,31 @@ class RunRecorder:
             inputs=tuple(inputs) or (() if request is None else tuple(request.inputs)),
         )
 
+    def awaiting_confirmation(self, requirement: ConfirmationRequirement) -> Run:
+        """Parked: allowed, but the host should ask the user first.
+
+        Persisted before the caller gets the run back, so "no external work
+        begins before the confirmation state is durable" is a property of the
+        ordering rather than of anyone remembering it.
+        """
+        return self._save(
+            RunStatus.AWAITING_CONFIRMATION,
+            confirmation=ConfirmationRecord.required(
+                self.run.id,
+                requirement,
+                proposal_hash=None if self.run.proposal is None else self.run.proposal.hash,
+            ),
+        )
+
+    def resumed(self, run: Run) -> None:
+        """Adopt the confirmed run, so later transitions build on it.
+
+        The confirmation was written by the host through the run service, not by
+        this recorder. Without this the next `_save` would overwrite the record
+        of having been confirmed with a copy that predates it.
+        """
+        self.run = run
+
     def running(self, handle: ExecutionHandle | None) -> Run:
         """Record the engine's own id as soon as there is one to record."""
         return self._save(
@@ -253,6 +279,7 @@ def run_from_evidence(
     failure: Failure | None = None,
     decision: PolicyDecision | None = None,
     request: PolicyRequest | None = None,
+    recorder: RunRecorder | None = None,
 ) -> Run | None:
     """Record a terminal run for an operation that reports once, at the end.
 
@@ -261,28 +288,34 @@ def run_from_evidence(
     completed together. The record is the same shape either way — what differs
     is how many times it was written, which is a property of the operation
     rather than of the model.
+
+    Pass `recorder` when the run already exists — an operation that had to be
+    admitted, or parked for confirmation, before anything ran. Then this
+    finishes that run rather than opening a second one for the same work.
     """
     if evidence is None:
         return None
-    recorder = RunRecorder(
-        kind=kind,
-        engine=engine,
-        provider=provider,
-        proposal=None,
-        actor=current_actor(),
-    )
-    recorder.run = replace(
-        recorder.run,
-        proposal=ProposalRecord(hash=evidence.proposal_hash or "", kind="sql")
-        if evidence.proposal_hash
-        else None,
-        inputs=tuple(ResourceRef(system=engine, resource=name) for name in evidence.inputs),
-    )
-    if request is not None:
-        # The policy decision that let this run happen. Recorded even though the
-        # run is written once, because "allowed by nothing in particular" and
-        # "allowed by data-agents v3" are different facts about the same run.
-        recorder.admitted(request=request, decision=decision)
+    if recorder is None:
+        recorder = RunRecorder(
+            kind=kind,
+            engine=engine,
+            provider=provider,
+            proposal=None,
+            actor=current_actor(),
+        )
+        recorder.run = replace(
+            recorder.run,
+            proposal=ProposalRecord(hash=evidence.proposal_hash or "", kind="sql")
+            if evidence.proposal_hash
+            else None,
+            inputs=tuple(ResourceRef(system=engine, resource=name) for name in evidence.inputs),
+        )
+        if request is not None:
+            # The policy decision that let this run happen. Recorded even though
+            # the run is written once, because "allowed by nothing in
+            # particular" and "allowed by data-agents v3" are different facts
+            # about the same run.
+            recorder.admitted(request=request, decision=decision)
     if status is ResultStatus.VERIFICATION_UNSUPPORTED:
         return recorder.rejected(
             ("a required check could not be evaluated",),

@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 
+from gantry.confirmation.model import NOT_REQUIRED, ConfirmationRequirement
+
 
 class PolicyReasonCode(StrEnum):
     """Why a decision came out the way it did, in machine-readable form.
@@ -63,6 +65,10 @@ class PolicyDecision:
 
     Carried onto the run whether it allowed or refused. An allow that records
     nothing is indistinguishable later from an operation nobody checked.
+
+    `confirmation` is a second, independent answer: the operation is allowed,
+    and the host should tell the user before it happens. A denial never carries
+    one — there is nothing to confirm about work that will not run.
     """
 
     allowed: bool
@@ -70,6 +76,7 @@ class PolicyDecision:
     policy_version: str
     matched_rules: tuple[str, ...] = ()
     reasons: tuple[PolicyReason, ...] = ()
+    confirmation: ConfirmationRequirement = NOT_REQUIRED
     evaluated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     @property
@@ -86,6 +93,7 @@ class PolicyDecision:
             "policy_version": self.policy_version,
             "matched_rules": list(self.matched_rules),
             "reasons": [reason.as_dict() for reason in self.reasons],
+            "confirmation": self.confirmation.as_dict(),
             "evaluated_at": self.evaluated_at.isoformat(),
         }
 

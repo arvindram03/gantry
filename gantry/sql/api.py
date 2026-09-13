@@ -17,11 +17,11 @@ from gantry.execution import Execution, ExecutionResult, ExecutionState, Validat
 from gantry.failure import Failure, FailureKind
 from gantry.handle import ExecutionHandle
 from gantry.output import OutputKind, OutputRef
-from gantry.policy.evaluator import evaluate
 from gantry.policy.model import Policy
 from gantry.result import Result, ResultStatus
 from gantry.runs.lifecycle import RunRecorder
 from gantry.runs.model import OperationKind, QueryResultRef, ResourceRef, Run
+from gantry.runs.service import gate
 from gantry.runs.status import RunStatus
 from gantry.runtime import ControlPlane
 from gantry.sql.adapter import SQLAdapter
@@ -269,14 +269,39 @@ class SQLConnection:
         # Authority, before anything external happens. What the SQL touches
         # comes from the dialect, not from the proposal's own account of itself.
         request = query_request(sql, dialect=self._dialect, provider=self.provider, policy=policy)
-        if self._policy is not None:
-            decision = evaluate(self._policy, request)
-            if not decision.allowed:
-                return recorder.policy_rejected(decision, request)
-            recorder.admitted(request=request, decision=decision)
-        else:
-            recorder.admitted(request=request)
 
+        async def run() -> Run:
+            return await self._execute_query(
+                sql,
+                policy=policy,
+                context=context,
+                recorder=recorder,
+                verifiers=verifiers,
+                trusted_checks=trusted_checks,
+                agent_checks=agent_checks_validated,
+                agent_verify=agent_verify,
+            )
+
+        return await gate(recorder, policy=self._policy, request=request, resume=run)
+
+    async def _execute_query(
+        self,
+        sql: str,
+        *,
+        policy: SQLPolicy,
+        context: Context | None,
+        recorder: RunRecorder,
+        verifiers: Sequence[Verifier],
+        trusted_checks: Sequence[MaterializationCheck],
+        agent_checks: Sequence[MaterializationCheck],
+        agent_verify: Sequence[MaterializationCheck],
+    ) -> Run:
+        """Everything after admission: execute, verify, decide, record.
+
+        Split out so the gate can hold it back. A confirmation that parks the
+        run parks exactly this, and resuming runs it unchanged — the same
+        proposal against the same already-admitted run.
+        """
         result = await self.execute(sql, policy=policy, context=context, verify=verifiers)
         recorder.running(result.handle)
         inline = _find_inline(result, policy.max_rows)
@@ -285,12 +310,12 @@ class SQLConnection:
             base,
             (
                 *_result_set_checks(trusted_checks, inline, CheckSource.TRUSTED),
-                *_result_set_checks(agent_checks_validated, inline, CheckSource.AGENT),
+                *_result_set_checks(agent_checks, inline, CheckSource.AGENT),
             ),
         )
         status, failure = _decide(result, verification)
         evidence = _query_evidence(
-            sql, result, inline, verification, status, agent_verify=agent_checks_validated
+            sql, result, inline, verification, status, agent_verify=agent_verify
         )
         if status is ResultStatus.REJECTED:
             return recorder.rejected(

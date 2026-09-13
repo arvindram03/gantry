@@ -22,6 +22,17 @@ class RunStatus(StrEnum):
     POLICY_REJECTED = "POLICY_REJECTED"
     """Refused before execution. Nothing ran."""
 
+    AWAITING_CONFIRMATION = "AWAITING_CONFIRMATION"
+    """Policy allowed it, and a rule asked that the user be told first.
+
+    Not a refusal and not terminal: the run is parked, nothing external has
+    started, and it resumes if the host confirms. A run left here forever is the
+    honest record of a question nobody answered.
+    """
+
+    CONFIRMATION_DECLINED = "CONFIRMATION_DECLINED"
+    """The host said the user declined. Terminal, and nothing ran."""
+
     VERIFICATION_CONFLICT = "VERIFICATION_CONFLICT"
     """The verification contract contradicted itself, so no outcome could satisfy it."""
 
@@ -45,6 +56,11 @@ class RunStatus(StrEnum):
     state — not that it has finished, and not that it will stay healthy."""
 
     @property
+    def awaiting(self) -> bool:
+        """Parked, waiting on someone outside Gantry. Not terminal, not running."""
+        return self is RunStatus.AWAITING_CONFIRMATION
+
+    @property
     def terminal(self) -> bool:
         return self in _TERMINAL
 
@@ -56,6 +72,7 @@ class RunStatus(StrEnum):
 _TERMINAL = frozenset(
     {
         RunStatus.POLICY_REJECTED,
+        RunStatus.CONFIRMATION_DECLINED,
         RunStatus.VERIFICATION_CONFLICT,
         RunStatus.EXECUTION_FAILED,
         RunStatus.VERIFICATION_UNSUPPORTED,

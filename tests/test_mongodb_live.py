@@ -410,3 +410,75 @@ async def test_policy_refuses_an_out_and_mongodb_keeps_no_collection() -> None:
     assert allowed.status is RunStatus.ACCEPTED
     assert "scratch_rollup" in names, "an authorized write must still happen"
     assert "prod_rollup" not in names, "a denied write must leave nothing behind"
+
+
+async def test_confirmation_holds_a_write_back_until_the_host_answers() -> None:
+    """A parked MongoDB write must leave no collection behind.
+
+    Asked of MongoDB itself rather than of the run: the collection either exists
+    or it does not, and while the run is parked it must not.
+    """
+    import importlib
+
+    from gantry.actor import actor, context
+    from gantry.confirmation import ConfirmationStatus
+    from gantry.runs.status import RunStatus
+
+    pytest.importorskip("pymongo")
+    if not await _reachable():
+        pytest.skip(f"no MongoDB at {URI}")
+    pymongo = importlib.import_module("pymongo")
+    client = pymongo.AsyncMongoClient(URI)
+    for name in ("confirm_rollup", "declined_rollup"):
+        await client[DATABASE].drop_collection(name)
+
+    policy = gantry.Policy(
+        name="ask-before-writing",
+        rules=[
+            gantry.allow.query(
+                sources=[f"{DATABASE}.orders"],
+                destinations=[f"{DATABASE}.*"],
+                require_confirmation=True,
+                confirmation_code="SENSITIVE_DESTINATION",
+                confirmation_message="This writes a derived collection.",
+            )
+        ],
+    )
+    db = gantry.nosql.connect("mongodb", uri=URI, database=DATABASE, policy=policy)
+    query = db.query(
+        read_only=False,
+        collections=["orders", "confirm_rollup", "declined_rollup"],
+        max_documents=10,
+        timeout=30,
+    )
+    rollup: list[Mapping[str, object]] = [
+        {"$match": {"status": "open"}},
+        {"$group": {"_id": "$region", "total": {"$sum": "$amount"}}},
+    ]
+
+    try:
+        with context(actor=actor("agent", "etl-agent")):
+            parked = await query("orders", [*rollup, {"$out": "confirm_rollup"}])
+            refused = await query("orders", [*rollup, {"$out": "declined_rollup"}])
+        while_waiting = set(await client[DATABASE].list_collection_names())
+
+        confirmed = await gantry.runs.confirm(parked.id, metadata={"channel": "chat"})
+        declined = await gantry.runs.decline(refused.id)
+        after = set(await client[DATABASE].list_collection_names())
+    finally:
+        await client.close()
+
+    assert parked.status is RunStatus.AWAITING_CONFIRMATION
+    assert parked.confirmation is not None
+    assert parked.confirmation.codes == ("SENSITIVE_DESTINATION",)
+    assert "confirm_rollup" not in while_waiting, "a parked write must not have happened"
+    assert "declined_rollup" not in while_waiting
+
+    assert confirmed.id == parked.id
+    assert confirmed.status is RunStatus.ACCEPTED
+    assert confirmed.confirmation is not None
+    assert confirmed.confirmation.status is ConfirmationStatus.CONFIRMED
+    assert declined.status is RunStatus.CONFIRMATION_DECLINED
+
+    assert "confirm_rollup" in after, "a confirmed write must actually happen"
+    assert "declined_rollup" not in after, "a declined write must never happen"

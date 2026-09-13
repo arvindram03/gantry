@@ -16,12 +16,11 @@ from gantry.handle import ExecutionHandle
 from gantry.metrics import ExecutionMetrics
 from gantry.nosql.capabilities import NoSQLCapabilities
 from gantry.nosql.inspection import materialize_request
-from gantry.nosql.pipeline import CollectionRef, Pipeline, classify_pipeline
+from gantry.nosql.pipeline import CollectionRef, Pipeline, classify_pipeline, pipeline_text
 from gantry.nosql.policy import NoSQLPolicy
 from gantry.nosql.result import NoSQLResult
 from gantry.nosql.verify import CollectionSnapshot, DocumentCheck
 from gantry.output import OutputKind, OutputRef
-from gantry.policy.evaluator import evaluate
 from gantry.policy.model import Policy
 from gantry.policy.request import PolicyRequest
 from gantry.result import ResultStatus
@@ -313,7 +312,13 @@ class NoSQLMaterializer:
         self._agent_checks[handle.gantry_id] = agent_checks  # type: ignore[assignment]
         return handle
 
-    async def wait(self, handle: ExecutionHandle, *, poll_interval_seconds: float = 1.0) -> Run:
+    async def wait(
+        self,
+        handle: ExecutionHandle,
+        *,
+        poll_interval_seconds: float = 1.0,
+        recorder: object | None = None,
+    ) -> Run:
         plan = self._plans.get(handle.gantry_id) or _plan_from_handle(handle)
         nosql_result = await self._connection.wait(
             handle, poll_interval_seconds=poll_interval_seconds
@@ -342,7 +347,7 @@ class NoSQLMaterializer:
                     )
                 ),
             )
-            return _recorded(result)
+            return _recorded(result, recorder=recorder)
         verification = await self._verification(plan.destination, agent_checks)
         unsupported = verification.unsupported_checks
         agent_unsupported = any(check.source == CheckSource.AGENT for check in unsupported)
@@ -389,7 +394,7 @@ class NoSQLMaterializer:
                 agent_checks,
             ),
         )
-        return _recorded(result)
+        return _recorded(result, recorder=recorder)
 
     async def status(self, handle: ExecutionHandle) -> object:
         return await self._connection.status(handle)
@@ -404,37 +409,67 @@ class NoSQLMaterializer:
         *,
         verify: Sequence[DocumentCheck] = (),
     ) -> Run:
+        from gantry.runs.lifecycle import RunRecorder
+        from gantry.runs.model import OperationKind
+        from gantry.runs.service import gate
+
+        # Recorded before anything reaches MongoDB, so a refused or parked
+        # proposal still leaves a run, and a confirmed one resumes that same run.
+        recorder = RunRecorder(
+            kind=OperationKind.MATERIALIZE,
+            engine="mongodb",
+            provider=self._connection.provider,
+            proposal=pipeline_text(collection, pipeline),
+            proposal_kind="mongodb",
+            agent_verification=tuple(type(check).__name__ for check in verify),
+        )
+
         # Authority first, from the classified pipeline. A refusal here means
         # nothing was submitted to MongoDB.
         try:
             request = self._policy_request(collection, pipeline)
         except (TypeError, ValueError) as error:
-            return _refuse(error, RunStatus.POLICY_REJECTED)
+            return _refuse(error, RunStatus.POLICY_REJECTED, recorder=recorder)
         except MaterializationError as error:
-            return _refuse(error.failure.message, RunStatus.POLICY_REJECTED, error.failure)
-        decision = None
-        if self._connection.policy is not None:
-            decision = evaluate(self._connection.policy, request)
-            if not decision.allowed:
-                from gantry.runs.lifecycle import RunRecorder
-                from gantry.runs.model import OperationKind
+            return _refuse(
+                error.failure.message,
+                RunStatus.POLICY_REJECTED,
+                error.failure,
+                recorder=recorder,
+            )
 
-                recorder = RunRecorder(
-                    kind=OperationKind.MATERIALIZE, engine="mongodb", provider="mongodb"
-                )
-                return recorder.policy_rejected(decision, request)
+        async def run() -> Run:
+            return await self._execute_materialization(
+                collection, pipeline, verify=verify, recorder=recorder
+            )
 
+        return await gate(recorder, policy=self._connection.policy, request=request, resume=run)
+
+    async def _execute_materialization(
+        self,
+        collection: str,
+        pipeline: Pipeline,
+        *,
+        verify: Sequence[DocumentCheck],
+        recorder: object,
+    ) -> Run:
+        """Everything after admission: submit to MongoDB, wait, verify, record."""
         try:
             handle = await self.submit(collection, pipeline, verify=verify)
         except VerificationUnsupported as error:
-            return _refuse(error, RunStatus.VERIFICATION_UNSUPPORTED)
+            return _refuse(error, RunStatus.VERIFICATION_UNSUPPORTED, recorder=recorder)
         except VerificationConflict as error:
-            return _refuse(error, RunStatus.VERIFICATION_CONFLICT)
+            return _refuse(error, RunStatus.VERIFICATION_CONFLICT, recorder=recorder)
         except (VerificationInputError, TypeError, ValueError) as error:
-            return _refuse(error, RunStatus.POLICY_REJECTED)
+            return _refuse(error, RunStatus.POLICY_REJECTED, recorder=recorder)
         except MaterializationError as error:
-            return _refuse(error.failure.message, RunStatus.POLICY_REJECTED, error.failure)
-        return await self.wait(handle, poll_interval_seconds=0.05)
+            return _refuse(
+                error.failure.message,
+                RunStatus.POLICY_REJECTED,
+                error.failure,
+                recorder=recorder,
+            )
+        return await self.wait(handle, poll_interval_seconds=0.05, recorder=recorder)
 
     async def _invoke_tool(self, arguments: Mapping[str, object]) -> Run:
         unexpected = set(arguments) - {"collection", "pipeline", "verify"}
@@ -702,26 +737,41 @@ def _evidence(
     )
 
 
-def _refuse(error: Exception | str, status: RunStatus, failure: Failure | None = None) -> Run:
+def _refuse(
+    error: Exception | str,
+    status: RunStatus,
+    failure: Failure | None = None,
+    *,
+    recorder: object | None = None,
+) -> Run:
     """Record a run for a proposal refused before it reached MongoDB."""
     from gantry.runs.lifecycle import RunRecorder
     from gantry.runs.model import OperationKind
 
-    recorder = RunRecorder(kind=OperationKind.MATERIALIZE, engine="mongodb", provider="mongodb")
+    recording = (
+        recorder
+        if isinstance(recorder, RunRecorder)
+        else RunRecorder(kind=OperationKind.MATERIALIZE, engine="mongodb", provider="mongodb")
+    )
     kind = {
         RunStatus.VERIFICATION_UNSUPPORTED: FailureKind.VERIFICATION_UNSUPPORTED,
         RunStatus.VERIFICATION_CONFLICT: FailureKind.VERIFICATION_CONFLICT,
     }.get(status, FailureKind.VALIDATION_ERROR)
-    return recorder.rejected((str(error),), status=status).with_failure(
+    return recording.rejected((str(error),), status=status).with_failure(
         failure or Failure(kind, False, str(error))
     )
 
 
-def _recorded(result: MaterializationResult) -> Run:
-    """Record the run for a MongoDB materialization and return it."""
+def _recorded(result: MaterializationResult, *, recorder: object | None = None) -> Run:
+    """Record the run for a MongoDB materialization and return it.
+
+    `recorder` finishes a run that already exists — one that had to be admitted,
+    or parked for confirmation, before anything reached MongoDB.
+    """
     from gantry.runs.lifecycle import RunRecorder, run_from_evidence
     from gantry.runs.model import OperationKind
 
+    existing = recorder if isinstance(recorder, RunRecorder) else None
     run = run_from_evidence(
         result.evidence,
         kind=OperationKind.MATERIALIZE,
@@ -731,10 +781,13 @@ def _recorded(result: MaterializationResult) -> Run:
         verification=result.verification,
         handle=result.handle,
         failure=result.failure,
+        recorder=existing,
     )
     if run is None:
-        recorder = RunRecorder(kind=OperationKind.MATERIALIZE, engine="mongodb", provider="mongodb")
-        run = recorder.rejected(
+        recording = existing or RunRecorder(
+            kind=OperationKind.MATERIALIZE, engine="mongodb", provider="mongodb"
+        )
+        run = recording.rejected(
             (result.failure.message if result.failure else "refused",),
             status=RunStatus.POLICY_REJECTED,
             verification=result.verification,

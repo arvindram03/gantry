@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 
+from gantry.confirmation.status import ConfirmationReasonCode
 from gantry.policy.errors import PolicyConfigurationError
 from gantry.policy.model import Effect, PolicyRule
 from gantry.runs.model import OperationKind
@@ -24,6 +25,9 @@ def allow(
     operation: OperationKind,
     *,
     name: str | None = None,
+    require_confirmation: bool = False,
+    confirmation_code: ConfirmationReasonCode | str | None = None,
+    confirmation_message: str | None = None,
     actors: Sequence[str] | None = None,
     engines: Sequence[str] | None = None,
     sources: Sequence[str] | None = None,
@@ -39,6 +43,9 @@ def allow(
     return PolicyRule(
         effect=Effect.ALLOW,
         name=name,
+        require_confirmation=require_confirmation,
+        confirmation_code=confirmation_code,
+        confirmation_message=confirmation_message,
         actors=None if actors is None else tuple(actors),
         operations=(operation,),
         engines=None if engines is None else tuple(engines),

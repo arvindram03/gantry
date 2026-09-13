@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from hashlib import sha256
 
+from gantry.confirmation.status import ConfirmationReasonCode
 from gantry.policy.errors import PolicyConfigurationError
 from gantry.policy.patterns import normalize_pattern
 from gantry.runs.model import OperationKind
@@ -67,10 +68,18 @@ class PolicyRule:
     `constraints` are ceilings the request must already be under. A rule cannot
     raise a limit the operation configured, so trusted constraints only ever
     compose toward less authority.
+
+    `require_confirmation` does not change the answer — the rule still allows —
+    it asks the host to tell the user before the work happens. Authority and
+    "should someone be told" are separate questions, and collapsing them would
+    turn every sensitive operation into a refusal.
     """
 
     effect: Effect
     name: str | None = None
+    require_confirmation: bool = False
+    confirmation_code: ConfirmationReasonCode | str | None = None
+    confirmation_message: str | None = None
     actors: tuple[str, ...] | None = None
     operations: tuple[OperationKind, ...] | None = None
     engines: tuple[str, ...] | None = None
@@ -90,11 +99,44 @@ class PolicyRule:
         object.__setattr__(self, "destinations", _patterns(self.destinations, "destinations"))
         object.__setattr__(self, "operations", _operations(self.operations))
         object.__setattr__(self, "constraints", _constraints(self.constraints))
+        self._check_confirmation()
+
+    def _check_confirmation(self) -> None:
+        """A confirmation prompt nobody will ever see is a mistake, not a preference."""
+        if self.confirmation_code is not None:
+            try:
+                object.__setattr__(
+                    self, "confirmation_code", ConfirmationReasonCode(self.confirmation_code)
+                )
+            except ValueError as error:
+                known = ", ".join(code.value for code in ConfirmationReasonCode)
+                raise PolicyConfigurationError(
+                    f"unknown confirmation code: {self.confirmation_code!r}; v0 has {known}"
+                ) from error
+        if self.confirmation_message is not None and not self.confirmation_message.strip():
+            raise PolicyConfigurationError("confirmation message must not be empty when given")
+        if self.require_confirmation and self.effect is Effect.DENY:
+            raise PolicyConfigurationError(
+                "a deny rule cannot require confirmation: nothing it matches will run"
+            )
+        if not self.require_confirmation and (
+            self.confirmation_code is not None or self.confirmation_message is not None
+        ):
+            raise PolicyConfigurationError(
+                "confirmation_code and confirmation_message need require_confirmation=True, "
+                "or nothing will ever show them"
+            )
 
     def as_dict(self) -> dict[str, object]:
         payload: dict[str, object] = {"effect": self.effect.value}
         if self.name is not None:
             payload["name"] = self.name
+        if self.require_confirmation:
+            payload["require_confirmation"] = True
+        if self.confirmation_code is not None:
+            payload["confirmation_code"] = str(self.confirmation_code)
+        if self.confirmation_message is not None:
+            payload["confirmation_message"] = self.confirmation_message
         for key in ("actors", "engines", "sources", "destinations", "environments"):
             value = getattr(self, key)
             if value is not None:

@@ -9,11 +9,13 @@ does and why a failure to create is a reason not to submit.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Sequence
 from typing import Protocol, runtime_checkable
 
 from gantry.runs.model import Run
 from gantry.runs.sqlite import SQLiteRunStore
+from gantry.runs.status import RunStatus
 
 
 @runtime_checkable
@@ -25,6 +27,16 @@ class RunStore(Protocol):
     def update(self, run: Run) -> None: ...
 
     def get(self, run_id: str) -> Run | None: ...
+
+    def compare_and_set(self, run_id: str, expected: RunStatus, updated: Run) -> bool:
+        """Move a run on only if it is still where the caller last saw it.
+
+        The one operation `update` cannot express. Two hosts may confirm the
+        same run at the same moment, and exactly one of them may be the reason
+        work gets submitted — so the check and the write have to be one step.
+        Returns whether this caller was the one that made the transition.
+        """
+        ...
 
 
 class MemoryRunStore:
@@ -38,6 +50,7 @@ class MemoryRunStore:
 
     def __init__(self) -> None:
         self._runs: dict[str, Run] = {}
+        self._lock = threading.Lock()
 
     def create(self, run: Run) -> None:
         self._runs[run.id] = run
@@ -47,6 +60,14 @@ class MemoryRunStore:
 
     def get(self, run_id: str) -> Run | None:
         return self._runs.get(run_id)
+
+    def compare_and_set(self, run_id: str, expected: RunStatus, updated: Run) -> bool:
+        with self._lock:
+            current = self._runs.get(run_id)
+            if current is None or current.status is not expected:
+                return False
+            self._runs[run_id] = updated
+            return True
 
     def recent(self, *, limit: int = 50, status: str | None = None) -> Sequence[Run]:
         runs = sorted(self._runs.values(), key=lambda run: run.created_at, reverse=True)
@@ -107,6 +128,25 @@ def update(run: Run) -> Run:
             f"(native execution {_native(run)} may still be running): {error}"
         ) from error
     return run
+
+
+def compare_and_set(run_id: str, expected: RunStatus, updated: Run) -> bool:
+    """Transition a run if it is still in `expected`, atomically.
+
+    Used by confirmation, where only one caller may be the one that lets work
+    start. A store that predates this method cannot make the guarantee, so the
+    failure is explicit rather than a silently weaker transition.
+    """
+    transition = getattr(_default, "compare_and_set", None)
+    if transition is None:
+        raise RunPersistenceError(
+            f"{type(_default).__name__} cannot transition a run atomically; "
+            "confirmation needs a store that implements compare_and_set"
+        )
+    try:
+        return bool(transition(run_id, expected, updated))
+    except Exception as error:
+        raise RunPersistenceError(f"could not transition run {run_id}: {error}") from error
 
 
 def get(run_id: str) -> Run | None:

@@ -60,6 +60,9 @@ def test_nothing_is_submitted_when_the_run_cannot_be_recorded() -> None:
         def get(self, run_id: str) -> None:
             return None
 
+        def compare_and_set(self, run_id: str, expected: object, updated: object) -> bool:
+            return False
+
     gantry.runs.configure(BrokenStore())
     try:
         with pytest.raises(RunPersistenceError, match="disk full"):

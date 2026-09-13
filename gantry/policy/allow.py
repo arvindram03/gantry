@@ -4,12 +4,17 @@
 A rule grants only what it names. Sources left out mean any source may be read;
 destinations left out mean nothing may be written, which is why every writing
 operation here requires them.
+
+`require_confirmation=True` still allows the operation. It asks the host to tell
+the user before it runs — a separate question from authority, answered in
+`run.confirmation` rather than by refusing.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 
+from gantry.confirmation.status import ConfirmationReasonCode
 from gantry.policy.model import PolicyRule
 from gantry.policy.rules import allow as _allow
 from gantry.runs.model import OperationKind
@@ -18,6 +23,9 @@ from gantry.runs.model import OperationKind
 def query(
     *,
     name: str | None = None,
+    require_confirmation: bool = False,
+    confirmation_code: ConfirmationReasonCode | str | None = None,
+    confirmation_message: str | None = None,
     actors: Sequence[str] | None = None,
     engines: Sequence[str] | None = None,
     sources: Sequence[str] | None = None,
@@ -34,6 +42,9 @@ def query(
     return _allow(
         OperationKind.QUERY,
         name=name,
+        require_confirmation=require_confirmation,
+        confirmation_code=confirmation_code,
+        confirmation_message=confirmation_message,
         actors=actors,
         engines=engines,
         sources=sources,
@@ -47,6 +58,9 @@ def materialize(
     *,
     destinations: Sequence[str],
     name: str | None = None,
+    require_confirmation: bool = False,
+    confirmation_code: ConfirmationReasonCode | str | None = None,
+    confirmation_message: str | None = None,
     actors: Sequence[str] | None = None,
     engines: Sequence[str] | None = None,
     sources: Sequence[str] | None = None,
@@ -57,6 +71,9 @@ def materialize(
     return _allow(
         OperationKind.MATERIALIZE,
         name=name,
+        require_confirmation=require_confirmation,
+        confirmation_code=confirmation_code,
+        confirmation_message=confirmation_message,
         actors=actors,
         engines=engines,
         sources=sources,
@@ -70,6 +87,9 @@ def batch(
     *,
     destinations: Sequence[str],
     name: str | None = None,
+    require_confirmation: bool = False,
+    confirmation_code: ConfirmationReasonCode | str | None = None,
+    confirmation_message: str | None = None,
     actors: Sequence[str] | None = None,
     engines: Sequence[str] | None = None,
     sources: Sequence[str] | None = None,
@@ -80,6 +100,9 @@ def batch(
     return _allow(
         OperationKind.BATCH,
         name=name,
+        require_confirmation=require_confirmation,
+        confirmation_code=confirmation_code,
+        confirmation_message=confirmation_message,
         actors=actors,
         engines=engines,
         sources=sources,
@@ -93,6 +116,9 @@ def stream(
     *,
     destinations: Sequence[str],
     name: str | None = None,
+    require_confirmation: bool = False,
+    confirmation_code: ConfirmationReasonCode | str | None = None,
+    confirmation_message: str | None = None,
     actors: Sequence[str] | None = None,
     engines: Sequence[str] | None = None,
     sources: Sequence[str] | None = None,
@@ -103,6 +129,9 @@ def stream(
     return _allow(
         OperationKind.STREAM,
         name=name,
+        require_confirmation=require_confirmation,
+        confirmation_code=confirmation_code,
+        confirmation_message=confirmation_message,
         actors=actors,
         engines=engines,
         sources=sources,

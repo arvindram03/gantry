@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -47,6 +48,20 @@ def normalize_pipeline(pipeline: Pipeline) -> tuple[Mapping[str, object], ...]:
     if any(not isinstance(stage, Mapping) for stage in stages):
         raise TypeError("every pipeline stage must be a mapping")
     return stages
+
+
+def pipeline_text(collection: str, pipeline: Pipeline) -> str:
+    """One stable string for a pipeline, so a proposal has a hash to be bound to.
+
+    Sorted keys and `default=str`, so the same pipeline hashes the same twice and
+    a value the JSON encoder does not know about cannot make the record fail to
+    be written.
+    """
+    return json.dumps(
+        {"collection": collection, "pipeline": normalize_pipeline(pipeline)},
+        sort_keys=True,
+        default=str,
+    )
 
 
 def classify_pipeline(

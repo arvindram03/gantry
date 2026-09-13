@@ -21,11 +21,11 @@ from gantry.flink.inspection import job_request
 from gantry.flink.metrics import FlinkMetrics
 from gantry.flink.verification import FlinkHealthCheck
 from gantry.handle import ExecutionHandle
-from gantry.policy.evaluator import evaluate
 from gantry.policy.request import PolicyRequest
 from gantry.result import ResultStatus
 from gantry.runs.lifecycle import RunRecorder
 from gantry.runs.model import OperationKind, ResourceRef, Run
+from gantry.runs.service import gate
 from gantry.runs.status import RunStatus
 from gantry.runtime import SubmissionError
 from gantry.sql.classification import SQLOperation
@@ -258,13 +258,26 @@ class FlinkJob:
                     (failure.message,), status=RunStatus.POLICY_REJECTED
                 ).with_failure(failure)
             return _refuse(recorder, error, RunStatus.POLICY_REJECTED)
-        decision = None
-        if self._runtime.policy is not None:
-            decision = evaluate(self._runtime.policy, request)
-            if not decision.allowed:
-                return recorder.policy_rejected(decision, request)
-        recorder.admitted(request=request, decision=decision)
 
+        async def run() -> Run:
+            return await self._execute_job(sql, context=context, verify=verify, recorder=recorder)
+
+        return await gate(recorder, policy=self._runtime.policy, request=request, resume=run)
+
+    async def _execute_job(
+        self,
+        sql: str,
+        *,
+        context: Context | None,
+        verify: Sequence[FlinkHealthCheck | MaterializationCheck],
+        recorder: RunRecorder,
+    ) -> Run:
+        """Everything after admission: submit to the cluster, wait, record.
+
+        A submitted Flink job is already running somewhere, so this is the part
+        a confirmation holds back — and the part that runs unchanged, against the
+        same already-admitted run, once the host confirms.
+        """
         try:
             handle = await self.submit(sql, context=context, verify=verify)
         except VerificationUnsupported as error:

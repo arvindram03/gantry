@@ -125,6 +125,25 @@ A rule that bounds something the operation did not bound cannot apply: nothing
 would hold the ceiling, so the request is denied with `CONSTRAINT_EXCEEDED`.
 Trusted constraints compose toward less authority, never more.
 
+## Asking before it happens
+
+Some operations are allowed and still deserve a question first. A rule can say so
+without turning the answer into a refusal:
+
+```python
+gantry.allow.materialize(
+    sources=["raw.*"],
+    destinations=["prod.*"],
+    require_confirmation=True,
+    confirmation_message="This will write to production data.",
+)
+```
+
+The decision stays `allowed=True`, the run parks at `AWAITING_CONFIRMATION`, and
+the host confirms or declines on a separate path. See
+[Confirmation](confirmation.md) — including what v0 does and does not claim, which
+is not authenticated approval.
+
 ## Actor and environment
 
 Both come from the application, through trusted context:

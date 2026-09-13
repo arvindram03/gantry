@@ -17,11 +17,11 @@ from gantry.execution import Execution
 from gantry.failure import Failure, FailureKind
 from gantry.handle import ExecutionHandle
 from gantry.output import OutputKind, OutputRef
-from gantry.policy.evaluator import evaluate
 from gantry.policy.request import PolicyRequest
 from gantry.result import ResultStatus
 from gantry.runs.lifecycle import RunRecorder
 from gantry.runs.model import OperationKind, ResourceRef, Run
+from gantry.runs.service import gate
 from gantry.runs.status import RunStatus
 from gantry.runtime import SubmissionError
 from gantry.sql.inspection import materialize_request
@@ -600,13 +600,24 @@ class SQLMaterializer:
             ).with_failure(error.failure)
         except (TypeError, ValueError) as error:
             return _refuse(recorder, error, RunStatus.POLICY_REJECTED)
-        decision = None
-        if self._connection.policy is not None:
-            decision = evaluate(self._connection.policy, request)
-            if not decision.allowed:
-                return recorder.policy_rejected(decision, request)
-        recorder.admitted(request=request, decision=decision)
 
+        async def run() -> Run:
+            return await self._execute_materialization(proposal, verify=verify, recorder=recorder)
+
+        return await gate(recorder, policy=self._connection.policy, request=request, resume=run)
+
+    async def _execute_materialization(
+        self,
+        proposal: str | MaterializationProposal,
+        *,
+        verify: Sequence[MaterializationCheck],
+        recorder: RunRecorder,
+    ) -> Run:
+        """Everything after admission: submit, wait, verify, record.
+
+        Held back by the gate when a rule asks for confirmation, and run
+        unchanged when the host confirms — the same proposal, the same run.
+        """
         try:
             handle = await self.submit(proposal, verify=verify)
         except VerificationUnsupported as error:

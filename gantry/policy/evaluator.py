@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from gantry.confirmation.model import NOT_REQUIRED, ConfirmationRequirement, reasons_from
 from gantry.policy.decision import PolicyDecision, PolicyReason, PolicyReasonCode, denial
 from gantry.policy.model import Effect, Policy, PolicyRule
 from gantry.policy.patterns import matches_any
@@ -119,7 +120,59 @@ def _evaluate(policy: Policy, request: PolicyRequest, version: str) -> PolicyDec
         policy=policy.name,
         policy_version=version,
         matched_rules=tuple(dict.fromkeys(matched)),
+        confirmation=_confirmation(applicable, request),
     )
+
+
+def _confirmation(
+    applicable: Sequence[PolicyRule], request: PolicyRequest
+) -> ConfirmationRequirement:
+    """What every rule touching this request wants the user told about.
+
+    Union, not first-match. Authorization needs one rule to grant it, so
+    `_covers` stops at the first; being asked about an operation is different —
+    if any rule that reaches these resources wants the user told, the user gets
+    told. Erring the other way would let rule order silence a prompt.
+
+    Several rules asking collapse into one requirement with several reasons, so
+    one operation means one question (§21).
+    """
+    wanted = [
+        rule for rule in applicable if rule.require_confirmation and _participates(rule, request)
+    ]
+    if not wanted:
+        return NOT_REQUIRED
+    return ConfirmationRequirement(
+        required=True,
+        reasons=reasons_from(
+            [
+                (
+                    rule.name,
+                    str(rule.confirmation_code) if rule.confirmation_code else None,
+                    rule.confirmation_message,
+                )
+                for rule in wanted
+            ]
+        ),
+    )
+
+
+def _participates(rule: PolicyRule, request: PolicyRequest) -> bool:
+    """Does this rule actually describe what the proposal is doing?
+
+    Every resource dimension the rule names has to match, the same way a deny
+    rule narrows. A rule for `raw.* -> prod.*` must not raise a production
+    prompt on a `raw.* -> scratch.*` run just because it recognises the source;
+    the pairing is what the rule is about.
+
+    A request with no resolved resources has nothing to compare against, so an
+    applicable rule participates by applying at all.
+    """
+    if not request.inputs and not request.outputs:
+        return True
+    if rule.sources is not None and not _touched(rule.sources, request.inputs):
+        return False
+    return rule.destinations is None or bool(_touched(rule.destinations, request.outputs))
 
 
 def _accounts_for_reads(rule: PolicyRule, request: PolicyRequest) -> bool:

@@ -18,6 +18,8 @@ from datetime import datetime
 from pathlib import Path
 
 from gantry.actor import ActorRef, ActorType
+from gantry.confirmation.model import ConfirmationReason, ConfirmationRecord
+from gantry.confirmation.status import ConfirmationReasonCode, ConfirmationStatus
 from gantry.evidence import EvidenceBundle, Observation, ObservationSource
 from gantry.runs.model import (
     AdmissionRecord,
@@ -70,6 +72,30 @@ class SQLiteRunStore:
 
     def update(self, run: Run) -> None:
         self._write(run, insert=False)
+
+    def compare_and_set(self, run_id: str, expected: RunStatus, updated: Run) -> bool:
+        """One statement, so the check and the write cannot be separated.
+
+        `WHERE status = ?` is the whole mechanism: two hosts confirming the same
+        run both run this, SQLite serialises them, and the second one updates no
+        rows. Only the caller that changed a row may start work.
+        """
+        with self._lock:
+            cursor = self._connection.execute(
+                """
+                UPDATE runs SET status = ?, updated_at = ?, document = ?
+                WHERE id = ? AND status = ?
+                """,
+                (
+                    updated.status.value,
+                    updated.updated_at.isoformat(),
+                    updated.to_json(),
+                    run_id,
+                    expected.value,
+                ),
+            )
+            self._connection.commit()
+            return cursor.rowcount == 1
 
     def get(self, run_id: str) -> Run | None:
         with self._lock:
@@ -146,6 +172,7 @@ def run_from_dict(payload: dict[str, object]) -> Run:
         outputs=_refs(payload.get("outputs")),
         result_ref=_result_ref(payload.get("result_ref")),
         admission=_admission(payload.get("admission")),
+        confirmation=_confirmation(payload.get("confirmation")),
         execution=_execution(payload.get("execution")),
         verification=_verification(payload.get("verification")),
         evidence=_evidence(payload.get("evidence")),
@@ -201,6 +228,32 @@ def _admission(value: object) -> AdmissionRecord | None:
         codes=tuple(str(item) for item in _sequence(data.get("codes"))),
         request=_mapping(data.get("request")) or None,
         **({"decided_at": decided} if decided is not None else {}),
+    )
+
+
+def _confirmation(value: object) -> ConfirmationRecord | None:
+    data = _mapping(value)
+    if not data:
+        return None
+    return ConfirmationRecord(
+        status=ConfirmationStatus(str(data.get("status", "not_required"))),
+        run_id=str(data.get("run_id", "")),
+        proposal_hash=_optional_str(data.get("proposal_hash")),
+        reasons=tuple(
+            ConfirmationReason(
+                code=ConfirmationReasonCode(
+                    str(item.get("code", ConfirmationReasonCode.CUSTOM_POLICY_REQUIREMENT.value))
+                ),
+                message=str(item.get("message", "confirmation required")),
+                rule=_optional_str(item.get("rule")),
+                details=_mapping(item.get("details")) or None,
+            )
+            for item in _sequence(data.get("reasons"))
+        ),
+        required_at=_time(data.get("required_at")),
+        confirmed_at=_time(data.get("confirmed_at")),
+        declined_at=_time(data.get("declined_at")),
+        metadata=_mapping(data.get("metadata")),
     )
 
 

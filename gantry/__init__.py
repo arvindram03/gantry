@@ -7,6 +7,13 @@ from gantry.adapter import ExecutionAdapter
 from gantry.admission import AdmissionDecision, admit
 from gantry.artifact import Artifact
 from gantry.capabilities import AdapterCapabilities
+from gantry.confirmation import (
+    ConfirmationReason,
+    ConfirmationReasonCode,
+    ConfirmationRecord,
+    ConfirmationRequirement,
+    ConfirmationStatus,
+)
 from gantry.context import Context
 from gantry.evidence import EvidenceBundle, Observation, ObservationSource
 from gantry.execution import Execution, ExecutionResult, ExecutionState, ValidationResult
@@ -61,6 +68,11 @@ __all__ = [
     "Artifact",
     "CheckResult",
     "CheckSource",
+    "ConfirmationReason",
+    "ConfirmationReasonCode",
+    "ConfirmationRecord",
+    "ConfirmationRequirement",
+    "ConfirmationStatus",
     "Context",
     "ControlPlane",
     "EvidenceBundle",

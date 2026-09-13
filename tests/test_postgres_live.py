@@ -551,3 +551,77 @@ async def test_a_policy_refusal_never_reaches_postgres() -> None:
     assert wrong_actor.execution is None
     assert wrong_actor.admission is not None
     assert wrong_actor.admission.codes == ("ACTOR_DENIED",)
+
+
+async def test_confirmation_parks_a_production_write_until_the_host_answers() -> None:
+    """Policy allows it; a rule asks that the user be told. Asked of `pg_tables`.
+
+    The three states have to be distinguishable in the database, not just in the
+    run: nothing while parked, the table once confirmed, and nothing at all for
+    the one that was declined.
+    """
+    from gantry.actor import actor, context
+    from gantry.confirmation import ConfirmationStatus
+
+    pytest.importorskip("asyncpg")
+    if not await _reachable():
+        require_live_or_skip(f"no PostgreSQL at {URL}")
+    await _raw_execute(
+        "CREATE SCHEMA IF NOT EXISTS confirm_raw",
+        "CREATE SCHEMA IF NOT EXISTS confirm_prod",
+        "DROP TABLE IF EXISTS confirm_raw.invoices",
+        "DROP TABLE IF EXISTS confirm_prod.totals",
+        "DROP TABLE IF EXISTS confirm_prod.declined",
+        "CREATE TABLE confirm_raw.invoices (customer_id int, balance int)",
+        "INSERT INTO confirm_raw.invoices VALUES (1, 10), (2, 20)",
+    )
+
+    policy = gantry.Policy(
+        name="prod-data-agents",
+        rules=[
+            gantry.allow.materialize(
+                sources=["confirm_raw.*"],
+                destinations=["confirm_prod.*"],
+                require_confirmation=True,
+                confirmation_code="PRODUCTION_WRITE",
+                confirmation_message="This will write to production data.",
+            )
+        ],
+    )
+    db = gantry.sql.connect(PROVIDER, url=URL, policy=policy)
+    materialize = db.materialize(
+        sources=["confirm_raw.*"],
+        destinations=["confirm_prod.*"],
+        timeout=60,
+        checks=[gantry.verify.destination_exists(), gantry.verify.row_count(min=1)],
+    )
+    body = (
+        "SELECT customer_id, SUM(balance) AS balance FROM confirm_raw.invoices GROUP BY customer_id"
+    )
+
+    with context(actor=actor("agent", "migration-agent"), environment="prod"):
+        parked = await materialize(f"CREATE TABLE confirm_prod.totals AS {body}")
+        to_decline = await materialize(f"CREATE TABLE confirm_prod.declined AS {body}")
+    while_waiting = await _tables("confirm_prod")
+
+    confirmed = await gantry.runs.confirm(parked.id, metadata={"channel": "cli"})
+    declined = await gantry.runs.decline(to_decline.id)
+    after = await _tables("confirm_prod")
+
+    assert while_waiting == set(), "nothing may exist in PostgreSQL while confirmation is pending"
+    assert after == {"totals"}
+
+    assert parked.status is RunStatus.AWAITING_CONFIRMATION
+    assert parked.execution is None
+    assert parked.admission is not None and parked.admission.allowed
+    assert parked.confirmation is not None
+    assert parked.confirmation.codes == ("PRODUCTION_WRITE",)
+
+    assert confirmed.id == parked.id
+    assert confirmed.status is RunStatus.ACCEPTED
+    assert confirmed.confirmation is not None
+    assert confirmed.confirmation.status is ConfirmationStatus.CONFIRMED
+    assert confirmed.verification is not None and confirmed.verification.ok
+
+    assert declined.status is RunStatus.CONFIRMATION_DECLINED
+    assert declined.execution is None

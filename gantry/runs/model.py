@@ -23,6 +23,8 @@ from enum import StrEnum
 from hashlib import sha256
 
 from gantry.actor import ActorRef
+from gantry.confirmation.model import ConfirmationRecord
+from gantry.confirmation.status import ConfirmationStatus
 from gantry.evidence import EvidenceBundle, _plain
 from gantry.failure import Failure
 from gantry.handle import ExecutionHandle
@@ -232,6 +234,7 @@ class Run:
     outputs: tuple[ResourceRef, ...] = ()
     result_ref: QueryResultRef | None = None
     admission: AdmissionRecord | None = None
+    confirmation: ConfirmationRecord | None = None
     execution: ExecutionRecord | None = None
     verification: VerificationResult | None = None
     evidence: EvidenceBundle | None = None
@@ -366,6 +369,7 @@ class Run:
             "outputs": [ref.as_dict() for ref in self.outputs],
             "result_ref": None if self.result_ref is None else self.result_ref.as_dict(),
             "admission": None if self.admission is None else self.admission.as_dict(),
+            "confirmation": None if self.confirmation is None else self.confirmation.as_dict(),
             "execution": None if self.execution is None else self.execution.as_dict(),
             "verification": _verification_as_dict(self.verification),
             "evidence": None if self.evidence is None else self.evidence.as_dict(),
@@ -428,6 +432,9 @@ def render(run: Run) -> str:
     if run.admission is not None:
         lines.extend(["Admission", *_admission_lines(run.admission), ""])
 
+    if run.confirmation is not None:
+        lines.extend(["Confirmation", *_confirmation_lines(run.confirmation), ""])
+
     if run.execution is not None:
         lines.extend(["Execution", f"  {run.execution.status}"])
         if run.execution.native_id:
@@ -481,6 +488,24 @@ def _admission_lines(admission: AdmissionRecord) -> list[str]:
             lines.append(f"    {mark} {verb} {resource}")
     lines.extend(f"    {code}" for code in admission.codes)
     lines.extend(f"      {reason}" for reason in admission.reasons)
+    return lines
+
+
+def _confirmation_lines(confirmation: ConfirmationRecord) -> list[str]:
+    """What was asked and what came back, never phrased as an approval.
+
+    "the host confirmed" and "a trusted human approved" are different claims,
+    and only the first one is true. A record that reads like the second would
+    be the most misleading line in the file.
+    """
+    marks = {
+        ConfirmationStatus.NOT_REQUIRED: "  — not required",
+        ConfirmationStatus.REQUIRED: "  ! awaiting user confirmation",
+        ConfirmationStatus.CONFIRMED: "  ✓ required\n  ✓ confirmed by the host",
+        ConfirmationStatus.DECLINED: "  ✓ required\n  ✗ declined by the host",
+    }
+    lines = marks[confirmation.status].split("\n")
+    lines.extend(f"    {reason.code.value}: {reason.message}" for reason in confirmation.reasons)
     return lines
 
 

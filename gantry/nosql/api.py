@@ -24,7 +24,7 @@ from gantry.nosql.materialization import (
     NoSQLMaterializer,
 )
 from gantry.nosql.output import InlineDocuments
-from gantry.nosql.pipeline import CollectionRef, Pipeline
+from gantry.nosql.pipeline import CollectionRef, Pipeline, pipeline_text
 from gantry.nosql.policy import NoSQLPolicy
 from gantry.nosql.query import NoSQLQuery
 from gantry.nosql.registry import resolve_provider
@@ -32,10 +32,11 @@ from gantry.nosql.result import NoSQLResult
 from gantry.nosql.target import NoSQLTarget
 from gantry.nosql.verify import CollectionSnapshot, DocumentCheck
 from gantry.output import OutputKind, OutputRef
-from gantry.policy.evaluator import evaluate
 from gantry.policy.model import Policy
 from gantry.result import Result, ResultStatus
-from gantry.runs.model import Run
+from gantry.runs.lifecycle import RunRecorder, run_from_evidence
+from gantry.runs.model import OperationKind, QueryResultRef, Run
+from gantry.runs.service import gate
 from gantry.runs.status import RunStatus
 from gantry.runtime import ControlPlane
 from gantry.target import ExecutionTarget
@@ -152,6 +153,18 @@ class NoSQLConnection:
         verifiers = tuple(check for check in trusted_verify if isinstance(check, Verifier))
         trusted_checks = tuple(check for check in trusted_verify if not isinstance(check, Verifier))
 
+        # Recorded before the pipeline reaches the driver, so a proposal that is
+        # refused or parked still leaves a run — and so the run that resumes
+        # after confirmation is the same one, not a second one for the same work.
+        recorder = RunRecorder(
+            kind=OperationKind.QUERY,
+            engine="mongodb",
+            provider=self.provider,
+            proposal=pipeline_text(collection, pipeline),
+            proposal_kind="mongodb",
+            agent_verification=tuple(type(check).__name__ for check in agent_verify),
+        )
+
         # Authority, before the pipeline reaches the driver. `$lookup` and
         # `$out` are resolved out of the pipeline, so a stage that reads or
         # writes somewhere unauthorized is refused rather than executed.
@@ -162,18 +175,34 @@ class NoSQLConnection:
             database=self.database,
             policy=policy,
         )
-        decision = None
-        if self._policy is not None:
-            decision = evaluate(self._policy, request)
-            if not decision.allowed:
-                from gantry.runs.lifecycle import RunRecorder
-                from gantry.runs.model import OperationKind
 
-                recorder = RunRecorder(
-                    kind=OperationKind.QUERY, engine="mongodb", provider=self.provider
-                )
-                return recorder.policy_rejected(decision, request)
+        async def run() -> Run:
+            return await self._execute_query(
+                collection,
+                pipeline,
+                policy=policy,
+                context=context,
+                recorder=recorder,
+                verifiers=verifiers,
+                trusted_checks=trusted_checks,
+                agent_verify=agent_verify,
+            )
 
+        return await gate(recorder, policy=self._policy, request=request, resume=run)
+
+    async def _execute_query(
+        self,
+        collection: str,
+        pipeline: Pipeline,
+        *,
+        policy: NoSQLPolicy,
+        context: Context | None,
+        recorder: RunRecorder,
+        verifiers: Sequence[Verifier],
+        trusted_checks: Sequence[DocumentCheck],
+        agent_verify: Sequence[DocumentCheck],
+    ) -> Run:
+        """Everything after admission: run the pipeline, verify, record."""
         raw = await self._execute_result(
             collection, pipeline, policy=policy, context=context, verify=verifiers
         )
@@ -198,10 +227,7 @@ class NoSQLConnection:
                 collection, pipeline, raw, result.inline, verification, status, agent_verify
             ),
         )
-        from gantry.runs.lifecycle import run_from_evidence
-        from gantry.runs.model import OperationKind, QueryResultRef
-
-        run = run_from_evidence(
+        finished = run_from_evidence(
             response.evidence,
             kind=OperationKind.QUERY,
             engine="mongodb",
@@ -210,8 +236,7 @@ class NoSQLConnection:
             verification=response.verification,
             handle=response.handle,
             inline=response.inline,
-            decision=decision,
-            request=request,
+            recorder=recorder,
             result_ref=None
             if response.inline is None
             else QueryResultRef(
@@ -221,17 +246,14 @@ class NoSQLConnection:
             ),
             failure=response.failure,
         )
-        if run is None:
-            from gantry.runs.lifecycle import RunRecorder
-
-            run = RunRecorder(
-                kind=OperationKind.QUERY, engine="mongodb", provider=self.provider
-            ).rejected(
+        if finished is None:
+            # No evidence at all means the pipeline was refused before it ran.
+            finished = recorder.rejected(
                 (response.failure.message if response.failure else "refused",),
                 status=RunStatus.POLICY_REJECTED,
                 verification=response.verification,
             )
-        return run.with_failure(response.failure)
+        return finished.with_failure(response.failure)
 
     async def submit(
         self,
