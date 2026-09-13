@@ -158,7 +158,7 @@ stream = gantry.stream.connect("flink", endpoint=GATEWAY, policy=policy)
   `("DESTINATION_DENIED",)`, not a string to grep, and the exact policy version that
   decided is recorded on the run.
 
-## Ask me first
+## Requiring user confirmation
 
 Some work is allowed and still deserves a question. A rule can say so without
 turning the answer into a refusal:
@@ -192,7 +192,10 @@ This is a user-interaction gate, not an authentication one. Gantry records that 
 application supplied confirmation before execution — it never claims a particular
 authenticated person approved anything, which is why no field names one.
 
-## Every run is a record you can read back
+## Durable run records
+
+Every operation leaves a run, written before anything external happens and
+readable long after the process that made it is gone:
 
 ```python
 gantry.runs.configure(gantry.runs.SQLiteRunStore(".gantry/runs.db"))
