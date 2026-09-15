@@ -11,6 +11,7 @@ psql "$GANTRY_DATABASE_URL" -f examples/seed.sql
 | I want to… | Example | Needs |
 |---|---|---|
 | Let an agent answer questions about a warehouse | [`agent_sql.py`](agent_sql.py) | PostgreSQL |
+| Watch a real OpenAI agent hit a refusal and recover | [`openai_agent.py`](openai_agent.py) | PostgreSQL + `OPENAI_API_KEY` |
 | Try this with nothing to set up | [`local_duckdb.py`](local_duckdb.py) | a file on disk |
 | Give an agent read access and one place to write, on MySQL | [`mysql_customers.py`](mysql_customers.py) | MySQL |
 | Let an agent build a feature table a model will train on | [`materialize_and_verify.py`](materialize_and_verify.py) | a file on disk |
@@ -20,6 +21,10 @@ psql "$GANTRY_DATABASE_URL" -f examples/seed.sql
 | Watch every MongoDB policy limit get hit on purpose | [`mongodb_policy_demo.py`](mongodb_policy_demo.py) | MongoDB |
 | Run a nightly job unattended and know it did something | [`batch_flink.py`](batch_flink.py) | Flink + PostgreSQL |
 | Run a continuous job, and know whether it is healthy | [`streaming_flink.py`](streaming_flink.py) | Flink + PostgreSQL |
+
+If you want to see a real model in the loop rather than SQL we wrote for it,
+read `openai_agent.py`: an agent answers one question, is refused on the next,
+and explains why instead of working around it.
 
 If you are only reading one, read `local_duckdb.py` — it needs nothing to run.
 If you want to see the point of the library rather than its API, read
