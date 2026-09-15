@@ -47,6 +47,38 @@ class FailureKind(StrEnum):
     VERIFICATION_CONFLICT = "VERIFICATION_CONFLICT"
     UNKNOWN = "UNKNOWN"
 
+    @property
+    def transient(self) -> bool:
+        """Whether this kind describes a condition that may pass on its own.
+
+        The rule every adapter should agree with, written once. Before this
+        existed each adapter carried its own copy — BigQuery tested
+        `kind in {TIMEOUT, RESOURCE_EXHAUSTED}`, Snowflake `kind is TIMEOUT`,
+        Flink an if-chain — and nothing made a new adapter agree with the old
+        ones.
+
+        The set is deliberately small and conservative, because the cost of the
+        two mistakes is not symmetric. Calling a permanent failure transient
+        invites a caller to retry something that will never succeed; calling a
+        transient one permanent only costs them an attempt they could have made.
+
+        Three kinds are left out on purpose. `CONNECTOR_ERROR` is a broker that
+        is down *or* a sink table that does not exist, and the message rarely
+        says which. `ENGINE_ERROR` and `UNKNOWN` mean Gantry could not tell what
+        went wrong, and advising a retry on that basis is advice with nothing
+        behind it.
+        """
+        return self in _TRANSIENT
+
+
+_TRANSIENT = frozenset(
+    {
+        FailureKind.TIMEOUT,
+        FailureKind.RESOURCE_ERROR,
+        FailureKind.RESOURCE_EXHAUSTED,
+    }
+)
+
 
 @dataclass(frozen=True, slots=True)
 class Failure:
@@ -55,6 +87,21 @@ class Failure:
     `kind` and `retryable` are for code to act on; `message` is for a human.
     `native_code`, `native_message` and `native` preserve what the engine
     actually said, so normalizing never loses the detail needed to debug.
+
+    `retryable` says one narrow thing: **the condition that caused this failure
+    may pass on its own.** It should equal `kind.transient` unless an adapter
+    genuinely knows better about its own engine, and a test enforces that across
+    the library so the flag means the same thing on every backend.
+
+    It does not say the work is safe to run again. A materialization that timed
+    out halfway may have left its destination behind, and create-only means the
+    retry fails with `DESTINATION_EXISTS` rather than succeeding. That question
+    belongs to the run, which knows what kind of operation it was and how far it
+    got: see `Run.safe_to_retry`.
+
+    Gantry itself never retries. A retried write is a second attempt at
+    something policy admitted once, and deciding that belongs to the
+    application, not to the layer whose job is to be the record of what ran.
     """
 
     kind: FailureKind

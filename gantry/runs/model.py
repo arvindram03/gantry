@@ -267,6 +267,34 @@ class Run:
         return self.status is RunStatus.ACCEPTED
 
     @property
+    def safe_to_retry(self) -> bool:
+        """Whether submitting this same proposal again is safe and worth doing.
+
+        `failure.retryable` answers half the question — whether the condition
+        may pass. This answers the half that depends on what was being done and
+        how far it got, which is the half that can destroy something.
+
+        A query is idempotent: re-running a `SELECT` that timed out costs
+        another attempt and nothing else. A write is not. Materializations are
+        create-only, and a run that reached the engine may have left its
+        destination behind even though it failed — so the retry does not
+        succeed, it comes back `DESTINATION_EXISTS`, turning a transient failure
+        into one that looks permanent. A batch or streaming job that was
+        submitted is worse: running it again does not replace the first one, it
+        adds a second.
+
+        So a write is retry-safe only when nothing reached the engine at all.
+        `False` here is not a claim that retrying will fail — it is a claim that
+        Gantry cannot promise it is harmless, which for a write is the answer
+        that matters.
+        """
+        if self.failure is None or not self.failure.retryable:
+            return False
+        if self.operation.kind is OperationKind.QUERY:
+            return True
+        return self.execution is None or self.execution.native_id is None
+
+    @property
     def run_id(self) -> str:
         """Alias for `id`, for callers that hold results from several systems."""
         return self.id
