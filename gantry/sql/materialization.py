@@ -593,13 +593,15 @@ class SQLMaterializer:
         # Authority first, and from the parsed plan rather than the proposal's
         # own description of itself. A refusal here means nothing was submitted.
         try:
-            request = self._policy_request(proposal)
+            plan = self.inspect(proposal)
         except MaterializationError as error:
             return recorder.rejected(
                 (error.failure.message,), status=RunStatus.POLICY_REJECTED
             ).with_failure(error.failure)
         except (TypeError, ValueError) as error:
             return _refuse(recorder, error, RunStatus.POLICY_REJECTED)
+
+        request = self._policy_request(plan)
 
         async def run() -> Run:
             return await self._execute_materialization(proposal, verify=verify, recorder=recorder)
@@ -630,8 +632,6 @@ class SQLMaterializer:
             return recorder.rejected(
                 (error.failure.message,), status=RunStatus.POLICY_REJECTED
             ).with_failure(error.failure)
-        except (TypeError, ValueError) as error:
-            return _refuse(recorder, error, RunStatus.POLICY_REJECTED)
 
         plan = self._plans.get(handle.gantry_id)
         recorder.running(handle)
@@ -854,14 +854,16 @@ class SQLMaterializer:
             return table
         return replace(table, metadata={**table.metadata, "null_rates": dict(rates)})
 
-    def _policy_request(self, proposal: str | MaterializationProposal) -> PolicyRequest:
+    def _policy_request(
+        self, proposal: str | MaterializationProposal | MaterializationPlan
+    ) -> PolicyRequest:
         """The normalized request for one materialization proposal.
 
         Parsing is what determines the destination, so a proposal that will not
         parse has no determinable effect — reported as unresolved rather than
         guessed at.
         """
-        plan = self.inspect(proposal)
+        plan = proposal if isinstance(proposal, MaterializationPlan) else self.inspect(proposal)
         return materialize_request(
             provider=self._connection.provider,
             sources=[source.qualified_name for source in plan.sources],

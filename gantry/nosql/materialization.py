@@ -427,7 +427,7 @@ class NoSQLMaterializer:
         # Authority first, from the classified pipeline. A refusal here means
         # nothing was submitted to MongoDB.
         try:
-            request = self._policy_request(collection, pipeline)
+            plan = self.inspect(collection, pipeline)
         except (TypeError, ValueError) as error:
             return _refuse(error, RunStatus.POLICY_REJECTED, recorder=recorder)
         except MaterializationError as error:
@@ -437,6 +437,8 @@ class NoSQLMaterializer:
                 error.failure,
                 recorder=recorder,
             )
+
+        request = self._policy_request(collection, pipeline, plan=plan)
 
         async def run() -> Run:
             return await self._execute_materialization(
@@ -460,7 +462,7 @@ class NoSQLMaterializer:
             return _refuse(error, RunStatus.VERIFICATION_UNSUPPORTED, recorder=recorder)
         except VerificationConflict as error:
             return _refuse(error, RunStatus.VERIFICATION_CONFLICT, recorder=recorder)
-        except (VerificationInputError, TypeError, ValueError) as error:
+        except VerificationInputError as error:
             return _refuse(error, RunStatus.POLICY_REJECTED, recorder=recorder)
         except MaterializationError as error:
             return _refuse(
@@ -494,19 +496,21 @@ class NoSQLMaterializer:
             return _refuse(error, RunStatus.POLICY_REJECTED)
         return await self(collection, pipeline, verify=checks)  # type: ignore[arg-type]
 
-    def _policy_request(self, collection: str, pipeline: Pipeline) -> PolicyRequest:
+    def _policy_request(
+        self, collection: str, pipeline: Pipeline, *, plan: MaterializationPlan | None = None
+    ) -> PolicyRequest:
         """The normalized request for one materialization, from its plan.
 
         `inspect` is what determines the destination and the collections a
         `$lookup` reaches, so a pipeline it refuses has no determinable effect
         and is refused here too.
         """
-        plan = self.inspect(collection, pipeline)
+        materialization_plan = plan if plan is not None else self.inspect(collection, pipeline)
         return materialize_request(
             provider=self._connection.provider,
             database=self._connection.database,
-            sources=plan.sources,
-            destination=plan.destination,
+            sources=materialization_plan.sources,
+            destination=materialization_plan.destination,
             policy=self._nosql_policy(),
         )
 

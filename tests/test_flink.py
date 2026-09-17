@@ -467,3 +467,28 @@ def test_old_public_flink_api_is_removed() -> None:
     assert not hasattr(flink, "connect")
     assert not hasattr(flink, "FlinkConnection")
     assert not hasattr(flink, "FlinkSQLTool")
+
+
+async def test_flink_internal_error_is_not_recorded_as_policy_rejected() -> None:
+    transport = FakeFlinkTransport()
+    job = _batch(transport).job(inputs=["src"], outputs=["sink"], poll_interval=0)
+
+    async def _crashing_submit(artifact: object, *, context: object = None) -> object:
+        raise ValueError("internal flink runtime bug")
+
+    job._runtime.submit = _crashing_submit  # type: ignore[method-assign,assignment]
+
+    with pytest.raises(ValueError, match="internal flink runtime bug"):
+        await job("INSERT INTO sink SELECT * FROM src")
+
+    # Invalid proposal input still returns POLICY_REJECTED
+    empty_result = await job("")
+    assert empty_result.status is RunStatus.POLICY_REJECTED
+    assert empty_result.failure is not None
+    assert "empty" in empty_result.failure.message
+
+    non_string_result = await job(cast(str, 123))
+    assert non_string_result.status is RunStatus.POLICY_REJECTED
+    assert non_string_result.failure is not None
+    assert "string" in non_string_result.failure.message
+
