@@ -368,4 +368,3 @@ async def test_invalid_proposal_types_are_rejected_as_policy_rejected(tmp_path: 
     assert non_string_result.status is RunStatus.POLICY_REJECTED
     assert non_string_result.failure is not None
     assert "string" in non_string_result.failure.message
-

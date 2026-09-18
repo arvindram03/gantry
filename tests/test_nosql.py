@@ -605,7 +605,6 @@ async def test_nosql_internal_error_is_not_recorded_as_policy_rejected() -> None
     assert "empty" in invalid_result.failure.message
 
 
-
 def test_mongo_adapter_reports_a_clear_error_without_pymongo(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
