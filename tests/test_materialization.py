@@ -334,3 +334,37 @@ async def test_bigquery_submission_recovers_the_preallocated_native_job_id(
     assert handle.native_id == client.job_id
     assert handle.native_id.startswith("gantry_")
     assert handle.metadata["gantry.sql.materialization.destination"] == "acme.scratch.result"
+
+
+async def test_internal_adapter_error_is_not_recorded_as_policy_rejected(tmp_path: Path) -> None:
+    db = _database(tmp_path)
+    materialize = db.materialize(
+        sources=["raw.*"],
+        destinations=["agent_scratch.*"],
+    )
+
+    def _broken_capabilities() -> Any:
+        raise ValueError("internal adapter bug: bad capability table")
+
+    db._adapter.capabilities = _broken_capabilities  # type: ignore[method-assign]
+
+    with pytest.raises(ValueError, match="internal adapter bug: bad capability table"):
+        await materialize(_sql())
+
+
+async def test_invalid_proposal_types_are_rejected_as_policy_rejected(tmp_path: Path) -> None:
+    db = _database(tmp_path)
+    materialize = db.materialize(
+        sources=["raw.*"],
+        destinations=["agent_scratch.*"],
+    )
+
+    empty_result = await materialize("")
+    assert empty_result.status is RunStatus.POLICY_REJECTED
+    assert empty_result.failure is not None
+    assert "empty" in empty_result.failure.message
+
+    non_string_result = await materialize(cast(str, 12345))
+    assert non_string_result.status is RunStatus.POLICY_REJECTED
+    assert non_string_result.failure is not None
+    assert "string" in non_string_result.failure.message

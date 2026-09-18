@@ -250,7 +250,7 @@ class FlinkJob:
         # already running somewhere, so this is the last point at which a
         # refusal costs nothing.
         try:
-            request = self._policy_request(sql)
+            plan = self.inspect(sql)
         except (FlinkJobError, TypeError, ValueError) as error:
             failure = error.failure if isinstance(error, FlinkJobError) else None
             if failure is not None:
@@ -258,6 +258,8 @@ class FlinkJob:
                     (failure.message,), status=RunStatus.POLICY_REJECTED
                 ).with_failure(failure)
             return _refuse(recorder, error, RunStatus.POLICY_REJECTED)
+
+        request = self._policy_request(sql, plan=plan)
 
         async def run() -> Run:
             return await self._execute_job(sql, context=context, verify=verify, recorder=recorder)
@@ -284,7 +286,7 @@ class FlinkJob:
             return _refuse(recorder, error, RunStatus.VERIFICATION_UNSUPPORTED)
         except VerificationConflict as error:
             return _refuse(recorder, error, RunStatus.VERIFICATION_CONFLICT)
-        except (VerificationInputError, TypeError, ValueError) as error:
+        except VerificationInputError as error:
             return _refuse(recorder, error, RunStatus.POLICY_REJECTED)
         except FlinkJobError as error:
             return recorder.rejected(
@@ -374,13 +376,13 @@ class FlinkJob:
         ):
             raise TypeError("batch checks must be Flink job or output checks")
 
-    def _policy_request(self, sql: str) -> PolicyRequest:
+    def _policy_request(self, sql: str, *, plan: FlinkJobPlan | None = None) -> PolicyRequest:
         """The normalized request for one Flink job, from its parsed plan."""
-        plan = self.inspect(sql)
+        job_plan = plan if plan is not None else self.inspect(sql)
         return job_request(
             kind=OperationKind.STREAM if self._kind is FlinkJobKind.STREAM else OperationKind.BATCH,
-            inputs=plan.inputs,
-            output=plan.output,
+            inputs=job_plan.inputs,
+            output=job_plan.output,
             catalog=self._runtime.default_catalog,
             database=self._runtime.default_database,
             constraints=(

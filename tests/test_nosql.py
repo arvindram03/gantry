@@ -586,6 +586,25 @@ async def test_materializer_rejects_sources_outside_policy() -> None:
     assert result.failure.kind is FailureKind.SOURCE_NOT_ALLOWED
 
 
+async def test_nosql_internal_error_is_not_recorded_as_policy_rejected() -> None:
+    class _CrashingConnection(_FakeMaterializeConnection):
+        def capabilities(self) -> NoSQLCapabilities:
+            raise ValueError("internal nosql adapter bug: bad capability table")
+
+    connection = _CrashingConnection(capabilities=_full_capabilities(), snapshot=None)
+    policy = MaterializationPolicy(sources=["orders"], destinations=["reporting.rollup"])
+    materializer = NoSQLMaterializer(connection, policy, ())
+
+    with pytest.raises(ValueError, match="internal nosql adapter bug: bad capability table"):
+        await materializer("orders", [{"$match": {}}, {"$out": "reporting.rollup"}])
+
+    # But proposal-level invalid input still produces POLICY_REJECTED
+    invalid_result = await materializer("", [{"$match": {}}, {"$out": "reporting.rollup"}])
+    assert invalid_result.status is RunStatus.POLICY_REJECTED
+    assert invalid_result.failure is not None
+    assert "empty" in invalid_result.failure.message
+
+
 def test_mongo_adapter_reports_a_clear_error_without_pymongo(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
