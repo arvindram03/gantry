@@ -199,3 +199,62 @@ def test_the_stores_that_ship_can_list(tmp_path: object) -> None:
 
     assert isinstance(gantry.runs.MemoryRunStore(), ListableRunStore)
     assert isinstance(gantry.runs.SQLiteRunStore(f"{tmp_path}/runs.db"), ListableRunStore)
+
+
+# --------------------------------------------- a policy can be stored and reloaded
+
+
+def test_a_policy_round_trips_and_keeps_its_version() -> None:
+    """The version has to survive, or the audit claim does not.
+
+    A run records the policy version that admitted it. If reloading a stored
+    policy produced a different version, every run recorded before the restart
+    would appear to have been decided by a policy that no longer exists.
+    """
+    original = gantry.Policy(
+        name="data-agents",
+        rules=[
+            gantry.allow.query(name="reads", actors=["research-agent"], sources=["analytics.*"]),
+            gantry.allow.materialize(
+                sources=["raw.*"],
+                destinations=["prod.*"],
+                require_confirmation=True,
+                confirmation_code="PRODUCTION_WRITE",
+                constraints={"max_rows": 1000},
+            ),
+            gantry.deny.materialize(destinations=["prod.secrets"]),
+        ],
+    )
+
+    restored = gantry.Policy.from_dict(original.as_dict())
+
+    assert restored.version == original.version
+    assert [rule.as_dict() for rule in restored.rules] == [
+        rule.as_dict() for rule in original.rules
+    ]
+    # And it still decides the same way, which is the point of keeping it.
+    assert restored.rules[1].require_confirmation
+    assert restored.rules[2].destinations == ("prod.secrets",)
+
+
+def test_an_unconstrained_dimension_comes_back_unconstrained() -> None:
+    """`as_dict` omits what was never set, so `from_dict` must not invent it.
+
+    A rule that named no actors applies to everyone. One that named an empty
+    list of actors applies to nobody. Losing that distinction on a reload would
+    silently disable a rule.
+    """
+    rule = gantry.PolicyRule.from_dict({"effect": "allow", "sources": ["a.*"]})
+
+    assert rule.actors is None
+    assert rule.environments is None
+    assert rule.sources == ("a.*",)
+
+
+def test_a_stored_policy_that_is_not_a_policy_is_refused() -> None:
+    from gantry.policy import PolicyConfigurationError
+
+    with pytest.raises(PolicyConfigurationError):
+        gantry.Policy.from_dict({"name": "p", "rules": "allow everything"})
+    with pytest.raises(PolicyConfigurationError):
+        gantry.Policy.from_dict({"name": "p", "rules": ["allow everything"]})

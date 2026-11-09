@@ -127,6 +127,51 @@ class PolicyRule:
                 "or nothing will ever show them"
             )
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> PolicyRule:
+        """Rebuild a rule from its stored form.
+
+        Absent keys mean unconstrained, exactly as `as_dict` omitted them, so a
+        rule that named no actors comes back naming no actors rather than
+        naming none of them.
+        """
+
+        def names(key: str) -> tuple[str, ...] | None:
+            value = payload.get(key)
+            if value is None:
+                return None
+            return tuple(str(item) for item in _iterable(value, key))
+
+        return cls(
+            effect=Effect(str(payload.get("effect", Effect.ALLOW.value))),
+            name=None if payload.get("name") is None else str(payload["name"]),
+            require_confirmation=bool(payload.get("require_confirmation", False)),
+            confirmation_code=(
+                None
+                if payload.get("confirmation_code") is None
+                else str(payload["confirmation_code"])
+            ),
+            confirmation_message=(
+                None
+                if payload.get("confirmation_message") is None
+                else str(payload["confirmation_message"])
+            ),
+            actors=names("actors"),
+            operations=(
+                None
+                if payload.get("operations") is None
+                else tuple(
+                    OperationKind(str(item))
+                    for item in _iterable(payload["operations"], "operations")
+                )
+            ),
+            engines=names("engines"),
+            sources=names("sources"),
+            destinations=names("destinations"),
+            environments=names("environments"),
+            constraints=_constraints_from(payload.get("constraints")),
+        )
+
     def as_dict(self) -> dict[str, object]:
         payload: dict[str, object] = {"effect": self.effect.value}
         if self.name is not None:
@@ -223,12 +268,46 @@ class Policy:
         )
         return f"sha256:{sha256(canonical.encode()).hexdigest()}"
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> Policy:
+        """Rebuild a policy from its stored form.
+
+        The version is not read back — it is derived from the rules, so a
+        round trip that produced a different one would mean the rules changed.
+        A stored `version` is therefore a checksum worth verifying rather than
+        a value to restore, and `Policy.version` recomputing it is what makes
+        "the run records the exact policy that decided" true after a reload.
+        """
+        stored = payload.get("rules") or []
+        rules: list[PolicyRule] = []
+        for entry in _iterable(stored, "rules"):
+            if not isinstance(entry, Mapping):
+                raise PolicyConfigurationError("each stored rule must be a mapping")
+            rules.append(PolicyRule.from_dict(entry))
+        return cls(name=str(payload.get("name", "")), rules=rules)
+
     def as_dict(self) -> dict[str, object]:
         return {
             "name": self.name,
             "version": self.version,
             "rules": [rule.as_dict() for rule in self.rules],
         }
+
+
+def _constraints_from(value: object) -> dict[str, float]:
+    """Stored constraints, refusing anything that is not a mapping of numbers."""
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise PolicyConfigurationError("constraints must be a mapping in stored policy")
+    return {str(key): float(item) for key, item in value.items()}
+
+
+def _iterable(value: object, field_name: str) -> list[object]:
+    """A stored list, refusing a bare string the way the constructors do."""
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise PolicyConfigurationError(f"{field_name} must be a list in stored policy")
+    return list(value)
 
 
 def _named(rules: Sequence[PolicyRule]) -> list[PolicyRule]:
