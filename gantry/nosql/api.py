@@ -14,7 +14,7 @@ from gantry.evidence import EvidenceBundle, Observation, ObservationSource
 from gantry.execution import Execution
 from gantry.failure import Failure, FailureKind
 from gantry.handle import ExecutionHandle
-from gantry.nosql.adapter import NoSQLAdapter
+from gantry.nosql.adapter import DescribableAdapter, NoSQLAdapter
 from gantry.nosql.bridge import NoSQLExecutionAdapter
 from gantry.nosql.capabilities import NoSQLCapabilities
 from gantry.nosql.inspection import query_request
@@ -335,6 +335,18 @@ class NoSQLConnection:
         return _from_engine_result(
             result, max_documents if isinstance(max_documents, int) else 1_000
         )
+
+    async def describe(self) -> tuple[str, ...]:
+        """The collections in this database, for a caller deciding what to allow.
+
+        The counterpart of `SQLConnection.describe`. A host configuring access
+        has to show someone what there is to grant, and without this it had to
+        reach past the engine to the driver — which is exactly the reach this
+        library exists to make unnecessary.
+        """
+        if not isinstance(self._adapter, DescribableAdapter):
+            raise NotImplementedError(f"{self.provider} cannot list its collections")
+        return await self._adapter.collections(self._target)
 
     async def _inspect_collection(
         self,

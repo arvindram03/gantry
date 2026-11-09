@@ -13,6 +13,7 @@ from collections.abc import Mapping
 
 import gantry
 import pytest
+from gantry.runs.status import RunStatus
 
 URI = os.environ.get("GANTRY_TEST_MONGODB_URI", "mongodb://localhost:27017")
 DATABASE = os.environ.get("GANTRY_TEST_MONGODB_DATABASE", "gantry_test")
@@ -24,12 +25,20 @@ def _connect() -> gantry.nosql.NoSQLConnection:
 
 
 async def _reachable() -> bool:
+    """Reachable means usable, not merely listening.
+
+    `ping` answers before authentication, so a MongoDB that requires
+    credentials the default URI does not carry passed this check and then
+    failed every test on its first real command. Asking the test database a
+    question only an authorized client can answer is the same bar the tests
+    themselves have to clear.
+    """
     import importlib
 
     pymongo = importlib.import_module("pymongo")
     try:
         client = pymongo.AsyncMongoClient(URI, serverSelectionTimeoutMS=2000)
-        await client.admin.command("ping")
+        await client[DATABASE].list_collection_names()
     except Exception:
         return False
     finally:
@@ -81,7 +90,7 @@ async def test_a_write_is_refused_before_it_reaches_the_database(
     query = db.query(read_only=True)
     result = await query("orders", [{"$match": {}}, {"$out": "reporting.rollup"}])
 
-    assert result.status.value == "REJECTED"
+    assert result.status is RunStatus.POLICY_REJECTED
     assert result.failure is not None
     assert "read-only" in result.failure.message
 
@@ -112,7 +121,7 @@ async def test_a_query_against_a_collection_outside_the_allow_list_is_rejected(
     query = db.query(read_only=True, collections=["orders"], timeout=15)
     result = await query("customers", {"status": "open"})
 
-    assert result.status.value == "REJECTED"
+    assert result.status is RunStatus.POLICY_REJECTED
     assert result.failure is not None
     assert "not allowed" in result.failure.message
 
@@ -123,7 +132,7 @@ async def test_a_query_against_a_denied_collection_is_rejected(
     query = db.query(read_only=True, denied_collections=["orders"], timeout=15)
     result = await query("orders", {"status": "open"})
 
-    assert result.status.value == "REJECTED"
+    assert result.status is RunStatus.POLICY_REJECTED
     assert result.failure is not None
     assert "denied" in result.failure.message
 
@@ -145,7 +154,7 @@ async def test_a_lookup_referencing_a_disallowed_collection_is_rejected(
     ]
     result = await query("orders", pipeline)
 
-    assert result.status.value == "REJECTED"
+    assert result.status is RunStatus.POLICY_REJECTED
     assert result.failure is not None
     assert "customers" in result.failure.message
 
@@ -179,7 +188,7 @@ async def test_materialize_rejects_a_source_outside_the_allowed_sources(
     ]
     result = await materialize("orders", pipeline)
 
-    assert result.status.value == "REJECTED"
+    assert result.status is RunStatus.POLICY_REJECTED
     assert result.failure is not None
     assert "customers" in result.failure.message
 
@@ -192,7 +201,7 @@ async def test_materialize_rejects_a_destination_outside_the_allowed_destination
         "orders", [{"$match": {"status": "open"}}, {"$out": "scratch.other"}]
     )
 
-    assert result.status.value == "REJECTED"
+    assert result.status is RunStatus.POLICY_REJECTED
     assert result.failure is not None
     assert "scratch.other" in result.failure.message
 
@@ -210,7 +219,7 @@ async def test_materialize_out_refuses_to_overwrite_an_existing_destination(
     assert first.ok
 
     second = await materialize("orders", pipeline)
-    assert second.status.value == "REJECTED"
+    assert second.status is RunStatus.POLICY_REJECTED
     assert second.failure is not None
     assert "already exists" in second.failure.message
 
@@ -225,7 +234,7 @@ async def test_merge_with_a_disallowed_when_matched_is_rejected(
     ]
     result = await materialize("orders", pipeline)
 
-    assert result.status.value == "REJECTED"
+    assert result.status is RunStatus.POLICY_REJECTED
     assert result.failure is not None
     assert "whenMatched" in result.failure.message
 

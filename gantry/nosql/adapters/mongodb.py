@@ -73,6 +73,11 @@ class MongoAdapter:
     ) -> ValidationResult:
         return ValidationResult.accepted()
 
+    async def collections(self, target: NoSQLTarget) -> tuple[str, ...]:
+        """Every collection in the database this target names."""
+        del target  # the database is fixed when the adapter is built
+        return tuple(sorted(await self._database.list_collection_names()))
+
     async def inspect_collection(
         self,
         reference: CollectionRef,

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from gantry.context import Context
 from gantry.execution import Execution, ExecutionResult, ValidationResult
@@ -10,6 +10,18 @@ from gantry.nosql.capabilities import NoSQLCapabilities
 from gantry.nosql.pipeline import Pipeline
 from gantry.nosql.policy import NoSQLPolicy
 from gantry.nosql.target import NoSQLTarget
+
+
+@runtime_checkable
+class DescribableAdapter(Protocol):
+    """An adapter that can say what a database holds.
+
+    Optional, like `MaterializationAdapter`: a store that cannot enumerate its
+    own collections is still governable, and an adapter should not have to
+    implement a listing it has no way to produce.
+    """
+
+    async def collections(self, target: NoSQLTarget) -> tuple[str, ...]: ...
 
 
 class NoSQLAdapter(Protocol):
