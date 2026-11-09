@@ -39,6 +39,24 @@ class RunStore(Protocol):
         ...
 
 
+@runtime_checkable
+class ListableRunStore(RunStore, Protocol):
+    """A store that can also answer "what has run lately".
+
+    Separate from `RunStore` because the two questions have different costs. A
+    store must be able to record a run and fetch it by id; being able to list
+    runs needs an index, and a store backed by something without one is still a
+    perfectly good store.
+
+    Listing is deliberately minimal here — newest first, optionally one status.
+    Anything richer is a product question: filtering by actor, by resource, by
+    policy version, across tenants. Those belong to whatever is built on top,
+    not to a library that has to run in someone's notebook.
+    """
+
+    def recent(self, *, limit: int = 50, status: str | None = None) -> Sequence[Run]: ...
+
+
 class MemoryRunStore:
     """Process-local storage.
 
@@ -155,9 +173,19 @@ def get(run_id: str) -> Run | None:
 
 
 def recent(*, limit: int = 50, status: str | None = None) -> Sequence[Run]:
-    """Recent runs, newest first. Not required by v0; useful in a terminal."""
-    lister = getattr(_default, "recent", None)
-    return () if lister is None else lister(limit=limit, status=status)
+    """Recent runs, newest first.
+
+    Raises rather than returning nothing when the configured store cannot list.
+    Returning an empty sequence made "this store has no index" indistinguishable
+    from "nothing has run" — the worse of the two answers, because it is the one
+    a person believes.
+    """
+    if not isinstance(_default, ListableRunStore):
+        raise RunPersistenceError(
+            f"{type(_default).__name__} cannot list runs; it implements RunStore but not "
+            "ListableRunStore. Fetch a run by id with `gantry.runs.get(run_id)`."
+        )
+    return _default.recent(limit=limit, status=status)
 
 
 def _native(run: Run) -> str | None:

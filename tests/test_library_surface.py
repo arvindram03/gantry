@@ -157,3 +157,45 @@ def test_the_result_is_json_serializable_whatever_happened(status: RunStatus) ->
     run = make_run(status=status, failure=Failure(FailureKind.TIMEOUT, True, "slow"))
 
     assert json.loads(json.dumps(run.as_tool_result(), default=str))["status"] == status.value
+
+
+# ------------------------------------------ listing is a capability, not a guess
+
+
+def test_a_store_that_cannot_list_says_so_instead_of_saying_nothing() -> None:
+    """An empty answer and an unsupported one are different facts.
+
+    `recent()` used to return `()` for any store without the method, so "this
+    store has no index" was indistinguishable from "nothing has run" — the
+    worse of the two, because it is the one a person believes.
+    """
+    from gantry.runs.store import ListableRunStore, RunPersistenceError
+
+    class Minimal:
+        """Everything `RunStore` requires, and nothing more."""
+
+        def create(self, run: gantry.Run) -> None: ...
+        def update(self, run: gantry.Run) -> None: ...
+        def get(self, run_id: str) -> gantry.Run | None:
+            return None
+
+        def compare_and_set(self, run_id: str, expected: RunStatus, updated: gantry.Run) -> bool:
+            return False
+
+    assert isinstance(Minimal(), gantry.runs.RunStore), "it is a valid store"
+    assert not isinstance(Minimal(), ListableRunStore), "it just cannot list"
+
+    previous = gantry.runs.store()
+    gantry.runs.configure(Minimal())
+    try:
+        with pytest.raises(RunPersistenceError, match="cannot list runs"):
+            gantry.runs.recent()
+    finally:
+        gantry.runs.configure(previous)
+
+
+def test_the_stores_that_ship_can_list(tmp_path: object) -> None:
+    from gantry.runs.store import ListableRunStore
+
+    assert isinstance(gantry.runs.MemoryRunStore(), ListableRunStore)
+    assert isinstance(gantry.runs.SQLiteRunStore(f"{tmp_path}/runs.db"), ListableRunStore)
