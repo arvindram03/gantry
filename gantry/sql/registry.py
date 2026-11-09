@@ -19,6 +19,19 @@ class Provider:
     driver: str
     adapter_factory: AdapterFactory
     validate_config: ConfigValidator
+    connect_defaults: Mapping[str, object] = field(default_factory=dict)
+    """Configuration this provider needs unless the caller says otherwise.
+
+    A preset exists to carry provider-specific behaviour. Without this it
+    carried none — `postgres`, `neon` and `supabase` were registered
+    identically — so every caller had to know that two of the three terminate
+    TLS and require it, and every example, every integration and every
+    downstream service wrote `ssl="require"` again.
+
+    Defaults fill gaps only. Anything the caller passes wins, so a local
+    instance without TLS is still reachable.
+    """
+
     metadata: Mapping[str, object] = field(default_factory=dict)
 
 
@@ -43,6 +56,7 @@ def register_provider(
     driver: str,
     adapter_factory: AdapterFactory,
     validate_config: ConfigValidator | None = None,
+    connect_defaults: Mapping[str, object] | None = None,
     metadata: Mapping[str, object] | None = None,
     replace: bool = False,
 ) -> None:
@@ -51,8 +65,11 @@ def register_provider(
     `adapter_factory` is called with the resolved `SQLTarget` each time a
     connection is opened, so one provider can serve many targets.
     `validate_config` runs before the factory and should raise on
-    configuration the adapter cannot honour. Raises `ValueError` if the name
-    is empty, or already registered and `replace` is false.
+    configuration the adapter cannot honour. `connect_defaults` is
+    configuration the provider needs unless the caller overrides it — TLS on a
+    hosted endpoint, say — so callers do not have to know it. Raises
+    `ValueError` if the name is empty, or already registered and `replace` is
+    false.
     """
     key = name.strip().lower()
     if not key:
@@ -65,6 +82,7 @@ def register_provider(
         driver=driver,
         adapter_factory=adapter_factory,
         validate_config=validate_config or _accept_config,
+        connect_defaults={} if connect_defaults is None else dict(connect_defaults),
         metadata={} if metadata is None else metadata,
     )
 

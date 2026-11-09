@@ -10,6 +10,9 @@ from gantry.sql.adapters.duckdb import DuckDBAdapter
 from gantry.sql.registry import register_provider
 from gantry.sql.target import SQLTarget
 
+#: What a hosted PostgreSQL needs from every caller, declared once.
+_HOSTED_POSTGRES: Mapping[str, object] = {"ssl": "require", "timeout": 30}
+
 
 def _require_url(config: Mapping[str, object]) -> None:
     url = config.get("url")
@@ -105,6 +108,11 @@ def register_builtin_providers() -> None:
             driver="postgres",
             adapter_factory=_postgres_factory,
             validate_config=_require_url,
+            # Neon and Supabase terminate TLS and require it, and a Neon
+            # compute that has scaled to zero takes seconds to wake — so the
+            # first connection is slow rather than broken. Plain `postgres`
+            # may be a local instance with no TLS at all, so it gets neither.
+            connect_defaults=_HOSTED_POSTGRES if name in {"neon", "supabase"} else None,
         )
     register_provider(
         "mysql",

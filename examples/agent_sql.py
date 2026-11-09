@@ -36,31 +36,18 @@ LOCAL_URL = "postgresql://gantry:gantry@localhost:5432/gantry"
 
 
 def connect() -> gantry.sql.SQLConnection:
-    """One connection, three hosting options.
+    """One connection, three hosting options, and nothing to remember.
 
-    `postgres`, `neon` and `supabase` are separate provider presets that share
-    the PostgreSQL dialect and driver. They are named separately so a target
-    can be identified in logs and so a preset can grow provider-specific
-    behaviour without changing calling code.
+    `postgres`, `neon` and `supabase` are separate presets sharing the
+    PostgreSQL dialect and driver. The preset carries what the provider needs —
+    Neon and Supabase terminate TLS and require it, and a compute that has
+    scaled to zero takes a few seconds to wake — so this function does not have
+    to know any of that. Anything you pass yourself still wins.
     """
-    provider = os.environ.get("GANTRY_PROVIDER", "postgres")
-    url = os.environ.get("GANTRY_DATABASE_URL", LOCAL_URL)
-
-    if provider == "neon":
-        # Neon terminates TLS and requires it. A compute that has scaled to
-        # zero takes a few seconds to wake, so the first connection is slow
-        # rather than broken — give it room before deciding it failed.
-        return gantry.sql.connect("neon", url=url, ssl="require", timeout=30)
-
-    if provider == "supabase":
-        # TLS on every endpoint. Nothing else is needed: on the transaction
-        # pooler (`:6543`) the adapter turns off asyncpg's statement cache for
-        # you, because a transaction-pooled backend is often not the one that
-        # prepared the statement. Pass `statement_cache_size` yourself if you
-        # have measured your own deployment and disagree.
-        return gantry.sql.connect("supabase", url=url, ssl="require", timeout=30)
-
-    return gantry.sql.connect("postgres", url=url)
+    return gantry.sql.connect(
+        os.environ.get("GANTRY_PROVIDER", "postgres"),
+        url=os.environ.get("GANTRY_DATABASE_URL", LOCAL_URL),
+    )
 
 
 # ------------------------------------------------------------------ the tool

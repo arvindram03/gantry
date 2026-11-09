@@ -492,12 +492,15 @@ def connect(provider: str, *, policy: Policy | None = None, **config: object) ->
     if policy is not None and not isinstance(policy, Policy):
         raise TypeError("policy must be a gantry.Policy")
     preset = resolve_provider(provider)
-    preset.validate_config(config)
+    # The preset fills in what the provider needs; the caller always wins, so
+    # passing `ssl=None` to reach a local instance still works.
+    settings = {**preset.connect_defaults, **config}
+    preset.validate_config(settings)
     target = SQLTarget(
         provider=preset.name,
         dialect=preset.dialect,
         driver=preset.driver,
-        config=dict(config),
+        config=dict(settings),
         metadata=preset.metadata,
     )
     return SQLConnection(

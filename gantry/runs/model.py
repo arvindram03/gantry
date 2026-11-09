@@ -406,11 +406,44 @@ class Run:
             "completed_at": _time(self.completed_at),
         }
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> Run:
+        """Rebuild a run from its stored form.
+
+        The counterpart to `as_dict`. Anyone implementing `RunStore` over their
+        own database needs this; without it the only way back was a function
+        inside the SQLite store, which told store implementers the library did
+        not expect them to exist.
+        """
+        from gantry.runs.serialization import run_from_dict
+
+        return run_from_dict(dict(payload))
+
+    @classmethod
+    def from_json(cls, document: str) -> Run:
+        """Rebuild a run from the JSON `to_json` produced."""
+        return cls.from_dict(json.loads(document))
+
     def to_json(self, *, indent: int | None = None) -> str:
         return json.dumps(self.as_dict(), indent=indent)
 
     def render(self) -> str:
         return render(self)
+
+    def as_tool_result(self) -> dict[str, object]:
+        """The run as an agent framework should hand it back to a model.
+
+        Every integration needs this and each one was writing its own, which is
+        how two copies of the same idea drift into disagreeing about whether a
+        refusal is an error. It is not: a refused run is a result the model can
+        act on — narrow the query, tell the user what it could not reach — and
+        an exception is not something it can reason about.
+
+        The run id is included deliberately. It costs a few tokens and lets the
+        model quote something an operator can look up afterwards instead of
+        describing from memory what it thinks happened.
+        """
+        return tool_result(self)
 
 
 def _verification_as_dict(verification: VerificationResult | None) -> dict[str, object] | None:
@@ -549,6 +582,49 @@ def _sequence_of_str(value: object) -> tuple[str, ...]:
 
 def _named_in(resource: str, reasons: set[str]) -> bool:
     return any(resource in reason for reason in reasons)
+
+
+def tool_result(run: Run) -> dict[str, object]:
+    """A run in the shape a model reads. See `Run.as_tool_result`."""
+    payload: dict[str, object] = {"run_id": run.id, "status": run.status.value}
+
+    if run.status is RunStatus.ACCEPTED:
+        if run.columns:
+            payload["columns"] = list(run.columns)
+        if run.rows:
+            payload["rows"] = [list(row) for row in run.rows]
+        if run.documents:
+            payload["documents"] = [_plain(document) for document in run.documents]
+        if run.uri is not None:
+            payload["output"] = run.uri
+        if run.truncated:
+            payload["note"] = "truncated by the configured limit"
+        return payload
+
+    if run.status is RunStatus.AWAITING_CONFIRMATION and run.confirmation is not None:
+        # The agent is told to ask, and given the words to ask with. It is not
+        # told how to confirm, because it has no business confirming.
+        payload["confirmation_required"] = run.confirmation.message
+        payload["reasons"] = list(run.confirmation.codes)
+        return payload
+
+    if run.failure is not None:
+        payload["refused_because"] = run.failure.message
+    if run.admission is not None and run.admission.codes:
+        payload["codes"] = list(run.admission.codes)
+    failed_checks = (
+        [check.name for check in run.verification.checks if not check.ok]
+        if (run.verification is not None)
+        else []
+    )
+    if failed_checks:
+        payload["failed_checks"] = failed_checks
+    payload["retry"] = (
+        "the same proposal may be run again"
+        if run.safe_to_retry
+        else "running this again will not help"
+    )
+    return payload
 
 
 def _scalar(value: object) -> str:
