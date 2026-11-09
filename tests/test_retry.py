@@ -10,13 +10,15 @@ answered: whether running the same proposal again is safe.
 from __future__ import annotations
 
 import ast
+import dataclasses
+import json
 import pathlib
 
 import duckdb
 import gantry
 import pytest
 from gantry.failure import Failure, FailureKind
-from gantry.runs.model import ExecutionRecord, OperationKind
+from gantry.runs.model import ExecutionRecord, OperationKind, Run
 from gantry.runs.status import RunStatus
 
 from _runs import make_run
@@ -238,3 +240,71 @@ async def test_rerunning_a_materialization_really_does_fail(tmp_path: pathlib.Pa
     # And the refusal is permanent, so nobody is invited to keep trying.
     assert not again.failure.retryable
     assert not again.safe_to_retry
+
+
+def test_a_stored_run_still_knows_why_it_failed(tmp_path: pathlib.Path) -> None:
+    """The record's whole job is answering what happened.
+
+    `failure` was never serialized, so every run read back from any store said
+    only that it failed: no kind, no engine wording, nothing to debug with. The
+    quiet part was `safe_to_retry`, which asks `failure.retryable` and so
+    answered `False` for every stored run — the safe direction, arrived at by
+    accident rather than by knowing anything.
+    """
+    from gantry.runs.store import SQLiteRunStore
+
+    path = str(tmp_path / "failures.db")
+    writer = SQLiteRunStore(path)
+    run = _failed(FailureKind.TIMEOUT, operation=OperationKind.QUERY, native_id="pg_77")
+    writer.create(run)
+    writer.close()
+
+    recovered = SQLiteRunStore(path).get(run.id)
+    assert recovered is not None
+    assert recovered.failure is not None, "a run that cannot say why it failed is a log line"
+    assert recovered.failure.kind is FailureKind.TIMEOUT
+    assert recovered.failure.retryable
+    assert recovered.failure.message == "engine said so"
+    assert recovered.safe_to_retry, "the same question, answered the same way, after a reload"
+
+
+def test_a_stored_failure_keeps_the_engine_s_own_words(tmp_path: pathlib.Path) -> None:
+    """Normalizing is for branching on; the native detail is for debugging."""
+    from gantry.runs.store import SQLiteRunStore
+
+    path = str(tmp_path / "native.db")
+    store = SQLiteRunStore(path)
+    run = dataclasses.replace(
+        make_run(status=RunStatus.EXECUTION_FAILED),
+        failure=Failure(
+            kind=FailureKind.RESOURCE_EXHAUSTED,
+            retryable=True,
+            message="the warehouse ran out of memory",
+            native_code="53200",
+            native_message="out of memory",
+            native={"sqlstate": "53200", "attempts": 2},
+        ),
+    )
+    store.create(run)
+
+    recovered = SQLiteRunStore(path).get(run.id)
+    assert recovered is not None and recovered.failure is not None
+    assert recovered.failure.native_code == "53200"
+    assert recovered.failure.native_message == "out of memory"
+    assert recovered.failure.native == {"sqlstate": "53200", "attempts": 2}
+
+
+def test_a_failure_kind_from_a_newer_version_is_read_rather_than_refused() -> None:
+    """Losing the exact kind beats refusing to deserialize the record."""
+    payload = json.loads(
+        dataclasses.replace(
+            make_run(status=RunStatus.EXECUTION_FAILED),
+            failure=Failure(FailureKind.ENGINE_ERROR, False, "something new went wrong"),
+        ).to_json()
+    )
+    payload["failure"]["kind"] = "A_KIND_INVENTED_LATER"
+
+    recovered = Run.from_dict(payload)
+    assert recovered.failure is not None
+    assert recovered.failure.kind is FailureKind.ENGINE_ERROR
+    assert recovered.failure.message == "something new went wrong"

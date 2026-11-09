@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from typing import Any, cast
 
 import gantry
@@ -608,22 +608,18 @@ async def test_nosql_internal_error_is_not_recorded_as_policy_rejected() -> None
 def test_mongo_adapter_reports_a_clear_error_without_pymongo(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import builtins
+    """Absence is staged in `sys.modules`, not by patching `__import__`.
 
-    real_import = builtins.__import__
+    The adapter reaches for the driver with `importlib.import_module`, which
+    returns a cached module straight from `sys.modules` without ever calling
+    `builtins.__import__`. Patching that builtin therefore only blocked the
+    import when nothing earlier in the session had imported pymongo — so this
+    test passed or failed depending on which files ran before it. A `None`
+    entry makes the import raise however often pymongo has already been loaded.
+    """
+    import sys
 
-    def _blocked_import(
-        name: str,
-        import_globals: Mapping[str, object] | None = None,
-        import_locals: Mapping[str, object] | None = None,
-        fromlist: Sequence[str] = (),
-        level: int = 0,
-    ) -> object:
-        if name == "pymongo":
-            raise ImportError("no module named pymongo")
-        return real_import(name, import_globals, import_locals, fromlist, level)
-
-    monkeypatch.setattr(builtins, "__import__", _blocked_import)
+    monkeypatch.setitem(sys.modules, "pymongo", None)
 
     from gantry.nosql.adapters.mongodb import MongoAdapter
 

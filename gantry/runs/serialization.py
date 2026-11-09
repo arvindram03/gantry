@@ -19,6 +19,7 @@ from gantry.actor import ActorRef, ActorType
 from gantry.confirmation.model import ConfirmationReason, ConfirmationRecord
 from gantry.confirmation.status import ConfirmationReasonCode, ConfirmationStatus
 from gantry.evidence import EvidenceBundle, Observation, ObservationSource
+from gantry.failure import Failure, FailureKind
 from gantry.runs.model import (
     AdmissionRecord,
     ExecutionRecord,
@@ -64,6 +65,7 @@ def run_from_dict(payload: dict[str, object]) -> Run:
         confirmation=_confirmation(payload.get("confirmation")),
         execution=_execution(payload.get("execution")),
         verification=_verification(payload.get("verification")),
+        failure=_failure(payload.get("failure")),
         evidence=evidence_from_dict(payload.get("evidence")),
         created_at=_time(payload.get("created_at")) or datetime.now(),
         updated_at=_time(payload.get("updated_at")) or datetime.now(),
@@ -157,6 +159,30 @@ def _execution(value: object) -> ExecutionRecord | None:
         started_at=_time(data.get("started_at")),
         finished_at=_time(data.get("finished_at")),
         metrics=_mapping(data.get("metrics")),
+    )
+
+
+def _failure(value: object) -> Failure | None:
+    """Rebuild a failure, defaulting a kind nobody recognises rather than raising.
+
+    A stored run written by a newer version is still worth reading: losing the
+    exact kind is a smaller loss than refusing to deserialize the record.
+    """
+    data = _mapping(value)
+    if not data:
+        return None
+    raw = str(data.get("kind", FailureKind.ENGINE_ERROR.value))
+    try:
+        kind = FailureKind(raw)
+    except ValueError:
+        kind = FailureKind.ENGINE_ERROR
+    return Failure(
+        kind=kind,
+        retryable=bool(data.get("retryable", kind.transient)),
+        message=str(data.get("message", "")),
+        native_code=_optional_str(data.get("native_code")),
+        native_message=_optional_str(data.get("native_message")),
+        native=_mapping(data.get("native")),
     )
 
 

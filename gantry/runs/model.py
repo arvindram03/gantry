@@ -253,6 +253,16 @@ class Run:
     """
 
     failure: Failure | None = field(default=None, compare=False, repr=False)
+    """Why the run did not produce a trustworthy result.
+
+    Stored, unlike `inline` and `handle`. A durable record whose whole purpose
+    is answering what happened cannot drop the answer on the way to disk: read
+    back, such a run said only that it failed, and `safe_to_retry` — which asks
+    `failure.retryable` — degraded to `False` for every stored run without
+    saying why. Kept out of `compare` because two runs are the same run when
+    their stored decisions match.
+    """
+
     handle: ExecutionHandle | None = field(default=None, compare=False, repr=False)
     """The engine handle, for callers that submit and wait separately.
 
@@ -400,6 +410,7 @@ class Run:
             "confirmation": None if self.confirmation is None else self.confirmation.as_dict(),
             "execution": None if self.execution is None else self.execution.as_dict(),
             "verification": _verification_as_dict(self.verification),
+            "failure": _failure_as_dict(self.failure),
             "evidence": None if self.evidence is None else self.evidence.as_dict(),
             "created_at": _time(self.created_at),
             "updated_at": _time(self.updated_at),
@@ -444,6 +455,24 @@ class Run:
         describing from memory what it thinks happened.
         """
         return tool_result(self)
+
+
+def _failure_as_dict(failure: Failure | None) -> dict[str, object] | None:
+    """The stored form of a failure, engine wording and all.
+
+    `kind` and `retryable` are what code branches on; the native fields are what
+    someone reads when the normalized kind is not enough to debug with.
+    """
+    if failure is None:
+        return None
+    return {
+        "kind": failure.kind.value,
+        "retryable": failure.retryable,
+        "message": failure.message,
+        "native_code": failure.native_code,
+        "native_message": failure.native_message,
+        "native": {key: _plain(value) for key, value in failure.native.items()},
+    }
 
 
 def _verification_as_dict(verification: VerificationResult | None) -> dict[str, object] | None:
