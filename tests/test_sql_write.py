@@ -623,3 +623,44 @@ async def test_the_check_tool_answers_a_row_write_as_the_write_it_would_be(path:
     assert "does not offer a tool that changes rows" in str(not_offered["because"])
     assert a_read["allowed"] is True
     assert "operation" not in a_read, "a read is answered as it always was"
+
+
+async def test_a_write_rolled_back_still_says_why_when_it_is_read_back(path: Path) -> None:
+    """The reason has to be in the stored run, not only on the one handed back.
+
+    An execution failure has no admission record or failed check to keep its
+    reason in. Attached only to the returned object, it was gone the moment
+    anyone looked the run up — which is how every reader other than the caller
+    meets it.
+    """
+    db = gantry.sql.connect("duckdb", path=str(path))
+    run = await db.write(destinations=["scratch.*"], max_rows_affected=10)(
+        "DELETE FROM scratch.notes WHERE id < 40"
+    )
+
+    stored = gantry.runs.get(run.id)
+
+    assert stored is not None
+    assert stored.status is RunStatus.EXECUTION_FAILED
+    assert stored.failure is not None, "the stored run lost the reason it failed"
+    assert stored.failure.kind is FailureKind.ROW_LIMIT_EXCEEDED
+    assert "40 rows" in stored.failure.message
+
+
+async def test_a_query_that_failed_in_the_engine_still_says_why_when_it_is_read_back(
+    path: Path,
+) -> None:
+    """The same loss, on the read path: it was never specific to writes.
+
+    A statement that validates and then fails on the data — the cast is fine
+    until it meets a row that is not a number.
+    """
+    db = gantry.sql.connect("duckdb", path=str(path), read_only=True)
+    run = await db.query()("SELECT CAST(body AS INTEGER) FROM scratch.notes")
+
+    stored = gantry.runs.get(run.id)
+
+    assert run.status is RunStatus.EXECUTION_FAILED, run.status
+    assert stored is not None
+    assert stored.failure is not None, "the stored run lost the reason it failed"
+    assert stored.failure.message == run.failure.message  # type: ignore[union-attr]

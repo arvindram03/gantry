@@ -38,6 +38,14 @@ Notable changes. Dates are release dates; the format follows
   one of the two tables PostgreSQL would change. `write_targets` now lists every
   table a statement changes.
 
+### Fixed
+
+- A run that failed in the engine lost its reason when it was stored. Every
+  caller attached the failure to the run it returned and none saved it, so a
+  timeout, a run-time error or a write over its row limit read back as
+  `EXECUTION_FAILED` with nothing to say why. `RunRecorder.execution_failed`
+  now takes the failure and stores it with the run.
+
 ### Added
 
 - **Governed writes.** `db.write(destinations=[...])` runs one `INSERT`,

@@ -647,7 +647,7 @@ class SQLMaterializer:
                 status=RunStatus.VERIFICATION_CONFLICT,
             ).with_failure(result.failure)
         if result.status is not ResultStatus.ACCEPTED and result.verification is None:
-            return recorder.execution_failed().with_failure(result.failure)
+            return recorder.execution_failed(result.failure)
         recorder.verifying()
         return recorder.decided(
             verification=result.verification,

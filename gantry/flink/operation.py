@@ -637,7 +637,7 @@ def _recorded(result: FlinkResult, *, recorder: RunRecorder | None = None) -> Ru
             ).with_failure(result.failure)
         if result.status is not ResultStatus.ACCEPTED and result.verification is None:
             native = dict(result.execution.native) if result.execution is not None else {}
-            return recorder.execution_failed(metrics=native).with_failure(result.failure)
+            return recorder.execution_failed(result.failure, metrics=native)
         recorder.verifying()
         return recorder.decided(
             verification=result.verification,
@@ -665,7 +665,7 @@ def _recorded(result: FlinkResult, *, recorder: RunRecorder | None = None) -> Ru
 
         recorder = RunRecorder(kind=kind, engine="flink", provider="flink")
         run = (
-            recorder.execution_failed()
+            recorder.execution_failed(result.failure)
             if result.status is not ResultStatus.ACCEPTED
             else recorder.decided(verification=result.verification)
         )

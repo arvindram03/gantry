@@ -366,7 +366,7 @@ class SQLWrite:
             ).with_failure(failure)
         if result.status is not ResultStatus.ACCEPTED:
             # Includes a statement over its row limit, which was rolled back.
-            return recorder.execution_failed().with_failure(result.failure)
+            return recorder.execution_failed(result.failure)
 
         affected = result.metrics.rows_written
         if affected is None:
@@ -377,7 +377,7 @@ class SQLWrite:
                 False,
                 "the adapter did not report how many rows the statement changed",
             )
-            return recorder.execution_failed().with_failure(failure)
+            return recorder.execution_failed(failure)
 
         inline = _returned(result, self._policy.max_rows)
         target = classification.write_targets[0]

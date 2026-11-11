@@ -343,7 +343,7 @@ class SQLConnection:
                 evidence=evidence,
             ).with_failure(failure)
         if status not in {ResultStatus.ACCEPTED, ResultStatus.VERIFICATION_FAILED}:
-            return recorder.execution_failed().with_failure(failure)
+            return recorder.execution_failed(failure)
         recorder.verifying()
         return recorder.decided(
             verification=verification,

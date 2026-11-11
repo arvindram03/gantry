@@ -183,9 +183,19 @@ class RunRecorder:
         )
 
     def execution_failed(
-        self, reason: str | None = None, *, metrics: Mapping[str, object] | None = None
+        self,
+        failure: Failure | None = None,
+        *,
+        metrics: Mapping[str, object] | None = None,
     ) -> Run:
         """The engine could not do work Gantry had admitted.
+
+        `failure` is stored with the run. A refusal keeps its reason in the
+        admission record and a failed check keeps its own, but an execution
+        failure has nowhere else to put one: every caller used to attach it to
+        the run it returned and none saved it, so a run that failed in the
+        engine — a timeout, a syntax error, a write over its row limit — read
+        back as having failed and could not say why.
 
         `metrics` carries whatever the engine said about the failure. Losing it
         means the record can say a job failed but not what the engine called
@@ -195,7 +205,7 @@ class RunRecorder:
             RunStatus.EXECUTION_FAILED,
             execution=replace(self._finished("FAILED"), metrics=dict(metrics or {})),
             admission=self.run.admission or AdmissionRecord(allowed=True),
-            **({"failure": reason} if reason else {}),
+            **({"failure": failure} if failure is not None else {}),
         )
 
     def verifying(self) -> Run:
@@ -331,7 +341,7 @@ def run_from_evidence(
             evidence=evidence,
         )
     if status is not None and status is not ResultStatus.ACCEPTED and verification is None:
-        return recorder.execution_failed()
+        return recorder.execution_failed(failure)
     recorder.running(handle)
     return recorder.decided(
         verification=verification,
