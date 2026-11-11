@@ -40,7 +40,6 @@ from gantry.sql.resultset import (
 )
 from gantry.sql.schema import DatabaseSchema, Table
 from gantry.sql.target import SQLTarget
-from gantry.sql.visibility import visible
 from gantry.store import MemoryExecutionStore
 from gantry.target import ExecutionTarget
 from gantry.verifier import CheckResult, CheckSource, VerificationResult, Verifier
@@ -96,24 +95,18 @@ class SQLConnection:
 
         return self._adapter.capabilities()
 
-    async def describe(self, *, policy: SQLPolicy | None = None) -> DatabaseSchema:
+    async def describe(self) -> DatabaseSchema:
         """Return normalized catalogs, schemas, tables, and columns.
 
-        With `policy`, the answer is narrowed to what an agent under those
-        bounds — and under this connection's reusable policy, if it has one —
-        could actually read. Without it, the answer is everything the
-        credential can see, which is the right shape for a human configuring
-        access and the wrong shape to put in a prompt: the tables someone
-        denied are usually denied because their structure is the sensitive
-        part, and describing them hands that over.
+        Everything the credential can see, which is the shape a person
+        configuring access needs. What may actually be *read* is a narrower
+        question, and the policy answers it: on the query path by refusing,
+        and ahead of time through `check_tool`.
         """
 
         if not self._adapter.capabilities().describe_schema:
             raise NotImplementedError(f"{self.provider} does not support schema discovery")
-        described = await self._adapter.describe(self._target)
-        if policy is None and self._policy is None:
-            return described
-        return visible(described, provider=self.provider, bounds=policy, policy=self._policy)
+        return await self._adapter.describe(self._target)
 
     async def validate(
         self,

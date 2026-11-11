@@ -8,9 +8,8 @@ what is here, and would this be allowed — plus the one it needs afterwards whe
 a run is held for confirmation.
 
 None of them reach the database any way the query path does not. `describe` is
-narrowed by the same two layers that decide a query, so an agent is never shown
-a table it could not read, and `check` is the policy evaluator answering about
-a statement nobody ran.
+the adapter's own schema listing, and `check` is the policy evaluator answering
+about a statement nobody ran.
 """
 
 from __future__ import annotations
@@ -29,23 +28,22 @@ from gantry.tool import Tool
 def describe_tool(
     connection: Any,
     *,
-    policy: SQLPolicy | None = None,
     name: str = "describe_schema",
     description: str = (
-        "List the schemas, tables and columns this connection may read. "
+        "List the schemas, tables and columns on this connection. "
         "Call this before writing SQL rather than guessing names."
     ),
 ) -> Tool[dict[str, object]]:
-    """A tool that answers "what is here", narrowed to what may be read.
+    """A tool that answers "what is here".
 
-    The narrowing is the point. `describe()` without a policy reports what the
-    credential can see, which includes the tables someone deliberately denied —
-    and their structure is usually the reason they were denied.
+    An agent that can read the schema stops guessing table names, which is
+    most of what it is refused for. What it may actually read is a narrower
+    question and the policy answers it: `check` says whether a statement would
+    be allowed, and the query path refuses one that would not be.
     """
-    bounds = policy or SQLPolicy()
 
     async def handler(_: Mapping[str, object]) -> dict[str, object]:
-        schema = await connection.describe(policy=bounds)
+        schema = await connection.describe()
         return {
             "schemas": list(schema.schemas),
             "tables": [

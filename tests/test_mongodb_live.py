@@ -491,23 +491,3 @@ async def test_confirmation_holds_a_write_back_until_the_host_answers() -> None:
 
     assert "confirm_rollup" in after, "a confirmed write must actually happen"
     assert "declined_rollup" not in after, "a declined write must never happen"
-
-
-async def test_a_denied_collection_is_not_described_to_an_agent(
-    db: gantry.nosql.NoSQLConnection,
-) -> None:
-    """The same leak the SQL side had.
-
-    Knowing a collection exists is most of what denying it was meant to
-    prevent, so the listing narrows the same way a query does.
-    """
-    from gantry.nosql.policy import NoSQLPolicy
-
-    everything = await db.describe()
-    assert "orders" in everything
-
-    narrowed = await db.describe(policy=NoSQLPolicy(denied_collections=["orders"]))
-    assert "orders" not in narrowed
-
-    allowed = await db.describe(policy=NoSQLPolicy(allowed_collections=["orders"]))
-    assert tuple(allowed) == ("orders",)

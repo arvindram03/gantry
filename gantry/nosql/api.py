@@ -32,7 +32,6 @@ from gantry.nosql.result import NoSQLResult
 from gantry.nosql.target import NoSQLTarget
 from gantry.nosql.verify import CollectionSnapshot, DocumentCheck
 from gantry.output import OutputKind, OutputRef
-from gantry.policy.evaluator import evaluate
 from gantry.policy.model import Policy
 from gantry.result import Result, ResultStatus
 from gantry.runs.lifecycle import RunRecorder, run_from_evidence
@@ -337,46 +336,17 @@ class NoSQLConnection:
             result, max_documents if isinstance(max_documents, int) else 1_000
         )
 
-    async def describe(self, *, policy: NoSQLPolicy | None = None) -> tuple[str, ...]:
+    async def describe(self) -> tuple[str, ...]:
         """The collections in this database, for a caller deciding what to allow.
 
-        The counterpart of `SQLConnection.describe`, including the narrowing:
-        with `policy`, the answer is what an agent under those bounds and this
-        connection's reusable policy could actually read. A collection someone
-        denied is not listed, because knowing it exists is most of what denying
-        it was meant to prevent.
-
-        Without a policy the answer is everything, which is the shape a host
-        configuring access needs — and without this it had to reach past the
-        engine to the driver, which is exactly the reach this library exists to
-        make unnecessary.
+        The counterpart of `SQLConnection.describe`. A host configuring access
+        has to show someone what there is to grant, and without this it had to
+        reach past the engine to the driver — which is exactly the reach this
+        library exists to make unnecessary.
         """
         if not isinstance(self._adapter, DescribableAdapter):
             raise NotImplementedError(f"{self.provider} cannot list its collections")
-        found = await self._adapter.collections(self._target)
-        if policy is None and self._policy is None:
-            return found
-        return tuple(name for name in found if self._readable(name, policy))
-
-    def _readable(self, collection: str, bounds: NoSQLPolicy | None) -> bool:
-        """Whether both layers would admit reading this collection."""
-        if bounds is not None:
-            lowered = collection.lower()
-            if {denied.lower() for denied in bounds.denied_collections} & {lowered}:
-                return False
-            allowed = {name.lower() for name in bounds.allowed_collections}
-            if allowed and lowered not in allowed:
-                return False
-        if self._policy is None:
-            return True
-        request = query_request(
-            collection,
-            [{"$match": {}}],
-            provider=self.provider,
-            database=self.database,
-            policy=bounds or NoSQLPolicy(),
-        )
-        return evaluate(self._policy, request).allowed
+        return await self._adapter.collections(self._target)
 
     async def _inspect_collection(
         self,

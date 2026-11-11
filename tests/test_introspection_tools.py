@@ -1,19 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """The tools an agent uses before and after it writes a statement.
 
-Against a real PostgreSQL, because the claim being tested is that a schema
-handed to a model omits the tables the policy denies — and a stub would agree
-with whatever this code did.
+Against a real PostgreSQL, because the claims being tested are about what a
+real database reports and what the evaluator says about real statements — and
+a stub would agree with whatever this code did.
 """
 
 from __future__ import annotations
 
 import os
+from typing import Any, cast
 
 import gantry
 import pytest
 from gantry.sql.introspection import check_tool, describe_tool, status_tool
-from gantry.sql.policy import SQLPolicy
 
 URL = os.environ.get("GANTRY_TEST_POSTGRES_URL", "postgresql://gantry:gantry@localhost:5432/gantry")
 
@@ -41,8 +41,8 @@ async def _db(policy: gantry.Policy | None = None) -> gantry.sql.SQLConnection:
 # --------------------------------------------------------------- describe
 
 
-async def test_describe_without_a_policy_still_shows_everything() -> None:
-    """The shape a person configuring access needs, unchanged."""
+async def test_describe_lists_what_the_credential_can_see() -> None:
+    """The shape a person configuring access needs."""
     db = await _db()
     schema = await db.describe()
     names = {f"{table.schema}.{table.name}" for table in schema.tables}
@@ -50,56 +50,14 @@ async def test_describe_without_a_policy_still_shows_everything() -> None:
     assert "analytics_pii.customer_contacts" in names
 
 
-async def test_a_denied_table_is_not_described_to_an_agent() -> None:
-    """The bug this exists for.
-
-    A denied table is usually denied because its structure is the sensitive
-    part. Describing it hands over the column names, the types and the fact
-    that it exists — around the deny rule rather than through it.
-    """
-    db = await _db()
-    bounds = SQLPolicy(denied_tables=["analytics_pii.customer_contacts"])
-
-    schema = await db.describe(policy=bounds)
-
-    names = {f"{table.schema}.{table.name}" for table in schema.tables}
-    assert "analytics.orders" in names
-    assert "analytics_pii.customer_contacts" not in names
-
-
-async def test_a_schema_outside_the_allow_list_is_not_described() -> None:
-    db = await _db()
-    schema = await db.describe(policy=SQLPolicy(allowed_schemas=["analytics"]))
-
-    assert {table.schema for table in schema.tables} == {"analytics"}
-    assert "analytics_pii" not in schema.schemas
-
-
-async def test_the_reusable_policy_narrows_the_schema_too() -> None:
-    """Both layers, because both layers decide a query.
-
-    A connection whose policy allows one table should not describe the rest:
-    the agent would be invited to reference what it cannot read.
-    """
-    policy = gantry.Policy(
-        name="only-orders",
-        rules=[gantry.allow.query(name="orders", sources=["analytics.orders"])],
-    )
-    db = await _db(policy)
-
-    schema = await db.describe(policy=SQLPolicy())
-
-    names = {f"{table.schema}.{table.name}" for table in schema.tables}
-    assert names == {"analytics.orders"}, names
-
-
 async def test_the_tool_returns_columns_an_agent_can_write_sql_against() -> None:
     db = await _db()
-    tool = describe_tool(db, policy=SQLPolicy(allowed_schemas=["analytics"]))
+    tool = describe_tool(db)
 
     answer = await tool.invoke({})
 
-    tables = {table["name"]: table for table in answer["tables"]}
+    listed = cast("list[dict[str, Any]]", answer["tables"])
+    tables = {table["name"]: table for table in listed}
     assert "analytics.orders" in tables
     assert tables["analytics.orders"]["columns"], "a schema with no columns helps nobody"
 
@@ -176,4 +134,4 @@ async def test_status_says_so_when_the_id_is_not_one() -> None:
     answer = await status_tool().invoke({"run_id": "run_nope"})
 
     assert answer["status"] == "UNKNOWN"
-    assert "run_nope" in answer["error"]
+    assert "run_nope" in str(answer["error"])
