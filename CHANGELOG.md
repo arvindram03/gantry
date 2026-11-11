@@ -47,8 +47,11 @@ Notable changes. Dates are release dates; the format follows
   write over its limit changes nothing and says how much it would have changed
   (`FailureKind.ROW_LIMIT_EXCEEDED`). An `UPDATE` or `DELETE` with no `WHERE` is
   refused before it runs; what a statement reads besides its own table has to
-  be named in `sources`; `merge` has to be asked for. `write.tool()` is the
-  agent form. PostgreSQL, Neon, Supabase, MySQL and DuckDB declare the new
+  be named in `sources`; `denied_tables` wins over both; `merge` has to be
+  asked for. `write.tool()` is the agent form, and `write.check(sql)` says
+  whether a statement would be admitted without running it — `check_tool(...,
+  write=...)` uses it, so a row write is answered as the write it would be sent
+  as rather than as a query that happens to write. PostgreSQL, Neon, Supabase, MySQL and DuckDB declare the new
   `affected_row_limit` capability; BigQuery and Snowflake do not yet, so a
   write there is refused rather than run unbounded.
 - `OperationKind.WRITE`, with `gantry.allow.write(...)` and

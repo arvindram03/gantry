@@ -418,6 +418,7 @@ class SQLConnection:
         *,
         destinations: Sequence[str],
         sources: Sequence[str] = (),
+        denied_tables: Sequence[str] = (),
         statements: Sequence[str] = ("insert", "update", "delete"),
         max_rows_affected: int = 100,
         require_where: bool = True,
@@ -428,6 +429,7 @@ class SQLConnection:
 
         `destinations` are the tables that may be changed and `sources` what a
         statement may read besides the one it changes; both take patterns.
+        `denied_tables` wins over both.
         `max_rows_affected` is enforced, not reported: the statement runs in a
         transaction and is rolled back if it changed more, so a write over its
         limit changes nothing. `max_rows` bounds what a `RETURNING` hands back.
@@ -443,6 +445,7 @@ class SQLConnection:
             WritePolicy(
                 destinations=destinations,
                 sources=sources,
+                denied_tables=denied_tables,
                 statements=statements,
                 max_rows_affected=max_rows_affected,
                 require_where=require_where,

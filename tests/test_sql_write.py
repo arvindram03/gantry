@@ -555,3 +555,71 @@ async def test_a_read_stays_silent_about_rows_affected(path: Path) -> None:
     assert run.rows_affected is None
     assert "rows_affected" not in run.as_tool_result()
     assert "affected" not in (run.as_dict()["result_ref"] or {})  # type: ignore[operator]
+
+
+# ------------------------------------------------ denied tables, and asking first
+
+
+async def test_a_denied_table_is_neither_written_nor_read(path: Path) -> None:
+    """Denied wins over the patterns that would have allowed it, in both directions."""
+    db = gantry.sql.connect("duckdb", path=str(path))
+    write = db.write(
+        destinations=["scratch.*", "prod.*"],
+        sources=["prod.*"],
+        denied_tables=["prod.orders"],
+    )
+
+    as_target = await write("UPDATE prod.orders SET total = 0 WHERE id = 1")
+    as_source = await write("INSERT INTO scratch.notes SELECT id + 500, 'x' FROM prod.orders")
+
+    assert as_target.status is RunStatus.POLICY_REJECTED
+    assert as_target.failure is not None
+    assert as_target.failure.kind is FailureKind.DESTINATION_NOT_ALLOWED
+    assert as_source.status is RunStatus.POLICY_REJECTED
+    assert as_source.failure is not None
+    assert as_source.failure.kind is FailureKind.SOURCE_NOT_ALLOWED
+    assert "prod.orders is denied" in as_source.failure.message
+    assert (_count(path, "scratch.notes"), _count(path, "prod.orders", "total = 0")) == (50, 0)
+
+
+async def test_a_write_can_be_checked_without_being_run(path: Path) -> None:
+    """Asked first, nothing changes and nothing is recorded."""
+    policy = Policy(
+        "scratch-only",
+        [allow.write(destinations=["scratch.*"]), deny.write(destinations=["prod.*"], name="np")],
+    )
+    db = gantry.sql.connect("duckdb", path=str(path), policy=policy)
+    write = db.write(destinations=["scratch.*", "prod.*"], max_rows_affected=7)
+
+    fine = write.check("DELETE FROM scratch.notes WHERE id < 40")
+    by_policy = write.check("UPDATE prod.orders SET total = 0 WHERE id = 1")
+    by_bounds = write.check("DELETE FROM scratch.notes")
+
+    assert fine["allowed"] is True
+    assert fine["writes"] == ["scratch.notes"]
+    assert fine["max_rows_affected"] == 7, "the limit it will be held to when it does run"
+    assert by_policy["allowed"] is False
+    assert by_policy["rules"] == ["np"]
+    assert by_bounds["allowed"] is False
+    assert "WHERE" in str(by_bounds["because"])
+    assert _count(path, "scratch.notes") == 50
+
+
+async def test_the_check_tool_answers_a_row_write_as_the_write_it_would_be(path: Path) -> None:
+    """A write checked as a query is a different operation and a different answer."""
+    from gantry.sql.introspection import check_tool
+
+    policy = Policy("p", [allow.query(), allow.write(destinations=["scratch.*"])])
+    db = gantry.sql.connect("duckdb", path=str(path), policy=policy)
+    write = db.write(destinations=["scratch.*"])
+    sql = "UPDATE scratch.notes SET body = 'x' WHERE id = 1"
+
+    offered = await check_tool(db, write=write).invoke(sql=sql)
+    not_offered = await check_tool(db).invoke(sql=sql)
+    a_read = await check_tool(db, write=write).invoke(sql="SELECT id FROM scratch.notes")
+
+    assert (offered["operation"], offered["allowed"]) == ("write", True)
+    assert not_offered["allowed"] is False
+    assert "does not offer a tool that changes rows" in str(not_offered["because"])
+    assert a_read["allowed"] is True
+    assert "operation" not in a_read, "a read is answered as it always was"

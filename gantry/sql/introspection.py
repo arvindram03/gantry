@@ -19,6 +19,7 @@ from typing import Any
 
 from gantry.policy.evaluator import evaluate
 from gantry.runs.status import RunStatus
+from gantry.sql.affected import ROW_WRITES
 from gantry.sql.inspection import query_request
 from gantry.sql.policy import SQLPolicy
 from gantry.sql.registry import resolve_dialect, resolve_provider
@@ -72,6 +73,7 @@ def check_tool(
     connection: Any,
     *,
     policy: SQLPolicy | None = None,
+    write: Any | None = None,
     name: str = "check_query",
     description: str = (
         "Say what a statement would read and write, and whether it would be "
@@ -83,11 +85,34 @@ def check_tool(
     The same classifier and the same evaluator the real path uses, so what it
     says is what would happen. An agent that can ask before acting stops
     guessing, and a refusal it avoids is a round trip nobody spends.
+
+    `write` is the configured write operation, when the host offers one. A
+    statement that changes rows is then answered as the write it would be sent
+    as, against that operation's bounds — not as a query that happens to write,
+    which is a different operation and usually a different answer. Without it,
+    a row write is reported as something no tool here would run.
     """
     bounds = policy or SQLPolicy()
 
     async def handler(arguments: Mapping[str, object]) -> dict[str, object]:
         sql = str(arguments.get("sql", ""))
+        dialect = resolve_dialect(resolve_provider(connection.provider).dialect)
+        classified = dialect.classify(sql)
+        if classified.operation in ROW_WRITES:
+            if write is not None:
+                return dict(write.check(sql))
+            written = {reference.qualified_name for reference in classified.write_targets}
+            return {
+                "operation": "write",
+                "reads": [
+                    reference.qualified_name
+                    for reference in classified.tables
+                    if reference.qualified_name not in written
+                ],
+                "writes": sorted(written),
+                "allowed": False,
+                "because": ["this connection does not offer a tool that changes rows"],
+            }
         request = query_request(
             sql,
             dialect=resolve_dialect(resolve_provider(connection.provider).dialect),

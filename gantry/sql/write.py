@@ -57,6 +57,8 @@ class WritePolicy:
     `sources` is what the statement may read *besides* the table it changes,
     and is empty by default, so an `INSERT ... SELECT` from somewhere else has
     to be allowed by name. Both take `fnmatch` patterns, lower-cased here.
+    `denied_tables` always wins, over both: a table named there is neither
+    written nor read, however broad the pattern that would have allowed it.
 
     `statements` defaults to insert, update and delete. `merge` is accepted
     but has to be asked for: one statement that inserts, updates and deletes
@@ -70,6 +72,7 @@ class WritePolicy:
 
     destinations: Collection[str]
     sources: Collection[str] = ()
+    denied_tables: Collection[str] = ()
     statements: Collection[str] = ("insert", "update", "delete")
     max_rows_affected: int = 100
     require_where: bool = True
@@ -77,7 +80,7 @@ class WritePolicy:
     timeout_seconds: float = 30
 
     def __post_init__(self) -> None:
-        for field_name in ("destinations", "sources", "statements"):
+        for field_name in ("destinations", "sources", "denied_tables", "statements"):
             values = getattr(self, field_name)
             if isinstance(values, str):
                 raise TypeError(f"{field_name} must be a collection, not a string")
@@ -166,6 +169,59 @@ class SQLWrite:
         """What the statement would change and read, without running it."""
         return self._connection._dialect.classify(sql)
 
+    def check(self, sql: str) -> dict[str, object]:
+        """Whether this write would be admitted, and why, without running it.
+
+        The same two decisions the real path makes, in the same order: this
+        operation's own bounds, then the connection's reusable policy. Nothing
+        reaches the engine and no run is recorded, so an agent can ask before
+        it acts — but that also means the one bound only the engine can apply,
+        how many rows the statement turns out to change, is not answered here.
+        `allowed` is `None` when the bounds admit the statement and no policy
+        is attached to say more.
+        """
+        from gantry.policy.evaluator import evaluate
+
+        connection = self._connection
+        classification = self.inspect(sql)
+        written = {reference.qualified_name for reference in classification.write_targets}
+        answer: dict[str, object] = {
+            "operation": "write",
+            "reads": [
+                reference.qualified_name
+                for reference in classification.tables
+                if reference.qualified_name not in written
+            ],
+            "writes": sorted(written),
+            "max_rows_affected": self._policy.max_rows_affected,
+        }
+        refusal = self._refusal(classification)
+        if refusal is not None:
+            return {
+                **answer,
+                "allowed": False,
+                "because": [refusal[1]],
+                "codes": [refusal[0].value],
+            }
+        if connection.policy is None:
+            return {
+                **answer,
+                "allowed": None,
+                "because": ["no policy is attached to this connection"],
+            }
+        request = write_request(
+            classification, provider=connection.provider, policy=self._policy.bounds()
+        )
+        decision = evaluate(connection.policy, request)
+        return {
+            **answer,
+            "allowed": decision.allowed,
+            "because": list(decision.messages()),
+            "codes": list(decision.codes),
+            "rules": list(decision.matched_rules),
+            "confirmation_required": decision.confirmation.required,
+        }
+
     def tool(
         self,
         *,
@@ -248,6 +304,18 @@ class SQLWrite:
                 f"{', '.join(target.qualified_name for target in targets)}",
             )
         target = targets[0]
+        denied = [
+            reference.qualified_name
+            for reference in classification.tables
+            if _matches(reference, policy.denied_tables)
+        ]
+        if denied:
+            return (
+                FailureKind.DESTINATION_NOT_ALLOWED
+                if target.qualified_name in denied
+                else FailureKind.SOURCE_NOT_ALLOWED,
+                f"{', '.join(denied)} is denied to this operation",
+            )
         if not _matches(target, policy.destinations):
             return (
                 FailureKind.DESTINATION_NOT_ALLOWED,
