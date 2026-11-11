@@ -15,6 +15,8 @@ import gantry
 import pytest
 from gantry.runs.status import RunStatus
 
+from _live import require_live_or_skip
+
 URI = os.environ.get("GANTRY_TEST_MONGODB_URI", "mongodb://localhost:27017")
 DATABASE = os.environ.get("GANTRY_TEST_MONGODB_DATABASE", "gantry_test")
 
@@ -51,7 +53,7 @@ async def _reachable() -> bool:
 async def db() -> gantry.nosql.NoSQLConnection:
     connection = _connect()
     if not await _reachable():
-        pytest.skip(f"no MongoDB at {URI}")
+        require_live_or_skip(f"no MongoDB at {URI}")
     return connection
 
 
@@ -280,7 +282,9 @@ async def test_document_count_verification_fails_outside_the_configured_range(
     ]
     result = await materialize("orders", pipeline)
 
-    assert result.status.value == "VERIFICATION_FAILED"
+    # A measured result that was not acceptable: the run executed, and what it
+    # built failed a check. `REJECTED`, as the PostgreSQL suite asserts.
+    assert result.status is RunStatus.REJECTED
     assert result.verification is not None
     assert not result.verification.ok
 
@@ -300,7 +304,9 @@ async def test_required_fields_verification_fails_when_a_field_is_missing(
     ]
     result = await materialize("orders", pipeline)
 
-    assert result.status.value == "VERIFICATION_FAILED"
+    # A measured result that was not acceptable: the run executed, and what it
+    # built failed a check. `REJECTED`, as the PostgreSQL suite asserts.
+    assert result.status is RunStatus.REJECTED
     assert result.verification is not None
     check = next(c for c in result.verification.checks if c.name == "required_fields")
     assert not check.ok
@@ -322,7 +328,7 @@ async def test_policy_refuses_a_lookup_into_an_unauthorized_collection() -> None
 
     pytest.importorskip("pymongo")
     if not await _reachable():
-        pytest.skip(f"no MongoDB at {URI}")
+        require_live_or_skip(f"no MongoDB at {URI}")
     pymongo = importlib.import_module("pymongo")
     client = pymongo.AsyncMongoClient(URI)
     await client[DATABASE]["customers"].delete_many({})
@@ -377,7 +383,7 @@ async def test_policy_refuses_an_out_and_mongodb_keeps_no_collection() -> None:
 
     pytest.importorskip("pymongo")
     if not await _reachable():
-        pytest.skip(f"no MongoDB at {URI}")
+        require_live_or_skip(f"no MongoDB at {URI}")
     pymongo = importlib.import_module("pymongo")
     client = pymongo.AsyncMongoClient(URI)
     for name in ("scratch_rollup", "prod_rollup"):
@@ -435,7 +441,7 @@ async def test_confirmation_holds_a_write_back_until_the_host_answers() -> None:
 
     pytest.importorskip("pymongo")
     if not await _reachable():
-        pytest.skip(f"no MongoDB at {URI}")
+        require_live_or_skip(f"no MongoDB at {URI}")
     pymongo = importlib.import_module("pymongo")
     client = pymongo.AsyncMongoClient(URI)
     for name in ("confirm_rollup", "declined_rollup"):

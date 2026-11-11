@@ -40,6 +40,13 @@ Notable changes. Dates are release dates; the format follows
 
 ### Fixed
 
+- **MongoDB materializations were recorded as failed after they had run.**
+  `submit` returned a handle with the proposal hash and the agent's checks
+  added to it, and `wait` handed that handle back to the control plane, which
+  only accepts the one it stored. Every `$out` and `$merge` the database
+  performed came back `EXECUTION_FAILED` with "no persisted execution record
+  matches the handle". The live tests that would have shown it were skipped
+  in CI for want of a server; CI now runs a MongoDB.
 - A run that failed in the engine lost its reason when it was stored. Every
   caller attached the failure to the run it returned and none saved it, so a
   timeout, a run-time error or a write over its row limit read back as

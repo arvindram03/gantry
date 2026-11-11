@@ -321,7 +321,7 @@ class NoSQLMaterializer:
     ) -> Run:
         plan = self._plans.get(handle.gantry_id) or _plan_from_handle(handle)
         nosql_result = await self._connection.wait(
-            handle, poll_interval_seconds=poll_interval_seconds
+            _as_submitted(handle), poll_interval_seconds=poll_interval_seconds
         )
         agent_checks = self._agent_checks_for(handle)
         if nosql_result.status is not ResultStatus.ACCEPTED or plan is None:
@@ -680,6 +680,35 @@ def _materialized_output(
         if output.kind is not OutputKind.INLINE and slug in output.uri.replace(".", "/"):
             return output
     return next((output for output in outputs if output.kind is not OutputKind.INLINE), None)
+
+
+#: What `submit` adds to a handle before returning it: the proposal's hash and
+#: the agent's checks, so both travel with the handle to a process that never
+#: saw the submission.
+_ADDED_AT_SUBMISSION = ("gantry.proposal_hash", "gantry.agent_verification")
+
+
+def _as_submitted(handle: ExecutionHandle) -> ExecutionHandle:
+    """The handle as the control plane recorded it.
+
+    The plane stores the handle it was given and, on `wait`, requires the one
+    it is handed back to equal it — that is how it refuses a handle it never
+    issued. `submit` here decorates the handle after the plane has stored it,
+    so the decorated one never matched: every materialization the database
+    performed was reported as EXECUTION_FAILED with "no persisted execution
+    record matches the handle", and a `$merge` that had already written was
+    recorded as not having run.
+
+    Stripping what was added, rather than remembering the original, because a
+    handle is meant to be stored and returned to — the process waiting on it
+    may not be the one that submitted it.
+    """
+    return replace(
+        handle,
+        metadata={
+            key: value for key, value in handle.metadata.items() if key not in _ADDED_AT_SUBMISSION
+        },
+    )
 
 
 def _plan_from_handle(handle: ExecutionHandle) -> MaterializationPlan | None:

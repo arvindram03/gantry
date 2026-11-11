@@ -77,13 +77,26 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
+      # And a real MongoDB for tests/test_mongodb_live.py. Those tests were
+      # skipped here for want of a server, and went dark for long enough that a
+      # materialization the database performed was being recorded as failed
+      # with nobody to notice. No credentials: the tests seed their own data.
+      mongodb:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.runCommand({ping:1}).ok'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
-      - run: uv sync --extra postgres --extra mysql
+      - run: uv sync --extra postgres --extra mysql --extra mongodb
       - run: psql "$GANTRY_TEST_POSTGRES_URL" -f examples/seed.sql
         env:
           GANTRY_TEST_POSTGRES_URL: postgresql://gantry:gantry@localhost:5432/gantry
@@ -107,6 +120,7 @@ jobs:
           GANTRY_REQUIRE_LIVE: "1"
           GANTRY_TEST_POSTGRES_URL: postgresql://gantry:gantry@localhost:5432/gantry
           GANTRY_TEST_MYSQL_URL: mysql://gantry:gantry@127.0.0.1:3306/analytics
+          GANTRY_TEST_MONGODB_URI: mongodb://localhost:27017
 
   # Heavier than a service container — a full JobManager/TaskManager/SQL
   # Gateway stack, built from examples/flink/. On demand or weekly rather
