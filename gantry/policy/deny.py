@@ -38,6 +38,29 @@ def query(
     )
 
 
+def write(
+    *,
+    destinations: Sequence[str] | None = None,
+    name: str | None = None,
+    actors: Sequence[str] | None = None,
+    engines: Sequence[str] | None = None,
+    sources: Sequence[str] | None = None,
+    environments: Sequence[str] | None = None,
+    constraints: Mapping[str, float] | None = None,
+) -> PolicyRule:
+    """Deny inserts, updates and deletes matching this rule."""
+    return _deny(
+        OperationKind.WRITE,
+        name=name,
+        actors=actors,
+        engines=engines,
+        sources=sources,
+        destinations=destinations,
+        environments=environments,
+        constraints=constraints,
+    )
+
+
 def materialize(
     *,
     destinations: Sequence[str] | None = None,

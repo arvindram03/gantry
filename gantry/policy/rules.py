@@ -18,7 +18,12 @@ from gantry.runs.model import OperationKind
 
 #: Operations that write somewhere. An allow rule for one of these has to say
 #: where, or it grants an authority nobody wrote down.
-WRITING = (OperationKind.MATERIALIZE, OperationKind.BATCH, OperationKind.STREAM)
+WRITING = (
+    OperationKind.WRITE,
+    OperationKind.MATERIALIZE,
+    OperationKind.BATCH,
+    OperationKind.STREAM,
+)
 
 
 def allow(

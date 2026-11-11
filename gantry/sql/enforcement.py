@@ -29,7 +29,13 @@ def policy_errors(
     if policy.read_only and not capabilities.read_only_session:
         errors.append("adapter cannot enforce a read-only session")
     if classification.operation is SQLOperation.UNKNOWN:
-        errors.append("SQL operation could not be classified safely")
+        errors.append(
+            "SQL operation could not be classified safely"
+            if classification.read_only_reason is None
+            else f"SQL operation could not be classified safely: {classification.read_only_reason}"
+        )
+    if policy.max_rows_affected is not None and not capabilities.affected_row_limit:
+        errors.append("adapter cannot enforce the affected-row limit")
     if policy.max_rows and not capabilities.row_limit:
         errors.append("adapter cannot enforce the row limit")
     if policy.timeout_seconds and not (

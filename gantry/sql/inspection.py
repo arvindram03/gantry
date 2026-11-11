@@ -26,6 +26,8 @@ def constraints(policy: SQLPolicy) -> dict[str, float]:
         "max_rows": policy.max_rows,
         "timeout_seconds": policy.timeout_seconds,
     }
+    if policy.max_rows_affected is not None:
+        values["max_rows_affected"] = policy.max_rows_affected
     if policy.max_bytes_scanned is not None:
         values["max_bytes_scanned"] = policy.max_bytes_scanned
     if policy.max_cost_usd is not None:
@@ -79,6 +81,36 @@ def query_request(
     )
 
 
+def write_request(
+    classification: SQLClassification,
+    *,
+    provider: str,
+    policy: SQLPolicy,
+) -> PolicyRequest:
+    """The policy request for one governed write.
+
+    A write operation, not a query that happens to write: the caller configured
+    it as one, so a rule can be written for it — and a rule that allows queries
+    does not allow this. The tables it changes are its outputs; anything else
+    it reads on the way is an input.
+    """
+    writes = _objects(provider, classification.write_targets)
+    written = {ref.resource for ref in writes}
+    reads = tuple(
+        ref for ref in _objects(provider, classification.tables) if ref.resource not in written
+    )
+    return PolicyRequest(
+        actor=current_actor(),
+        operation=OperationKind.WRITE,
+        engine=provider,
+        inputs=reads,
+        outputs=writes,
+        environment=current_environment(),
+        constraints=constraints(policy),
+        unresolved=_unresolvable(classification),
+    )
+
+
 def materialize_request(
     *,
     provider: str,
@@ -106,7 +138,8 @@ def materialize_request(
 
 def _unresolvable(classification: SQLClassification) -> tuple[str, ...]:
     if classification.operation is SQLOperation.UNKNOWN:
-        return ("the statement could not be classified",)
+        reason = classification.read_only_reason
+        return ("the statement could not be classified" + (f": {reason}" if reason else ""),)
     if classification.operation is SQLOperation.MULTI_STATEMENT:
         # Several statements share one classification, so which tables are read
         # and which are written is no longer separable. Authorizing the union as

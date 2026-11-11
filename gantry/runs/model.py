@@ -58,6 +58,7 @@ class OperationKind(StrEnum):
     """
 
     QUERY = "query"
+    WRITE = "write"
     MATERIALIZE = "materialize"
     BATCH = "batch"
     STREAM = "stream"
@@ -139,14 +140,28 @@ class ResourceRef:
 
 @dataclass(frozen=True, slots=True)
 class QueryResultRef:
-    """A bounded query's output, as a reference rather than its rows."""
+    """A bounded operation's output, as a reference rather than its rows.
+
+    `rows` is how many rows came back. `affected` is how many a write changed,
+    and is `None` for an operation that changes nothing — which is not the same
+    as a write that matched no rows, and a reader should be able to tell the
+    two apart. A write with `RETURNING` has both.
+    """
 
     rows: int
     inline: bool = True
     truncated: bool = False
+    affected: int | None = None
 
     def as_dict(self) -> dict[str, object]:
-        return {"rows": self.rows, "inline": self.inline, "truncated": self.truncated}
+        payload: dict[str, object] = {
+            "rows": self.rows,
+            "inline": self.inline,
+            "truncated": self.truncated,
+        }
+        if self.affected is not None:
+            payload["affected"] = self.affected
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -329,6 +344,16 @@ class Run:
         if self.result_ref is not None:
             return self.result_ref.truncated
         return bool(getattr(self.inline, "truncated", False))
+
+    @property
+    def rows_affected(self) -> int | None:
+        """How many rows a write changed, or `None` when this was not a write.
+
+        Counted by the engine for the statement itself. Rows changed on its
+        behalf — a cascade, a trigger — are the database's doing and are not in
+        this number.
+        """
+        return None if self.result_ref is None else self.result_ref.affected
 
     @property
     def documents(self) -> tuple[object, ...]:
@@ -517,7 +542,12 @@ def render(run: Run) -> str:
             lines.extend([label, *(f"  {ref.resource}" for ref in refs), ""])
     if run.result_ref is not None:
         suffix = " (truncated)" if run.result_ref.truncated else ""
-        lines.extend(["Result", f"  {run.result_ref.rows} rows{suffix}", ""])
+        result = []
+        if run.result_ref.affected is not None:
+            result.append(f"  {run.result_ref.affected} rows affected")
+        if run.result_ref.affected is None or run.result_ref.rows:
+            result.append(f"  {run.result_ref.rows} rows{suffix}")
+        lines.extend(["Result", *result, ""])
 
     if run.admission is not None:
         lines.extend(["Admission", *_admission_lines(run.admission), ""])
@@ -618,6 +648,8 @@ def tool_result(run: Run) -> dict[str, object]:
     payload: dict[str, object] = {"run_id": run.id, "status": run.status.value}
 
     if run.status is RunStatus.ACCEPTED:
+        if run.rows_affected is not None:
+            payload["rows_affected"] = run.rows_affected
         if run.columns:
             payload["columns"] = list(run.columns)
         if run.rows:

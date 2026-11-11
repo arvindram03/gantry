@@ -34,6 +34,11 @@ POLICY_REQUIREMENTS: tuple[tuple[str, str, str], ...] = (
     ("read_only", "read_only_session", "adapter cannot enforce a read-only session"),
     ("max_rows", "row_limit", "adapter cannot enforce the row limit"),
     (
+        "max_rows_affected",
+        "affected_row_limit",
+        "adapter cannot enforce the affected-row limit",
+    ),
+    (
         "timeout_seconds",
         "statement_timeout, or reconnect and cancellation",
         "adapter cannot enforce or monitor the statement timeout",

@@ -37,6 +37,7 @@ from gantry.failure import Failure, FailureKind
 from gantry.handle import ExecutionHandle
 from gantry.metrics import ExecutionMetrics
 from gantry.output import OutputKind, OutputRef
+from gantry.sql.affected import ROW_WRITES, AffectedRowLimitError, check
 from gantry.sql.capabilities import SQLCapabilities
 from gantry.sql.classification import SQLOperation
 from gantry.sql.dialect import MySQLDialect
@@ -92,6 +93,7 @@ class MySQLAdapter:
             read_only_session=True,
             statement_timeout=True,
             row_limit=True,
+            affected_row_limit=True,
             query_metrics=True,
             create_table_as=True,
             create_view_as=True,
@@ -321,7 +323,7 @@ class MySQLAdapter:
                 await cursor.execute("SELECT CONNECTION_ID()")
                 row = await cursor.fetchone()
                 self._threads[handle.gantry_id] = int(row[0])
-            outputs, rows_read = await asyncio.wait_for(
+            outputs, rows_read, rows_written = await asyncio.wait_for(
                 self._run(connection, handle, sql, policy),
                 timeout=policy.timeout_seconds,
             )
@@ -340,6 +342,9 @@ class MySQLAdapter:
             return ExecutionResult.failed(
                 handle, Failure(FailureKind.CANCELLED, False, "MySQL statement was cancelled")
             )
+        except AffectedRowLimitError as error:
+            # `_run` rolled the transaction back before letting this out.
+            return ExecutionResult.failed(handle, error.failure())
         except Exception as error:
             return ExecutionResult.failed(handle, _failure(error))
         finally:
@@ -350,12 +355,14 @@ class MySQLAdapter:
         return ExecutionResult.succeeded(
             handle,
             outputs=outputs,
-            metrics=ExecutionMetrics(rows_read=rows_read, runtime_seconds=runtime),
+            metrics=ExecutionMetrics(
+                rows_read=rows_read, rows_written=rows_written, runtime_seconds=runtime
+            ),
         )
 
     async def _run(
         self, connection: Any, handle: ExecutionHandle, sql: str, policy: SQLPolicy
-    ) -> tuple[tuple[OutputRef, ...], int | None]:
+    ) -> tuple[tuple[OutputRef, ...], int | None, int | None]:
         operation = _DIALECT.classify(sql).operation
         async with connection.cursor() as cursor:
             # Server-side for reads. It does not cover writes, which is why the
@@ -368,11 +375,23 @@ class MySQLAdapter:
             )
             try:
                 await cursor.execute(sql)
+                if operation in ROW_WRITES:
+                    # Counted before the commit, so a statement over its limit
+                    # is rolled back by the handler below and changes nothing.
+                    # This holds for transactional tables, which InnoDB's are;
+                    # a MyISAM table has no transaction to roll back.
+                    #
+                    # MySQL counts rows *changed*: an `UPDATE` that sets a row
+                    # to the value it already has does not count it.
+                    affected = max(0, int(cursor.rowcount))
+                    check(policy.max_rows_affected, affected)
+                    await connection.commit()
+                    return (), None, affected
                 if operation is not SQLOperation.SELECT:
                     await connection.commit()
                     # A materialization has to come back as a reference to what
                     # it built, or the caller cannot verify the destination.
-                    return _destination_output(handle), None
+                    return _destination_output(handle), None, None
                 columns = tuple(str(column[0]) for column in (cursor.description or ()))
                 records = await cursor.fetchmany(policy.max_rows + 1)
                 rows = tuple(tuple(value for value in row) for row in records[: policy.max_rows])
@@ -385,7 +404,7 @@ class MySQLAdapter:
         output = OutputRef(
             OutputKind.INLINE, f"inline://{handle.gantry_id}", metadata={"inline": inline}
         )
-        return (output,), len(rows)
+        return (output,), len(rows), None
 
     async def _kill(self, gantry_id: str) -> None:
         """`KILL QUERY` the statement from a connection of its own."""

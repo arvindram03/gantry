@@ -16,7 +16,9 @@ from gantry.handle import ExecutionHandle
 from gantry.metrics import ExecutionMetrics
 from gantry.output import OutputKind, OutputRef
 from gantry.sql.adapter import SQLAdapter
+from gantry.sql.affected import ROW_WRITES, AffectedRowLimitError, check
 from gantry.sql.capabilities import SQLCapabilities
+from gantry.sql.dialect import ConservativeDialect
 from gantry.sql.explain import ExplainResult
 from gantry.sql.materialization import MaterializationPlan, TableRef
 from gantry.sql.output import InlineRows
@@ -30,6 +32,8 @@ class _Cursor(Protocol):
     def description(self) -> Sequence[Sequence[object]] | None: ...
 
     def fetchall(self) -> list[tuple[object, ...]]: ...
+
+    def fetchone(self) -> tuple[object, ...] | None: ...
 
     def fetchmany(self, size: int) -> list[tuple[object, ...]]: ...
 
@@ -74,6 +78,7 @@ class DuckDBAdapter(SQLAdapter):
             write_execution=not self._read_only,
             statement_timeout=True,
             row_limit=True,
+            affected_row_limit=not self._read_only,
             query_metrics=True,
             create_table_as=not self._read_only,
             create_view_as=not self._read_only,
@@ -261,12 +266,23 @@ class DuckDBAdapter(SQLAdapter):
         policy: SQLPolicy,
     ) -> ExecutionResult:
         started = asyncio.get_running_loop().time()
+        classification = ConservativeDialect().classify(sql)
+        writes = classification.operation in ROW_WRITES
+        rows_written: int | None = None
         try:
             async with self._lock:
-                inline = await asyncio.wait_for(
-                    asyncio.to_thread(self._execute_bounded, sql, policy.max_rows),
-                    timeout=policy.timeout_seconds,
-                )
+                if writes:
+                    rows_written, inline = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            self._execute_write, sql, policy, classification.returning
+                        ),
+                        timeout=policy.timeout_seconds,
+                    )
+                else:
+                    inline = await asyncio.wait_for(
+                        asyncio.to_thread(self._execute_bounded, sql, policy.max_rows),
+                        timeout=policy.timeout_seconds,
+                    )
         except TimeoutError:
             self._connection.interrupt()
             return ExecutionResult.failed(
@@ -278,6 +294,9 @@ class DuckDBAdapter(SQLAdapter):
                 handle,
                 Failure(FailureKind.CANCELLED, False, "DuckDB statement was cancelled"),
             )
+        except AffectedRowLimitError as error:
+            # `_execute_write` rolled the transaction back before raising.
+            return ExecutionResult.failed(handle, error.failure())
         except Exception as error:
             return ExecutionResult.failed(
                 handle,
@@ -304,9 +323,50 @@ class DuckDBAdapter(SQLAdapter):
             )
         return ExecutionResult.succeeded(
             handle,
-            outputs=(output,),
-            metrics=ExecutionMetrics(rows_read=len(inline.rows), runtime_seconds=runtime),
+            # A write that returns no rows has no inline result to hand back.
+            outputs=() if writes and not classification.returning else (output,),
+            metrics=ExecutionMetrics(
+                rows_read=None if writes and not classification.returning else len(inline.rows),
+                rows_written=rows_written,
+                runtime_seconds=runtime,
+            ),
         )
+
+    def _execute_write(
+        self, sql: str, policy: SQLPolicy, returning: bool
+    ) -> tuple[int, InlineRows]:
+        """Run a row write in a transaction, and undo it if it changed too much.
+
+        DuckDB answers a write with one row holding the count, unless the
+        statement has `RETURNING`, in which case the changed rows come back and
+        are the count. Reading one past the limit is enough to know it was
+        exceeded.
+        """
+        limit = policy.max_rows_affected
+        self._connection.execute("BEGIN TRANSACTION")
+        try:
+            cursor = self._connection.execute(sql)
+            if returning:
+                columns = tuple(str(column[0]) for column in (cursor.description or ()))
+                fetched = cursor.fetchall() if limit is None else cursor.fetchmany(limit + 1)
+                if limit is not None and len(fetched) > limit:
+                    raise AffectedRowLimitError(limit)
+                affected = len(fetched)
+                inline = InlineRows(
+                    columns,
+                    tuple(fetched[: policy.max_rows]),
+                    truncated=len(fetched) > policy.max_rows,
+                )
+            else:
+                counted = cursor.fetchone()
+                affected = int(counted[0]) if counted and isinstance(counted[0], int) else 0
+                check(limit, affected)
+                inline = InlineRows((), ())
+        except BaseException:
+            self._connection.execute("ROLLBACK")
+            raise
+        self._connection.execute("COMMIT")
+        return affected, inline
 
     def _execute_bounded(self, sql: str, max_rows: int) -> InlineRows:
         cursor = self._connection.execute(sql)

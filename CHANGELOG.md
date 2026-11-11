@@ -5,6 +5,63 @@ Notable changes. Dates are release dates; the format follows
 
 ## Unreleased
 
+### Security
+
+- **A read could reach tables its policy did not allow.** The classifier named
+  one table per `FROM`, so the second table of a comma-separated list was never
+  checked: under a policy allowing only `analytics.*`,
+  `SELECT c.* FROM analytics.orders o, private.contacts c` was admitted and
+  returned `private.contacts`. The same was true of the first table inside a
+  parenthesised join, `FROM (private.contacts CROSS JOIN analytics.orders)`.
+  Both are measured against PostgreSQL 16, and both applied to the operation's
+  own `schemas=`/`tables=` bounds as well as to a reusable `Policy`. The
+  classifier now follows the whole list — every comma, every join, into
+  parenthesised joins, past `ONLY` and `LATERAL` — and reads structure from the
+  statement with string literals blanked, so a parenthesis inside a string
+  cannot move the depth of what follows it. The new scan is joined to the old
+  pattern rather than substituted for it: it can only name more tables than
+  before, never fewer.
+- **A read could return a table through a function, with no `FROM` to check.**
+  `SELECT table_to_xml('private.contacts', ...)` and
+  `SELECT query_to_xml('select ...', ...)` were admitted for the same reason:
+  nothing in the statement named the table, and the string handed to
+  `query_to_xml` can be assembled with `||`. A statement that calls one of the
+  `*_to_xml` family or `dblink` is now refused as unclassifiable, however the
+  function name is quoted or qualified, and the refusal says which call it was.
+  `dblink_exec` moves with them, so it is now refused outright rather than
+  classified as a `SELECT` that writes. This is a floor: a user-defined
+  function can do the same and no classifier can see inside one. The database
+  role remains the boundary.
+- A write's target was the first table the statement named, which is not always
+  the one it changes. `WITH src AS (SELECT * FROM a) UPDATE b ...` reported `a`
+  — the table being read — as written, and a data-modifying CTE reported only
+  one of the two tables PostgreSQL would change. `write_targets` now lists every
+  table a statement changes.
+
+### Added
+
+- **Governed writes.** `db.write(destinations=[...])` runs one `INSERT`,
+  `UPDATE` or `DELETE` against tables the application named and returns a `Run`
+  with `rows_affected`. `max_rows_affected` is enforced by the adapter running
+  the statement in a transaction and rolling it back if it changed more, so a
+  write over its limit changes nothing and says how much it would have changed
+  (`FailureKind.ROW_LIMIT_EXCEEDED`). An `UPDATE` or `DELETE` with no `WHERE` is
+  refused before it runs; what a statement reads besides its own table has to
+  be named in `sources`; `merge` has to be asked for. `write.tool()` is the
+  agent form. PostgreSQL, Neon, Supabase, MySQL and DuckDB declare the new
+  `affected_row_limit` capability; BigQuery and Snowflake do not yet, so a
+  write there is refused rather than run unbounded.
+- `OperationKind.WRITE`, with `gantry.allow.write(...)` and
+  `gantry.deny.write(...)`, and a `max_rows_affected` constraint. A write is its
+  own operation, so a rule that allows queries does not allow it.
+- `SQLClassification.filtered` and `.returning`: whether an `UPDATE` or `DELETE`
+  carries a `WHERE` of its own, and whether a write hands rows back.
+- `Run.rows_affected`, stored on the run's result reference and included in
+  `as_tool_result()`. `None` for an operation that is not a write, which is not
+  the same as a write that matched no rows.
+- A statement refused as unclassifiable now says why when there is a reason to
+  give.
+
 ### Changed
 
 - **Governed operations return a `Run`.** `db.query(...)`,

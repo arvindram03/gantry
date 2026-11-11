@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     from gantry.sql.capabilities import SQLCapabilities
     from gantry.sql.materialization import SQLMaterializer, TableRef
     from gantry.sql.query import SQLQuery
+    from gantry.sql.write import SQLWrite
     from gantry.verify import MaterializationCheck
 
 
@@ -411,6 +412,44 @@ class SQLConnection:
                     ),
                 )
             await asyncio.sleep(poll_interval_seconds)
+
+    def write(
+        self,
+        *,
+        destinations: Sequence[str],
+        sources: Sequence[str] = (),
+        statements: Sequence[str] = ("insert", "update", "delete"),
+        max_rows_affected: int = 100,
+        require_where: bool = True,
+        max_rows: int = 100,
+        timeout: float = 30,
+    ) -> SQLWrite:
+        """Configure a governed write: `INSERT`, `UPDATE` and `DELETE` on named tables.
+
+        `destinations` are the tables that may be changed and `sources` what a
+        statement may read besides the one it changes; both take patterns.
+        `max_rows_affected` is enforced, not reported: the statement runs in a
+        transaction and is rolled back if it changed more, so a write over its
+        limit changes nothing. `max_rows` bounds what a `RETURNING` hands back.
+
+        An adapter that cannot roll a write back refuses the operation rather
+        than running it unbounded.
+        """
+
+        from gantry.sql.write import SQLWrite, WritePolicy
+
+        return SQLWrite(
+            self,
+            WritePolicy(
+                destinations=destinations,
+                sources=sources,
+                statements=statements,
+                max_rows_affected=max_rows_affected,
+                require_where=require_where,
+                max_rows=max_rows,
+                timeout_seconds=timeout,
+            ),
+        )
 
     def materialize(
         self,

@@ -101,6 +101,86 @@ boundary. Gantry does not replace native authorization.
 Allowed and denied table policies are an additional admission check. Use them together with
 native permissions rather than as a substitute for those permissions.
 
+What the classifier reads is the statement. It follows every `FROM` list, join and
+subquery to name the tables a statement touches, and it refuses outright a statement that
+calls a built-in which reaches a table by name or runs a string as SQL — `table_to_xml`,
+`query_to_xml`, `dblink` and their relatives — because nothing in the text says what those
+touch. It cannot see inside a user-defined function, which can do the same. Give the
+connection a role that can reach only what agents should reach, and treat the allow-list as
+the check that explains a refusal, not the wall that prevents one.
+
+## Writes
+
+`db.query()` reads and `db.materialize()` builds a new table. `db.write()` is for
+changing rows that already exist — `INSERT`, `UPDATE` and `DELETE`, one statement
+at a time, against tables you named:
+
+```python
+write = db.write(
+    destinations=["app.tickets", "agent_scratch.*"],
+    max_rows_affected=25,
+)
+
+run = await write("UPDATE app.tickets SET status = 'closed' WHERE id = 4182")
+run.rows_affected  # 1
+
+tools = [query.tool(), write.tool()]
+```
+
+A write is bounded on every side that can be decided before it runs, and on the
+one that cannot:
+
+| Bound | Default | What it does |
+| --- | --- | --- |
+| `destinations` | required | The tables that may be changed. There is no default place to write. |
+| `sources` | none | What a statement may read *besides* the table it changes. An `INSERT ... SELECT` from somewhere else has to be allowed by name. |
+| `statements` | insert, update, delete | Which kinds run. `merge` has to be asked for. |
+| `require_where` | on | An `UPDATE` or `DELETE` with no `WHERE` is refused before it runs. |
+| `max_rows_affected` | `100` | The statement runs in a transaction and is **rolled back** if it changed more. |
+| `max_rows` | `100` | How many `RETURNING` rows come back. |
+
+The row ceiling is the one that matters most, because it is the one nobody can
+know in advance. It is not a report: a `DELETE` that would have removed 40,000
+rows under a limit of 25 removes none, and the run says how many it would have
+removed.
+
+```text
+EXECUTION_FAILED
+  the statement would have changed 40000 rows; at most 25 rows are allowed,
+  so it was rolled back and nothing was changed
+```
+
+A write is its own operation in policy, so a rule that allows queries does not
+allow it, and it can be denied, scoped to an environment or held for
+confirmation like any other:
+
+```python
+gantry.allow.write(destinations=["agent_scratch.*"])
+gantry.allow.write(
+    destinations=["app.tickets"],
+    constraints={"max_rows_affected": 25},
+    require_confirmation=True,
+    confirmation_message="This changes customer tickets.",
+)
+gantry.deny.write(destinations=["billing.*"])
+```
+
+What is and is not covered:
+
+- **One statement, one table.** A data-modifying CTE that changes a second table
+  is refused, as is MySQL's multi-table `UPDATE` unless every table in the join
+  is a destination.
+- **The count is the statement's own.** Rows changed on its behalf — a cascading
+  delete, a trigger — are the database's doing and are not in `rows_affected` or
+  under the ceiling. MySQL counts rows *changed*, so an `UPDATE` that sets a row
+  to the value it already has does not count it.
+- **Rollback needs a transaction.** PostgreSQL, Neon, Supabase, MySQL on InnoDB
+  and DuckDB have one. BigQuery and Snowflake do not declare the capability yet,
+  so a write there is refused rather than run unbounded. A MyISAM table cannot be
+  rolled back and should not be a destination.
+- **A function can still write elsewhere.** Classification reads the statement,
+  not the bodies of the functions it calls. The database role is the boundary.
+
 ## Bounded and reconnectable results
 
 Adapters fetch at most `max_rows + 1` records to detect truncation. `SQLResult.inline` therefore

@@ -30,6 +30,7 @@ class SQLCapabilities:
     write_execution: bool = True
     statement_timeout: bool = False
     row_limit: bool = False
+    affected_row_limit: bool = False
     cost_estimate: bool = False
     cost_limit: bool = False
     bytes_scanned: bool = False

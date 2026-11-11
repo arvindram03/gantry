@@ -54,6 +54,41 @@ def query(
     )
 
 
+def write(
+    *,
+    destinations: Sequence[str],
+    name: str | None = None,
+    require_confirmation: bool = False,
+    confirmation_code: ConfirmationReasonCode | str | None = None,
+    confirmation_message: str | None = None,
+    actors: Sequence[str] | None = None,
+    engines: Sequence[str] | None = None,
+    sources: Sequence[str] | None = None,
+    environments: Sequence[str] | None = None,
+    constraints: Mapping[str, float] | None = None,
+) -> PolicyRule:
+    """Allow rows in `destinations` to be inserted, updated or deleted.
+
+    The tables a write changes are its destinations; anything else it reads on
+    the way — an `INSERT ... SELECT`, an `UPDATE ... FROM` — is a source.
+    `constraints={"max_rows_affected": 100}` makes the rule apply only to writes
+    already configured to change at most that many rows.
+    """
+    return _allow(
+        OperationKind.WRITE,
+        name=name,
+        require_confirmation=require_confirmation,
+        confirmation_code=confirmation_code,
+        confirmation_message=confirmation_message,
+        actors=actors,
+        engines=engines,
+        sources=sources,
+        destinations=destinations,
+        environments=environments,
+        constraints=constraints,
+    )
+
+
 def materialize(
     *,
     destinations: Sequence[str],

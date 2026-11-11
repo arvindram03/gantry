@@ -70,6 +70,13 @@ class SQLClassification:
     and `read_only` is false, `read_only_reason` says which of those it was, so
     a refusal can explain itself instead of reporting that a SELECT is not
     allowed by a read-only policy.
+
+    `write_targets` is every table the statement changes, not only the first
+    one it names: a data-modifying CTE writes too, and `WITH gone AS (DELETE
+    FROM a RETURNING *) INSERT INTO b ...` changes both. `filtered` says
+    whether an `UPDATE` or `DELETE` carries a `WHERE` of its own — `None` for
+    anything else, where the question does not arise — and `returning` whether
+    a write hands rows back.
     """
 
     operation: SQLOperation
@@ -79,3 +86,5 @@ class SQLClassification:
     functions: tuple[str, ...] = ()
     statement_count: int = 1
     read_only_reason: str | None = None
+    filtered: bool | None = None
+    returning: bool = False

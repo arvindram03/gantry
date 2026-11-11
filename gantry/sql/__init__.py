@@ -28,6 +28,7 @@ from gantry.sql.registry import providers, register, register_dialect, register_
 from gantry.sql.result import SQLResult
 from gantry.sql.schema import Column, DatabaseSchema, Table
 from gantry.sql.target import SQLTarget
+from gantry.sql.write import SQLWrite, WritePolicy
 
 register_builtin_providers()
 
@@ -59,8 +60,10 @@ __all__ = [
     "SQLQuery",
     "SQLResult",
     "SQLTarget",
+    "SQLWrite",
     "Table",
     "TableRef",
+    "WritePolicy",
     "connect",
     "parse_materialization",
     "providers",

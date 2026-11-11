@@ -248,6 +248,22 @@ No `DROP`, no `REPLACE`, no writing outside `reporting`, and no accepted result 
 the destination has been checked. The agent can make the contract *stricter* at
 invocation time — `{"verify": [{"type": "not_empty"}]}` — and never looser.
 
+To change rows that already exist there is `db.write()`: `INSERT`, `UPDATE` and
+`DELETE` on tables you named, with a ceiling on how many rows one statement may
+change.
+
+```python
+write = db.write(destinations=["app.tickets"], max_rows_affected=25)
+
+run = await write("UPDATE app.tickets SET status = 'closed' WHERE id = 4182")
+run.rows_affected  # 1
+```
+
+The ceiling is enforced, not reported. The statement runs in a transaction and is
+rolled back if it changed more, so a `DELETE` that matched 40,000 rows under a
+limit of 25 deletes none. An `UPDATE` or `DELETE` with no `WHERE` is refused
+before it runs.
+
 ## It's a library, not a proxy — your data doesn't route through it
 
 You add an import, not a service. Gantry decides whether a statement may run and

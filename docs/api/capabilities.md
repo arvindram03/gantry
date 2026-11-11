@@ -22,6 +22,7 @@ python scripts/capability_matrix.py --write
 | --- | --- | --- |
 | `read_only` | `read_only_session` | adapter cannot enforce a read-only session |
 | `max_rows` | `row_limit` | adapter cannot enforce the row limit |
+| `max_rows_affected` | `affected_row_limit` | adapter cannot enforce the affected-row limit |
 | `timeout_seconds` | `statement_timeout, or reconnect and cancellation` | adapter cannot enforce or monitor the statement timeout |
 | `max_bytes_scanned` | `bytes_scanned` | adapter cannot enforce maximum bytes scanned |
 | `max_cost_usd` | `cost_limit` | adapter cannot enforce maximum cost |
@@ -40,6 +41,7 @@ python scripts/capability_matrix.py --write
 | `write_execution` | yes | yes | yes | writable conn | writable conn |
 | `statement_timeout` | yes | yes | no | yes | yes |
 | `row_limit` | yes | yes | yes | yes | yes |
+| `affected_row_limit` | yes | yes | no | no | writable conn |
 | `cost_estimate` | no | no | conditional | no | no |
 | `cost_limit` | no | no | conditional | no | no |
 | `bytes_scanned` | no | no | yes | no | no |

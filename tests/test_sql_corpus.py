@@ -101,7 +101,9 @@ CORPUS: tuple[Case, ...] = (
     Case("schema-qualified nextval", "SELECT pg_catalog.nextval('s')", True, S.SELECT, 1),
     # The one write a read-only transaction does NOT stop: the effect lands on
     # another server. Measured — the inserted row survived the ROLLBACK.
-    Case("dblink_exec", "SELECT dblink_exec('dbname=x', 'UPDATE t SET a = 1')", True, S.SELECT, 1),
+    # Refused outright rather than as a SELECT that writes: it runs a string as
+    # SQL on another server, so what it touches is not in the statement at all.
+    Case("dblink_exec", "SELECT dblink_exec('dbname=x', 'UPDATE t SET a = 1')", True, S.UNKNOWN, 1),
     # A read-only session cannot supply the function it would need.
     Case(
         "CREATE FUNCTION",

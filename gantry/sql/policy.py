@@ -16,6 +16,12 @@ class SQLPolicy:
     submission — passing a bare string where a collection belongs is a
     `TypeError`, not a policy that matches one table.
 
+    `max_rows_affected` bounds a write the way `max_rows` bounds a read, and is
+    `None` — no bound — unless a write operation sets it. An adapter that
+    declares it runs the statement in a transaction, counts what it changed and
+    rolls back if that is more than the limit, so a statement that would have
+    changed too much changes nothing.
+
     Declaring a field is not the same as it being enforced: a bound is admitted
     only when the adapter can apply it.
     """
@@ -25,6 +31,7 @@ class SQLPolicy:
     allowed_tables: Collection[str] = frozenset()
     denied_tables: Collection[str] = frozenset()
     max_rows: int = 1_000
+    max_rows_affected: int | None = None
     timeout_seconds: float = 30
     max_bytes_scanned: int | None = None
     max_cost_usd: float | None = None
@@ -48,6 +55,15 @@ class SQLPolicy:
             raise TypeError("max rows must be an integer")
         if self.max_rows <= 0:
             raise ValueError("max rows must be positive")
+        if self.max_rows_affected is not None:
+            if isinstance(self.max_rows_affected, bool) or not isinstance(
+                self.max_rows_affected, int
+            ):
+                raise TypeError("max rows affected must be an integer")
+            if self.max_rows_affected <= 0:
+                raise ValueError("max rows affected must be positive")
+            if self.read_only:
+                raise ValueError("max rows affected bounds a write; it cannot be set on a read")
         if isinstance(self.timeout_seconds, bool) or not isinstance(
             self.timeout_seconds, (int, float)
         ):

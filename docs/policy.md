@@ -255,6 +255,7 @@ written, not at admission:
 ```python
 gantry.allow.query(sources=["ana*lytics"])  # a star inside a name
 gantry.allow.materialize(destinations=[])  # could never authorize a write
+gantry.allow.write(destinations=[])  # nor could this
 gantry.allow.query(constraints={"max_joins": 3})  # not a bounded constraint
 ```
 

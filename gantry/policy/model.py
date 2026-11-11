@@ -27,6 +27,7 @@ class Effect(StrEnum):
 #: effective bound is always the smaller of the two.
 CONSTRAINTS: Mapping[str, type] = {
     "max_rows": int,
+    "max_rows_affected": int,
     "max_documents": int,
     "max_bytes_scanned": int,
     "max_cost_usd": float,

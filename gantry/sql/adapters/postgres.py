@@ -21,6 +21,7 @@ from gantry.failure import Failure, FailureKind
 from gantry.handle import ExecutionHandle
 from gantry.metrics import ExecutionMetrics
 from gantry.output import OutputKind, OutputRef
+from gantry.sql.affected import ROW_WRITES, AffectedRowLimitError, check, from_command_tag
 from gantry.sql.capabilities import SQLCapabilities
 from gantry.sql.classification import SQLOperation
 from gantry.sql.dialect import ConservativeDialect
@@ -49,7 +50,11 @@ class _Attribute(Protocol):
 class _PreparedStatement(Protocol):
     def get_attributes(self) -> Sequence[_Attribute]: ...
 
+    def get_statusmsg(self) -> str: ...
+
     def cursor(self) -> Awaitable[_Cursor]: ...
+
+    async def fetch(self) -> Sequence[Sequence[object]]: ...
 
 
 class _Transaction(Protocol):
@@ -103,6 +108,7 @@ class PostgresAdapter:
             read_only_session=True,
             statement_timeout=True,
             row_limit=True,
+            affected_row_limit=True,
             query_metrics=True,
             create_table_as=True,
             create_view_as=True,
@@ -371,6 +377,8 @@ class PostgresAdapter:
     ) -> ExecutionResult:
         started = asyncio.get_running_loop().time()
         outputs: tuple[OutputRef, ...]
+        rows_read: int | None
+        rows_written: int | None = None
         try:
             connection = await self._open()
             self._connections[handle.gantry_id] = connection
@@ -393,6 +401,20 @@ class PostgresAdapter:
                     )
                     outputs = (output,)
                     rows_read = len(rows)
+                elif operation in ROW_WRITES:
+                    rows_written, returned = await _write(connection, sql, policy)
+                    outputs = (
+                        ()
+                        if returned is None
+                        else (
+                            OutputRef(
+                                OutputKind.INLINE,
+                                f"inline://{handle.gantry_id}",
+                                metadata={"inline": returned},
+                            ),
+                        )
+                    )
+                    rows_read = None if returned is None else len(returned.rows)
                 else:
                     await connection.execute(sql)
                     # A materialization has to come back as a reference to what
@@ -403,6 +425,10 @@ class PostgresAdapter:
             return ExecutionResult.failed(
                 handle, Failure(FailureKind.CANCELLED, False, "PostgreSQL statement was cancelled")
             )
+        except AffectedRowLimitError as error:
+            # Raised inside the transaction block above, so by here the
+            # statement has been rolled back.
+            return ExecutionResult.failed(handle, error.failure())
         except Exception as error:
             return ExecutionResult.failed(handle, _failure(error))
         finally:
@@ -415,7 +441,9 @@ class PostgresAdapter:
         return ExecutionResult.succeeded(
             handle,
             outputs=outputs,
-            metrics=ExecutionMetrics(rows_read=rows_read, runtime_seconds=runtime),
+            metrics=ExecutionMetrics(
+                rows_read=rows_read, rows_written=rows_written, runtime_seconds=runtime
+            ),
         )
 
     async def _open(self) -> _Connection:
@@ -466,6 +494,43 @@ def _schema_filter(reference: TableRef) -> str:
 
 def _quoted(identifier: str) -> str:
     return '"' + identifier.replace('"', '""') + '"'
+
+
+async def _write(
+    connection: _Connection, sql: str, policy: SQLPolicy
+) -> tuple[int, InlineRows | None]:
+    """Run an `INSERT`, `UPDATE`, `DELETE` or `MERGE`, counted and bounded.
+
+    Called inside the caller's transaction, which is what makes the bound
+    real: exceeding it raises, and leaving the transaction block on an
+    exception rolls the statement back.
+
+    Without `RETURNING` the count is the command tag's. With it, every changed
+    row comes back, so the rows are the count — and they are read through a
+    cursor one past the limit rather than fetched whole, because a statement
+    that changed a million rows should be refused without first shipping a
+    million rows here. PostgreSQL runs the whole statement on the first fetch
+    either way; the cursor only bounds what crosses the wire.
+    """
+    statement = await connection.prepare(sql)
+    attributes = statement.get_attributes()
+    limit = policy.max_rows_affected
+    if not attributes:
+        await statement.fetch()
+        affected = from_command_tag(statement.get_statusmsg())
+        check(limit, affected)
+        return affected, None
+
+    columns = tuple(attribute.name for attribute in attributes)
+    if limit is None:
+        records = await statement.fetch()
+    else:
+        cursor = await statement.cursor()
+        records = await cursor.fetch(limit + 1)
+        if len(records) > limit:
+            raise AffectedRowLimitError(limit)
+    rows = tuple(tuple(value for value in row) for row in records[: policy.max_rows])
+    return len(records), InlineRows(columns, rows, truncated=len(records) > policy.max_rows)
 
 
 def _destination_output(handle: ExecutionHandle) -> tuple[OutputRef, ...]:

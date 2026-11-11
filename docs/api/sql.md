@@ -22,6 +22,21 @@ a tool.
     [capability matrix](capabilities.md) for which provider enforces what, and
     what happens when it cannot.
 
+## Writes
+
+`INSERT`, `UPDATE` and `DELETE` against tables you named, one statement at a
+time, with a ceiling on how many rows it may change.
+
+::: gantry.sql.SQLWrite
+
+::: gantry.sql.WritePolicy
+
+!!! note "The row ceiling is enforced by rolling back"
+    The statement runs in a transaction, the engine reports how many rows it
+    changed, and a count over `max_rows_affected` undoes it. An adapter that
+    cannot do that refuses the operation — see `affected_row_limit` in the
+    [capability matrix](capabilities.md).
+
 ## Materialization
 
 Create-only: one `CREATE TABLE AS` or `CREATE VIEW AS`, to a schema-qualified

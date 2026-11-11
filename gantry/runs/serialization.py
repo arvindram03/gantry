@@ -102,6 +102,7 @@ def _result_ref(value: object) -> QueryResultRef | None:
         rows=_optional_int(data.get("rows")) or 0,
         inline=bool(data.get("inline", True)),
         truncated=bool(data.get("truncated", False)),
+        affected=_optional_int(data.get("affected")),
     )
 
 
