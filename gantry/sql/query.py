@@ -53,6 +53,22 @@ class SQLQuery:
             agent_verify=tuple(verify),
         )
 
+    async def resume(self, run: Run) -> Run:
+        """Continue a confirmed run from the store. See `SQLWrite.resume`."""
+        from gantry.runs.lifecycle import stored_proposal
+
+        sql = stored_proposal(run, OperationKind.QUERY)
+        return await self._connection._execute_query(
+            sql,
+            policy=self._policy,
+            context=None,
+            recorder=RunRecorder.adopt(run),
+            verifiers=tuple(item for item in self._verify if isinstance(item, Verifier)),
+            trusted_checks=tuple(item for item in self._verify if not isinstance(item, Verifier)),
+            agent_checks=(),
+            agent_verify=(),
+        )
+
     def tool(
         self,
         *,

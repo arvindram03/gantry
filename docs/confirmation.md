@@ -208,3 +208,38 @@ confirming something already declined — is refused rather than answered quietl
   pinning its proposal in memory forever.
 - A custom `RunStore` needs `compare_and_set` to back confirmation. One without
   it raises a clear error instead of making a weaker guarantee quietly.
+
+## Confirming after a restart
+
+A parked run's continuation lives in the process that parked it. The run
+itself is in the store, so it outlives a restart; the continuation does not.
+A host that confirms from somewhere else — after a deploy, or from a second
+instance — says how to pick the run back up:
+
+```python
+write = db.write(destinations=["app.tickets"])
+
+run = await gantry.runs.confirm(run_id, resume=write.resume)
+```
+
+`resume` is given the confirmed run and continues it under the same id.
+`SQLWrite`, `SQLQuery` and `SQLMaterializer` each provide one. What is and is
+not re-decided:
+
+- **The operation's bounds are applied again**, as they are now. A destination
+  taken away while the write waited refuses it, which is what taking it away
+  meant.
+- **The reusable policy is not asked again.** The run was admitted, and an
+  admitted run is not re-evaluated.
+- **It still runs once.** Whichever process moves the run out of
+  `AWAITING_CONFIRMATION` in the store is the only one that resumes it.
+
+Two kinds of run cannot be resumed from the store and say so: one that kept
+only its proposal's hash, since a hash cannot be executed, and one carrying
+checks the agent supplied, since those are recorded by name and resuming
+without them would run the proposal under a looser contract than it was made
+with. Both can still be confirmed by the process that received them.
+
+For a write, `await write.dry_run(sql)` tells the person deciding how many rows
+it would change — by running it in a transaction that is rolled back, so it is
+a call to make on purpose.

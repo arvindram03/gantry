@@ -53,6 +53,28 @@ class AffectedRowLimitError(Exception):
         return Failure(FailureKind.ROW_LIMIT_EXCEEDED, False, str(self))
 
 
+#: The context key that asks an adapter to count a write and then undo it.
+DRY_RUN = "gantry.sql.dry_run"
+
+#: How many `RETURNING` rows a dry run reads before it stops counting. The
+#: statement has run in full by then; this only bounds what crosses the wire.
+DRY_RUN_CEILING = 100_000
+
+
+class DryRunComplete(Exception):  # noqa: N818 - control flow, not an error
+    """A dry run counted what the statement changed, and is rolling it back.
+
+    Raised inside the adapter's transaction for the same reason the limit is:
+    leaving the block on an exception is what undoes the statement. `affected`
+    is exact unless `at_least` is set, in which case counting stopped there.
+    """
+
+    def __init__(self, affected: int, *, at_least: bool = False) -> None:
+        self.affected = affected
+        self.at_least = at_least
+        super().__init__(f"dry run: {affected} rows")
+
+
 def check(limit: int | None, affected: int) -> None:
     """Raise if `affected` is past `limit`. No limit means nothing to check."""
     if limit is not None and affected > limit:

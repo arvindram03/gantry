@@ -69,6 +69,22 @@ Notable changes. Dates are release dates; the format follows
   as rather than as a query that happens to write. PostgreSQL, Neon, Supabase, MySQL and DuckDB declare the new
   `affected_row_limit` capability; BigQuery and Snowflake do not yet, so a
   write there is refused rather than run unbounded.
+- **A parked run can be confirmed after the process that parked it is gone.**
+  `gantry.runs.confirm(run_id, resume=operation.resume)` continues a run from
+  the store when its continuation is not in this process — a restart, or
+  another instance. `SQLWrite`, `SQLQuery` and `SQLMaterializer` each have a
+  `resume(run)`. The run keeps its id, its admission and its confirmation; the
+  operation's own bounds are applied again as they stand, so a destination
+  removed while a write waited refuses it; the reusable policy is not asked
+  again. Still single-shot: the compare-and-set that releases a run is what
+  lets exactly one confirmer through. A run that kept only its proposal's
+  hash, or carries checks the agent supplied, cannot be resumed this way and
+  says so.
+- `write.dry_run(sql)`: how many rows a statement would change, found by
+  running it in a transaction that is always rolled back. Reported even when
+  over the limit — the question is how many, not whether. It does run, so
+  locks are taken and a sequence it advances stays advanced; that is why it is
+  a call a host makes on purpose rather than something `check` does.
 - `OperationKind.WRITE`, with `gantry.allow.write(...)` and
   `gantry.deny.write(...)`, and a `max_rows_affected` constraint. A write is its
   own operation, so a rule that allows queries does not allow it.

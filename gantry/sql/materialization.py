@@ -608,6 +608,13 @@ class SQLMaterializer:
 
         return await gate(recorder, policy=self._connection.policy, request=request, resume=run)
 
+    async def resume(self, run: Run) -> Run:
+        """Continue a confirmed run from the store. See `SQLWrite.resume`."""
+        from gantry.runs.lifecycle import stored_proposal
+
+        sql = stored_proposal(run, OperationKind.MATERIALIZE)
+        return await self._execute_materialization(sql, verify=(), recorder=RunRecorder.adopt(run))
+
     async def _execute_materialization(
         self,
         proposal: str | MaterializationProposal,

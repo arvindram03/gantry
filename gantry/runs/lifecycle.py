@@ -144,6 +144,19 @@ class RunRecorder:
             inputs=tuple(inputs) or (() if request is None else tuple(request.inputs)),
         )
 
+    @classmethod
+    def adopt(cls, run: Run) -> RunRecorder:
+        """A recorder for a run that already exists, rather than a new one.
+
+        For resuming a run from the store: the process that parked it is gone,
+        and the work has to continue under the same id, with the admission and
+        confirmation already recorded on it. Nothing is created and nothing is
+        written until the next transition.
+        """
+        recorder = cls.__new__(cls)
+        recorder.run = run
+        return recorder
+
     def awaiting_confirmation(self, requirement: ConfirmationRequirement) -> Run:
         """Parked: allowed, but the host should ask the user first.
 
@@ -258,6 +271,36 @@ class RunRecorder:
         self.run = self.run.advanced(status, **changes)
         _update_run(self.run)
         return self.run
+
+
+def stored_proposal(run: Run, kind: OperationKind) -> str:
+    """The proposal a stored run can be resumed from, or a refusal to resume it.
+
+    Three things have to hold. The run is the kind of operation being asked to
+    resume it — a write operation must not continue a query. The proposal's
+    body was kept, since a hash cannot be executed. And the agent attached no
+    checks of its own: those are recorded by name, not in full, so resuming
+    without them would run the proposal under a looser contract than the one
+    it was made with.
+    """
+    from gantry.runs.service import ConfirmationError
+
+    if run.operation.kind is not kind:
+        raise ConfirmationError(
+            f"run {run.id} is a {run.operation.kind.value}, not a {kind.value}; "
+            "resume it with the operation that proposed it"
+        )
+    proposal = run.proposal
+    if proposal is None or proposal.body is None:
+        raise ConfirmationError(
+            f"run {run.id} kept only the hash of its proposal, so there is nothing to resume"
+        )
+    if proposal.agent_verification:
+        raise ConfirmationError(
+            f"run {run.id} carries checks the agent supplied, which are not stored in full; "
+            "it can be resumed only by the process that received it"
+        )
+    return proposal.body
 
 
 def _decide(verification: VerificationResult | None) -> RunStatus:

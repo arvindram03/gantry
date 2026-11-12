@@ -664,3 +664,158 @@ async def test_a_query_that_failed_in_the_engine_still_says_why_when_it_is_read_
     assert stored is not None
     assert stored.failure is not None, "the stored run lost the reason it failed"
     assert stored.failure.message == run.failure.message  # type: ignore[union-attr]
+
+
+# ------------------------------------------------- counting without changing
+
+
+async def test_a_dry_run_says_how_many_rows_and_changes_none(path: Path) -> None:
+    """The number an approver needs, from the data rather than from the text."""
+    db = gantry.sql.connect("duckdb", path=str(path))
+    write = db.write(destinations=["scratch.*"], max_rows_affected=10)
+
+    small = await write.dry_run("DELETE FROM scratch.notes WHERE id < 4")
+    large = await write.dry_run("DELETE FROM scratch.notes WHERE id < 40")
+    returning = await write.dry_run("UPDATE scratch.notes SET body = 'x' WHERE id < 7 RETURNING id")
+
+    assert (small["would_change"], small["over_limit"]) == (4, False)
+    assert (large["would_change"], large["over_limit"]) == (40, True), (
+        "over the limit is reported, not refused: the question was how many"
+    )
+    assert returning["would_change"] == 7
+    assert _count(path, "scratch.notes") == 50
+    assert _count(path, "scratch.notes", "body = 'x'") == 0
+
+
+async def test_a_dry_run_does_not_run_what_would_be_refused(path: Path) -> None:
+    db = gantry.sql.connect("duckdb", path=str(path))
+    write = db.write(destinations=["scratch.*"])
+
+    answer = await write.dry_run("DELETE FROM prod.orders WHERE id < 5")
+
+    assert answer["allowed"] is False
+    assert answer["would_change"] is None
+    assert _count(path, "prod.orders") == 20
+
+
+# ------------------------------------------- resuming after the process is gone
+
+
+def _ask_first() -> Policy:
+    return Policy(
+        "ask-first",
+        [
+            allow.query(),
+            allow.write(
+                destinations=["scratch.*"],
+                require_confirmation=True,
+                confirmation_message="This changes scratch data.",
+            ),
+        ],
+    )
+
+
+def _forget_parked_runs() -> None:
+    """What a restart does: the store keeps the run, the process loses the continuation."""
+    from gantry.runs import service
+
+    with service._pending.lock:
+        service._pending.entries.clear()
+
+
+async def test_a_parked_write_survives_the_process_that_parked_it(path: Path) -> None:
+    """Held, restarted, approved: the same run, and the rows change once."""
+    db = gantry.sql.connect("duckdb", path=str(path), policy=_ask_first())
+    write = db.write(destinations=["scratch.*"])
+    parked = await write("DELETE FROM scratch.notes WHERE id < 3")
+    _forget_parked_runs()
+
+    with pytest.raises(gantry.runs.ConfirmationError, match="pass resume="):
+        await gantry.runs.confirm(parked.id)
+    assert _count(path, "scratch.notes") == 50, "a refusal to resume must not have run it"
+
+    # A second connection and operation, as a new process would build them.
+    again = gantry.sql.connect("duckdb", path=str(path), policy=_ask_first())
+    done = await gantry.runs.confirm(
+        parked.id, resume=again.write(destinations=["scratch.*"]).resume
+    )
+
+    assert done.id == parked.id
+    assert done.status is RunStatus.ACCEPTED
+    assert done.rows_affected == 3
+    assert done.confirmation is not None
+    assert _count(path, "scratch.notes") == 47
+
+    repeated = await gantry.runs.confirm(
+        parked.id, resume=again.write(destinations=["scratch.*"]).resume
+    )
+    assert repeated.status is RunStatus.ACCEPTED
+    assert _count(path, "scratch.notes") == 47, "confirming twice ran the write twice"
+
+
+async def test_a_resumed_write_is_still_held_to_the_bounds_as_they_are_now(path: Path) -> None:
+    """Taking a destination away while a write waits is a way of saying no."""
+    db = gantry.sql.connect("duckdb", path=str(path), policy=_ask_first())
+    parked = await db.write(destinations=["scratch.*"])("DELETE FROM scratch.notes WHERE id < 3")
+    _forget_parked_runs()
+
+    narrower = db.write(destinations=["scratch.other"])
+    done = await gantry.runs.confirm(parked.id, resume=narrower.resume)
+
+    assert done.status is RunStatus.POLICY_REJECTED
+    assert _count(path, "scratch.notes") == 50
+
+
+async def test_a_run_is_resumed_only_by_the_kind_of_operation_that_proposed_it(
+    path: Path,
+) -> None:
+    db = gantry.sql.connect("duckdb", path=str(path), policy=_ask_first())
+    parked = await db.write(destinations=["scratch.*"])("DELETE FROM scratch.notes WHERE id < 3")
+    _forget_parked_runs()
+
+    with pytest.raises(gantry.runs.ConfirmationError, match="is a write, not a query"):
+        await db.query(read_only=False).resume(parked)
+    assert _count(path, "scratch.notes") == 50
+
+
+async def test_a_declined_run_cannot_be_resumed(path: Path) -> None:
+    db = gantry.sql.connect("duckdb", path=str(path), policy=_ask_first())
+    write = db.write(destinations=["scratch.*"])
+    parked = await write("DELETE FROM scratch.notes WHERE id < 3")
+    _forget_parked_runs()
+
+    declined = await gantry.runs.decline(parked.id)
+    assert declined.status is RunStatus.CONFIRMATION_DECLINED
+    with pytest.raises(gantry.runs.ConfirmationError, match="was declined"):
+        await gantry.runs.confirm(parked.id, resume=write.resume)
+    assert _count(path, "scratch.notes") == 50
+
+
+async def test_a_parked_query_and_a_parked_materialization_resume_too(path: Path) -> None:
+    policy = Policy(
+        "ask-about-everything",
+        [
+            allow.query(require_confirmation=True, confirmation_message="Reading."),
+            allow.materialize(
+                sources=["scratch.*"],
+                destinations=["scratch.*"],
+                require_confirmation=True,
+                confirmation_message="Building.",
+            ),
+        ],
+    )
+    db = gantry.sql.connect("duckdb", path=str(path), policy=policy)
+    query = db.query(read_only=False, max_rows=2)
+    build = db.materialize(sources=["scratch.*"], destinations=["scratch.*"])
+    read = await query("SELECT id FROM scratch.notes ORDER BY id")
+    built = await build("CREATE TABLE scratch.copy AS SELECT * FROM scratch.notes WHERE id < 5")
+    assert read.status is built.status is RunStatus.AWAITING_CONFIRMATION
+    _forget_parked_runs()
+
+    read_done = await gantry.runs.confirm(read.id, resume=query.resume)
+    built_done = await gantry.runs.confirm(built.id, resume=build.resume)
+
+    assert read_done.status is RunStatus.ACCEPTED
+    assert read_done.rows == ((0,), (1,))
+    assert built_done.status is RunStatus.ACCEPTED, built_done.failure
+    assert _count(path, "scratch.copy") == 5

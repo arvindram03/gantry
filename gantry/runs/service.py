@@ -158,8 +158,20 @@ async def gate(
     return await resume()
 
 
-async def confirm(run_id: str, *, metadata: Mapping[str, object] | None = None) -> Run:
+async def confirm(
+    run_id: str,
+    *,
+    metadata: Mapping[str, object] | None = None,
+    resume: Callable[[Run], Awaitable[Run]] | None = None,
+) -> Run:
     """The host says the user agreed. Resume the run and return what it became.
+
+    `resume` is for a run whose continuation is not in this process — the
+    server restarted, or another instance received the proposal. It is handed
+    the confirmed run and continues it, normally by calling `resume(run)` on
+    the same kind of operation that proposed it. Without it, a run parked
+    elsewhere is refused rather than guessed at. A continuation still held
+    here is always preferred: it is the proposal exactly as it arrived.
 
     Idempotent and single-shot: the transition out of `AWAITING_CONFIRMATION` is
     a compare-and-set in the store, so of any number of concurrent or repeated
@@ -175,12 +187,13 @@ async def confirm(run_id: str, *, metadata: Mapping[str, object] | None = None) 
         return _already(run, ConfirmationStatus.CONFIRMED)
 
     parked = _pending.peek(run_id)
-    if parked is None:
+    if parked is None and resume is None:
         raise ConfirmationError(
-            f"run {run_id} is awaiting confirmation but cannot be resumed in this process; "
-            "v0 resumes a parked run only where it was proposed"
+            f"run {run_id} is awaiting confirmation but its continuation is not in this "
+            "process; pass resume= to continue it from the stored run"
         )
-    _check_proposal(run, parked)
+    if parked is not None:
+        _check_proposal(run, parked)
 
     record = _record(run, run_id).confirmed(metadata=metadata)
     # Durable before anything external happens, and atomic so that only one
@@ -192,12 +205,17 @@ async def confirm(run_id: str, *, metadata: Mapping[str, object] | None = None) 
     ):
         return _already(_require(run_id), ConfirmationStatus.CONFIRMED)
 
-    claimed = _pending.take(run_id)
-    if claimed is None:  # pragma: no cover - another task took it between peek and take
-        return _require(run_id)
     confirmed = _require(run_id)
-    claimed.recorder.resumed(confirmed)
-    return await claimed.resume()
+    claimed = _pending.take(run_id)
+    if claimed is not None:
+        claimed.recorder.resumed(confirmed)
+        return await claimed.resume()
+    if resume is None:  # pragma: no cover - another task took it between peek and take
+        return confirmed
+    # The compare-and-set above is what makes this single-shot across
+    # processes: only the caller that moved the run out of
+    # AWAITING_CONFIRMATION gets here.
+    return await resume(confirmed)
 
 
 async def decline(run_id: str, *, metadata: Mapping[str, object] | None = None) -> Run:

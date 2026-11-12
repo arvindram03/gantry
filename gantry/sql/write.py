@@ -26,10 +26,11 @@ from gantry.context import Context
 from gantry.evidence import EvidenceBundle, Observation, ObservationSource
 from gantry.failure import Failure, FailureKind
 from gantry.result import Result, ResultStatus
-from gantry.runs.lifecycle import RunRecorder
+from gantry.runs.lifecycle import RunRecorder, stored_proposal
 from gantry.runs.model import OperationKind, QueryResultRef, ResourceRef, Run
 from gantry.runs.service import gate
 from gantry.runs.status import RunStatus
+from gantry.sql.affected import DRY_RUN
 from gantry.sql.classification import SQLClassification, SQLObjectRef, SQLOperation
 from gantry.sql.inspection import write_request
 from gantry.sql.output import InlineRows
@@ -164,6 +165,60 @@ class SQLWrite:
             return await self._execute(sql, classification, context=context, recorder=recorder)
 
         return await gate(recorder, policy=connection.policy, request=request, resume=run)
+
+    async def resume(self, run: Run) -> Run:
+        """Continue a confirmed run from the store, in a process that never parked it.
+
+        For `gantry.runs.confirm(run_id, resume=write.resume)`. The statement
+        is the one recorded on the run. This operation's bounds are applied
+        again, as they stand now: a destination removed since the proposal was
+        made refuses it, which is what removing it meant. The reusable policy
+        is not asked again — the run was admitted, and an admitted run is not
+        re-decided.
+        """
+        sql = stored_proposal(run, OperationKind.WRITE)
+        recorder = RunRecorder.adopt(run)
+        classification = self._connection._dialect.classify(sql)
+        refusal = self._refusal(classification)
+        if refusal is not None:
+            return _refuse(recorder, *refusal)
+        return await self._execute(sql, classification, context=None, recorder=recorder)
+
+    async def dry_run(self, sql: str) -> dict[str, object]:
+        """How many rows the statement would change, found by running it and undoing it.
+
+        `check` answers from the statement; this answers from the data. The
+        statement runs inside a transaction that is always rolled back, so
+        nothing it does persists — but it does run: locks are taken for its
+        duration, triggers fire and are undone with it, and a sequence it
+        advances stays advanced. That is why this is a separate call a host
+        makes on purpose, and not something `check` does quietly.
+
+        A statement this operation or the policy would refuse is not run at
+        all; the answer is then `check`'s, with `would_change` left `None`.
+        No run is recorded.
+        """
+        answer = self.check(sql)
+        answer["would_change"] = None
+        if answer["allowed"] is False:
+            return answer
+        bounds = self._policy.bounds()
+        result = await self._connection.execute(
+            sql, policy=bounds, context=Context(metadata={DRY_RUN: True})
+        )
+        if result.status is not ResultStatus.ACCEPTED:
+            failure = result.failure
+            return {
+                **answer,
+                "error": failure.message if failure is not None else "the dry run failed",
+            }
+        counted = result.metrics.rows_written
+        return {
+            **answer,
+            "would_change": counted,
+            "at_least": bool(result.metrics.native.get("at_least", False)),
+            "over_limit": counted is not None and counted > self._policy.max_rows_affected,
+        }
 
     def inspect(self, sql: str) -> SQLClassification:
         """What the statement would change and read, without running it."""

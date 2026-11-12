@@ -37,7 +37,7 @@ from gantry.failure import Failure, FailureKind
 from gantry.handle import ExecutionHandle
 from gantry.metrics import ExecutionMetrics
 from gantry.output import OutputKind, OutputRef
-from gantry.sql.affected import ROW_WRITES, AffectedRowLimitError, check
+from gantry.sql.affected import DRY_RUN, ROW_WRITES, AffectedRowLimitError, DryRunComplete, check
 from gantry.sql.capabilities import SQLCapabilities
 from gantry.sql.classification import SQLOperation
 from gantry.sql.dialect import MySQLDialect
@@ -207,6 +207,8 @@ class MySQLAdapter:
             raise ValueError("governed SQL policy is missing from execution context")
         gantry_id = f"run_{uuid4().hex}"
         metadata: dict[str, object] = {"provider": target.provider}
+        if context.metadata.get(DRY_RUN) is True:
+            metadata[DRY_RUN] = True
         plan = context.metadata.get(_PLAN_METADATA)
         if isinstance(plan, MaterializationPlan):
             metadata[_DESTINATION_METADATA] = plan.destination.qualified_name
@@ -345,6 +347,15 @@ class MySQLAdapter:
         except AffectedRowLimitError as error:
             # `_run` rolled the transaction back before letting this out.
             return ExecutionResult.failed(handle, error.failure())
+        except DryRunComplete as counted:
+            return ExecutionResult.succeeded(
+                handle,
+                metrics=ExecutionMetrics(
+                    rows_written=counted.affected,
+                    runtime_seconds=asyncio.get_running_loop().time() - started,
+                    native={"dry_run": True, "at_least": counted.at_least},
+                ),
+            )
         except Exception as error:
             return ExecutionResult.failed(handle, _failure(error))
         finally:
@@ -384,6 +395,8 @@ class MySQLAdapter:
                     # MySQL counts rows *changed*: an `UPDATE` that sets a row
                     # to the value it already has does not count it.
                     affected = max(0, int(cursor.rowcount))
+                    if handle.metadata.get(DRY_RUN) is True:
+                        raise DryRunComplete(affected)
                     check(policy.max_rows_affected, affected)
                     await connection.commit()
                     return (), None, affected

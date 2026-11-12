@@ -325,3 +325,30 @@ async def test_mysql_refuses_an_update_through_a_join_it_was_not_given(mysql: ob
     assert run.status is RunStatus.POLICY_REJECTED
     assert run.failure is not None
     assert "analytics.write_other" in run.failure.message
+
+
+# -------------------------------------------------------- counting, for real
+
+
+async def test_postgres_counts_a_dry_run_and_leaves_the_rows(raw: object) -> None:
+    write = _db().write(destinations=["write_scratch.*"], max_rows_affected=10)
+
+    plain = await write.dry_run("DELETE FROM write_scratch.notes WHERE id <= 40")
+    returning = await write.dry_run(
+        "UPDATE write_scratch.notes SET body = 'x' WHERE id <= 6 RETURNING id"
+    )
+
+    assert (plain["would_change"], plain["over_limit"]) == (40, True)
+    assert (returning["would_change"], returning["over_limit"]) == (6, False)
+    assert await _count(raw, "write_scratch.notes") == 50
+    assert await _count(raw, "write_scratch.notes", "body = 'x'") == 0
+
+
+async def test_mysql_counts_a_dry_run_and_leaves_the_rows(mysql: object) -> None:
+    db = gantry.sql.connect("mysql", url=MYSQL)
+    write = db.write(destinations=["analytics.write_*"], max_rows_affected=10)
+
+    answer = await write.dry_run("DELETE FROM analytics.write_notes WHERE id <= 40")
+
+    assert (answer["would_change"], answer["over_limit"]) == (40, True)
+    assert await _mysql_count(mysql) == 50

@@ -16,7 +16,14 @@ from gantry.handle import ExecutionHandle
 from gantry.metrics import ExecutionMetrics
 from gantry.output import OutputKind, OutputRef
 from gantry.sql.adapter import SQLAdapter
-from gantry.sql.affected import ROW_WRITES, AffectedRowLimitError, check
+from gantry.sql.affected import (
+    DRY_RUN,
+    DRY_RUN_CEILING,
+    ROW_WRITES,
+    AffectedRowLimitError,
+    DryRunComplete,
+    check,
+)
 from gantry.sql.capabilities import SQLCapabilities
 from gantry.sql.dialect import ConservativeDialect
 from gantry.sql.explain import ExplainResult
@@ -199,6 +206,8 @@ class DuckDBAdapter(SQLAdapter):
                     "gantry.sql.materialization.operation": plan.operation.value,
                 }
             )
+        if context.metadata.get(DRY_RUN) is True:
+            metadata[DRY_RUN] = True
         handle = ExecutionHandle(
             gantry_id=gantry_id,
             engine="sql",
@@ -274,7 +283,11 @@ class DuckDBAdapter(SQLAdapter):
                 if writes:
                     rows_written, inline = await asyncio.wait_for(
                         asyncio.to_thread(
-                            self._execute_write, sql, policy, classification.returning
+                            self._execute_write,
+                            sql,
+                            policy,
+                            classification.returning,
+                            handle.metadata.get(DRY_RUN) is True,
                         ),
                         timeout=policy.timeout_seconds,
                     )
@@ -297,6 +310,15 @@ class DuckDBAdapter(SQLAdapter):
         except AffectedRowLimitError as error:
             # `_execute_write` rolled the transaction back before raising.
             return ExecutionResult.failed(handle, error.failure())
+        except DryRunComplete as counted:
+            return ExecutionResult.succeeded(
+                handle,
+                metrics=ExecutionMetrics(
+                    rows_written=counted.affected,
+                    runtime_seconds=asyncio.get_running_loop().time() - started,
+                    native={"dry_run": True, "at_least": counted.at_least},
+                ),
+            )
         except Exception as error:
             return ExecutionResult.failed(
                 handle,
@@ -333,7 +355,7 @@ class DuckDBAdapter(SQLAdapter):
         )
 
     def _execute_write(
-        self, sql: str, policy: SQLPolicy, returning: bool
+        self, sql: str, policy: SQLPolicy, returning: bool, dry_run: bool = False
     ) -> tuple[int, InlineRows]:
         """Run a row write in a transaction, and undo it if it changed too much.
 
@@ -346,6 +368,14 @@ class DuckDBAdapter(SQLAdapter):
         self._connection.execute("BEGIN TRANSACTION")
         try:
             cursor = self._connection.execute(sql)
+            if dry_run:
+                if returning:
+                    seen = cursor.fetchmany(DRY_RUN_CEILING + 1)
+                    raise DryRunComplete(
+                        min(len(seen), DRY_RUN_CEILING), at_least=len(seen) > DRY_RUN_CEILING
+                    )
+                row = cursor.fetchone()
+                raise DryRunComplete(int(row[0]) if row and isinstance(row[0], int) else 0)
             if returning:
                 columns = tuple(str(column[0]) for column in (cursor.description or ()))
                 fetched = cursor.fetchall() if limit is None else cursor.fetchmany(limit + 1)

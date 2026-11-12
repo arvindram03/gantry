@@ -21,7 +21,15 @@ from gantry.failure import Failure, FailureKind
 from gantry.handle import ExecutionHandle
 from gantry.metrics import ExecutionMetrics
 from gantry.output import OutputKind, OutputRef
-from gantry.sql.affected import ROW_WRITES, AffectedRowLimitError, check, from_command_tag
+from gantry.sql.affected import (
+    DRY_RUN,
+    DRY_RUN_CEILING,
+    ROW_WRITES,
+    AffectedRowLimitError,
+    DryRunComplete,
+    check,
+    from_command_tag,
+)
 from gantry.sql.capabilities import SQLCapabilities
 from gantry.sql.classification import SQLOperation
 from gantry.sql.dialect import ConservativeDialect
@@ -316,7 +324,10 @@ class PostgresAdapter:
             f"postgres_{uuid4().hex}",
             metadata=metadata,
         )
-        self._jobs[gantry_id] = asyncio.create_task(self._execute(handle, sql, policy))
+        dry_run = context.metadata.get(DRY_RUN) is True
+        self._jobs[gantry_id] = asyncio.create_task(
+            self._execute(handle, sql, policy, dry_run=dry_run)
+        )
         return handle
 
     async def status(self, handle: ExecutionHandle) -> Execution:
@@ -374,6 +385,8 @@ class PostgresAdapter:
         handle: ExecutionHandle,
         sql: str,
         policy: SQLPolicy,
+        *,
+        dry_run: bool = False,
     ) -> ExecutionResult:
         started = asyncio.get_running_loop().time()
         outputs: tuple[OutputRef, ...]
@@ -402,7 +415,7 @@ class PostgresAdapter:
                     outputs = (output,)
                     rows_read = len(rows)
                 elif operation in ROW_WRITES:
-                    rows_written, returned = await _write(connection, sql, policy)
+                    rows_written, returned = await _write(connection, sql, policy, dry_run)
                     outputs = (
                         ()
                         if returned is None
@@ -429,6 +442,16 @@ class PostgresAdapter:
             # Raised inside the transaction block above, so by here the
             # statement has been rolled back.
             return ExecutionResult.failed(handle, error.failure())
+        except DryRunComplete as counted:
+            # Likewise rolled back: the statement ran, was counted, and is gone.
+            return ExecutionResult.succeeded(
+                handle,
+                metrics=ExecutionMetrics(
+                    rows_written=counted.affected,
+                    runtime_seconds=asyncio.get_running_loop().time() - started,
+                    native={"dry_run": True, "at_least": counted.at_least},
+                ),
+            )
         except Exception as error:
             return ExecutionResult.failed(handle, _failure(error))
         finally:
@@ -497,7 +520,7 @@ def _quoted(identifier: str) -> str:
 
 
 async def _write(
-    connection: _Connection, sql: str, policy: SQLPolicy
+    connection: _Connection, sql: str, policy: SQLPolicy, dry_run: bool = False
 ) -> tuple[int, InlineRows | None]:
     """Run an `INSERT`, `UPDATE`, `DELETE` or `MERGE`, counted and bounded.
 
@@ -515,6 +538,16 @@ async def _write(
     statement = await connection.prepare(sql)
     attributes = statement.get_attributes()
     limit = policy.max_rows_affected
+    if dry_run:
+        # Counted and then undone whatever the count: the limit is not applied,
+        # because the question being asked is how many, not whether.
+        if not attributes:
+            await statement.fetch()
+            raise DryRunComplete(from_command_tag(statement.get_statusmsg()))
+        counted = await (await statement.cursor()).fetch(DRY_RUN_CEILING + 1)
+        raise DryRunComplete(
+            min(len(counted), DRY_RUN_CEILING), at_least=len(counted) > DRY_RUN_CEILING
+        )
     if not attributes:
         await statement.fetch()
         affected = from_command_tag(statement.get_statusmsg())
