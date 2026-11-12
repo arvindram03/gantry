@@ -32,6 +32,14 @@ Notable changes. Dates are release dates; the format follows
   classified as a `SELECT` that writes. This is a floor: a user-defined
   function can do the same and no classifier can see inside one. The database
   role remains the boundary.
+- **A rule that asked for confirmation did not ask about a write that read
+  nothing.** `allow.write(sources=[...], destinations=[...],
+  require_confirmation=True)` granted `DELETE FROM t WHERE ...` and
+  `INSERT INTO t VALUES (...)` and ran them without parking: a rule naming
+  sources was held not to describe a request that touched none of them, though
+  the same rule had just authorized it. The same applied to a materialization
+  or a MongoDB `$out` with no source collection. With nothing read, a rule is
+  now judged on its destinations.
 - A write's target was the first table the statement named, which is not always
   the one it changes. `WITH src AS (SELECT * FROM a) UPDATE b ...` reported `a`
   — the table being read — as written, and a data-modifying CTE reported only

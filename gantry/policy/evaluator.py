@@ -167,11 +167,25 @@ def _participates(rule: PolicyRule, request: PolicyRequest) -> bool:
 
     A request with no resolved resources has nothing to compare against, so an
     applicable rule participates by applying at all.
+
+    A write that reads nothing is the case this used to get wrong. `DELETE FROM
+    t WHERE ...` and `INSERT INTO t VALUES (...)` have an output and no inputs.
+    A rule naming sources was held not to describe such a request — none of its
+    sources was touched — so a rule that granted the write, and asked to be
+    told about it, granted it without asking. Sources say what may be read on
+    the way to a destination; reading nothing satisfies that, exactly as it
+    does when the same rule is asked for authority. So with nothing read, a
+    rule is judged on its destinations alone — and one that names sources but
+    no destinations grants no write and has nothing to say about one.
     """
     if not request.inputs and not request.outputs:
         return True
-    if rule.sources is not None and not _touched(rule.sources, request.inputs):
-        return False
+    if rule.sources is not None:
+        if request.inputs:
+            if not _touched(rule.sources, request.inputs):
+                return False
+        elif rule.destinations is None:
+            return False
     return rule.destinations is None or bool(_touched(rule.destinations, request.outputs))
 
 

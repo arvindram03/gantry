@@ -819,3 +819,63 @@ async def test_a_parked_query_and_a_parked_materialization_resume_too(path: Path
     assert read_done.rows == ((0,), (1,))
     assert built_done.status is RunStatus.ACCEPTED, built_done.failure
     assert _count(path, "scratch.copy") == 5
+
+
+# ---------------------------------------------- being asked about every write
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "DELETE FROM scratch.notes WHERE id < 3",
+        "INSERT INTO scratch.notes VALUES (900, 'x')",
+        "UPDATE scratch.notes SET body = 'x' WHERE id = 1",
+    ],
+)
+async def test_a_write_that_reads_nothing_is_still_asked_about(path: Path, sql: str) -> None:
+    """A rule that names its sources asked about writes that read from them, and
+    waved through the ones that read nothing.
+
+    Most writes read nothing but the table they change. The rule below grants
+    every one of these, and granted them without the question it was written
+    to ask.
+    """
+    policy = Policy(
+        "ask-first",
+        [
+            allow.write(
+                sources=["prod.*"],
+                destinations=["scratch.*"],
+                require_confirmation=True,
+                confirmation_message="This changes scratch data.",
+            )
+        ],
+    )
+    db = gantry.sql.connect("duckdb", path=str(path), policy=policy)
+    before = _count(path, "scratch.notes")
+
+    run = await db.write(destinations=["scratch.*"])(sql)
+
+    assert run.status is RunStatus.AWAITING_CONFIRMATION, run.status
+    assert _count(path, "scratch.notes") == before
+    await gantry.runs.decline(run.id)
+
+
+async def test_a_rule_about_reading_does_not_ask_about_a_write_it_does_not_grant(
+    path: Path,
+) -> None:
+    """The other direction: fixing the above must not make every rule ask."""
+    policy = Policy(
+        "two-rules",
+        [
+            allow.query(
+                sources=["prod.*"], require_confirmation=True, confirmation_message="Reading prod."
+            ),
+            allow.write(destinations=["scratch.*"]),
+        ],
+    )
+    db = gantry.sql.connect("duckdb", path=str(path), policy=policy)
+
+    run = await db.write(destinations=["scratch.*"])("DELETE FROM scratch.notes WHERE id < 3")
+
+    assert run.status is RunStatus.ACCEPTED
