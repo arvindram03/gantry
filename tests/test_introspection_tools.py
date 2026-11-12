@@ -19,7 +19,7 @@ URL = os.environ.get("GANTRY_TEST_POSTGRES_URL", "postgresql://gantry:gantry@loc
 
 
 async def _reachable() -> bool:
-    import asyncpg  # type: ignore[import-untyped]
+    asyncpg = pytest.importorskip("asyncpg")
 
     try:
         connection = await asyncpg.connect(URL, timeout=5)

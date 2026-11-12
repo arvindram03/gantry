@@ -83,6 +83,7 @@ def test_hosted_postgres_presets_carry_what_they_require() -> None:
 
 def test_the_caller_always_wins_over_a_preset_default() -> None:
     """Otherwise the defaults would make a local instance unreachable."""
+    pytest.importorskip("asyncpg")
     db = gantry.sql.connect("supabase", url="postgresql://u:p@localhost:5432/d", ssl=None)
 
     assert db._target.config["ssl"] is None
