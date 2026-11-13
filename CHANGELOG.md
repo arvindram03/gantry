@@ -3,6 +3,25 @@
 Notable changes. Dates are release dates; the format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.7.0 — 2026-11-13
+
+### Added
+
+- **A dry run can show the rows a write would change.** `SQLWrite.dry_run(sql,
+  preview=n)` returns up to `n` of the changed rows as `columns` and `rows`,
+  beside the count — what a person deciding on a held write wants to look at.
+  Where the engine supports `RETURNING` (PostgreSQL, DuckDB), a statement
+  without one is run with `RETURNING *` added, so the rows are as the write
+  would leave them; the transaction is rolled back as before, so nothing
+  persists. MySQL has no `RETURNING`, and answers with the count and
+  `previewed: false`.
+- The `returning` SQL capability, and `DRY_RUN_PREVIEW` for adapters that
+  implement the preview.
+
+### Changed
+
+- The release check passes without the optional database drivers installed.
+
 ## 0.6.0 — 2026-11-12
 
 ### Security
