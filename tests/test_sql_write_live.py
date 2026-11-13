@@ -344,6 +344,20 @@ async def test_postgres_counts_a_dry_run_and_leaves_the_rows(raw: object) -> Non
     assert await _count(raw, "write_scratch.notes", "body = 'x'") == 0
 
 
+async def test_postgres_shows_the_rows_a_dry_run_would_change(raw: object) -> None:
+    write = _db().write(destinations=["write_scratch.*"], max_rows_affected=10)
+
+    answer = await write.dry_run(
+        "UPDATE write_scratch.notes SET body = 'x' WHERE id <= 6", preview=4
+    )
+
+    assert answer["would_change"] == 6 and answer["previewed"] is True
+    assert answer["columns"] == ["id", "body"]
+    assert [row[1] for row in answer["rows"]] == ["x"] * 4  # type: ignore[attr-defined]
+    assert answer["preview_truncated"] is True
+    assert await _count(raw, "write_scratch.notes", "body = 'x'") == 0
+
+
 async def test_mysql_counts_a_dry_run_and_leaves_the_rows(mysql: object) -> None:
     db = gantry.sql.connect("mysql", url=MYSQL)
     write = db.write(destinations=["analytics.write_*"], max_rows_affected=10)
@@ -352,3 +366,7 @@ async def test_mysql_counts_a_dry_run_and_leaves_the_rows(mysql: object) -> None
 
     assert (answer["would_change"], answer["over_limit"]) == (40, True)
     assert await _mysql_count(mysql) == 50
+    previewed = await write.dry_run("DELETE FROM analytics.write_notes WHERE id <= 4", preview=5)
+    assert previewed["would_change"] == 4 and previewed["previewed"] is False, (
+        "MySQL has no RETURNING: the count, and an honest no"
+    )

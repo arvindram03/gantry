@@ -18,9 +18,11 @@ doing and are not in the number.
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 
 from gantry.failure import Failure, FailureKind
 from gantry.sql.classification import SQLOperation
+from gantry.sql.output import InlineRows
 
 #: The statements this bound applies to. A `CREATE TABLE AS` is a write too,
 #: but it is a materialization, bounded and verified by its own path.
@@ -60,6 +62,10 @@ DRY_RUN = "gantry.sql.dry_run"
 #: statement has run in full by then; this only bounds what crosses the wire.
 DRY_RUN_CEILING = 100_000
 
+#: The context key asking a dry run to keep up to this many of the rows it
+#: counted, so a person can see them before deciding.
+DRY_RUN_PREVIEW = "gantry.sql.dry_run_preview"
+
 
 class DryRunComplete(Exception):  # noqa: N818 - control flow, not an error
     """A dry run counted what the statement changed, and is rolling it back.
@@ -69,10 +75,26 @@ class DryRunComplete(Exception):  # noqa: N818 - control flow, not an error
     is exact unless `at_least` is set, in which case counting stopped there.
     """
 
-    def __init__(self, affected: int, *, at_least: bool = False) -> None:
+    def __init__(
+        self, affected: int, *, at_least: bool = False, preview: InlineRows | None = None
+    ) -> None:
         self.affected = affected
         self.at_least = at_least
+        self.preview = preview
         super().__init__(f"dry run: {affected} rows")
+
+
+def preview_rows(
+    columns: tuple[str, ...], records: Sequence[Sequence[object]], keep: int
+) -> InlineRows | None:
+    """The first `keep` of the rows a dry run counted, or nothing if none were asked for."""
+    if keep <= 0:
+        return None
+    return InlineRows(
+        columns,
+        tuple(tuple(value for value in row) for row in records[:keep]),
+        truncated=len(records) > keep,
+    )
 
 
 def check(limit: int | None, affected: int) -> None:

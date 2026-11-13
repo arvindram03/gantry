@@ -687,6 +687,27 @@ async def test_a_dry_run_says_how_many_rows_and_changes_none(path: Path) -> None
     assert _count(path, "scratch.notes", "body = 'x'") == 0
 
 
+async def test_a_dry_run_can_show_the_rows_it_would_change(path: Path) -> None:
+    """What the approver wants to look at, not just how many."""
+    db = gantry.sql.connect("duckdb", path=str(path))
+    write = db.write(destinations=["scratch.*"], max_rows_affected=10)
+
+    shown = await write.dry_run("UPDATE scratch.notes SET body = 'x' WHERE id < 7", preview=3)
+    named = await write.dry_run("DELETE FROM scratch.notes WHERE id < 2 RETURNING id", preview=5)
+    counted = await write.dry_run("DELETE FROM scratch.notes WHERE id < 4")
+
+    assert shown["would_change"] == 7 and shown["previewed"] is True
+    assert "body" in shown["columns"]  # type: ignore[operator]
+    assert len(shown["rows"]) == 3 and shown["preview_truncated"] is True  # type: ignore[arg-type]
+    body = shown["columns"].index("body")  # type: ignore[attr-defined]
+    assert {row[body] for row in shown["rows"]} == {"x"}, "rows as the write leaves them"  # type: ignore[attr-defined]
+    assert named["columns"] == ["id"] and named["preview_truncated"] is False
+    assert sorted(row[0] for row in named["rows"]) == [0, 1]  # type: ignore[attr-defined]
+    assert "rows" not in counted and "previewed" not in counted, "nothing asked, nothing shown"
+    assert _count(path, "scratch.notes") == 50
+    assert _count(path, "scratch.notes", "body = 'x'") == 0
+
+
 async def test_a_dry_run_does_not_run_what_would_be_refused(path: Path) -> None:
     db = gantry.sql.connect("duckdb", path=str(path))
     write = db.write(destinations=["scratch.*"])

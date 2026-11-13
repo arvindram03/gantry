@@ -30,7 +30,7 @@ from gantry.runs.lifecycle import RunRecorder, stored_proposal
 from gantry.runs.model import OperationKind, QueryResultRef, ResourceRef, Run
 from gantry.runs.service import gate
 from gantry.runs.status import RunStatus
-from gantry.sql.affected import DRY_RUN
+from gantry.sql.affected import DRY_RUN, DRY_RUN_PREVIEW
 from gantry.sql.classification import SQLClassification, SQLObjectRef, SQLOperation
 from gantry.sql.inspection import write_request
 from gantry.sql.output import InlineRows
@@ -184,7 +184,7 @@ class SQLWrite:
             return _refuse(recorder, *refusal)
         return await self._execute(sql, classification, context=None, recorder=recorder)
 
-    async def dry_run(self, sql: str) -> dict[str, object]:
+    async def dry_run(self, sql: str, *, preview: int = 0) -> dict[str, object]:
         """How many rows the statement would change, found by running it and undoing it.
 
         `check` answers from the statement; this answers from the data. The
@@ -197,14 +197,27 @@ class SQLWrite:
         A statement this operation or the policy would refuse is not run at
         all; the answer is then `check`'s, with `would_change` left `None`.
         No run is recorded.
+
+        `preview` asks for up to that many of the changed rows as well, as
+        `columns` and `rows` — what a person deciding on the write wants to
+        see. Where the engine supports `RETURNING`, a statement without one
+        is run with `RETURNING *` added, so the rows are the rows as the write
+        leaves them. Where it does not, only the count comes back. The answer
+        says which with `previewed`.
         """
         answer = self.check(sql)
         answer["would_change"] = None
         if answer["allowed"] is False:
             return answer
         bounds = self._policy.bounds()
+        metadata: dict[str, object] = {DRY_RUN: True}
+        run_sql = sql
+        returning = self._returning(sql) if preview > 0 else None
+        if returning is not None:
+            run_sql = returning
+            metadata[DRY_RUN_PREVIEW] = preview
         result = await self._connection.execute(
-            sql, policy=bounds, context=Context(metadata={DRY_RUN: True})
+            run_sql, policy=bounds, context=Context(metadata=metadata)
         )
         if result.status is not ResultStatus.ACCEPTED:
             failure = result.failure
@@ -213,12 +226,45 @@ class SQLWrite:
                 "error": failure.message if failure is not None else "the dry run failed",
             }
         counted = result.metrics.rows_written
-        return {
+        answer = {
             **answer,
             "would_change": counted,
             "at_least": bool(result.metrics.native.get("at_least", False)),
             "over_limit": counted is not None and counted > self._policy.max_rows_affected,
         }
+        if preview > 0:
+            shown: InlineRows | None = None
+            for output in result.outputs:
+                inline = output.metadata.get("inline")
+                if isinstance(inline, InlineRows):
+                    shown = inline
+                    break
+            answer["previewed"] = shown is not None
+            if shown is not None:
+                answer["columns"] = list(shown.columns)
+                answer["rows"] = [list(row) for row in shown.rows]
+                answer["preview_truncated"] = shown.truncated
+        return answer
+
+    def _returning(self, sql: str) -> str | None:
+        """The statement as a dry run should run it to see its rows, or `None` if it cannot.
+
+        The rows come from `RETURNING`. A statement that already says it is
+        run as written; one that does not gets `RETURNING *`, on an engine that
+        supports it, for the statements that take it.
+        """
+        if not self._connection.capabilities().returning:
+            return None
+        classification = self._connection._dialect.classify(sql)
+        if classification.returning:
+            return sql
+        if classification.operation not in (
+            SQLOperation.INSERT,
+            SQLOperation.UPDATE,
+            SQLOperation.DELETE,
+        ):
+            return None
+        return sql.rstrip().rstrip(";").rstrip() + " RETURNING *"
 
     def inspect(self, sql: str) -> SQLClassification:
         """What the statement would change and read, without running it."""

@@ -42,6 +42,7 @@ python scripts/capability_matrix.py --write
 | `statement_timeout` | yes | yes | no | yes | yes |
 | `row_limit` | yes | yes | yes | yes | yes |
 | `affected_row_limit` | yes | yes | no | no | writable conn |
+| `returning` | yes | no | no | no | writable conn |
 | `cost_estimate` | no | no | conditional | no | no |
 | `cost_limit` | no | no | conditional | no | no |
 | `bytes_scanned` | no | no | yes | no | no |

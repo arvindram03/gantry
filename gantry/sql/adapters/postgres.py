@@ -24,11 +24,13 @@ from gantry.output import OutputKind, OutputRef
 from gantry.sql.affected import (
     DRY_RUN,
     DRY_RUN_CEILING,
+    DRY_RUN_PREVIEW,
     ROW_WRITES,
     AffectedRowLimitError,
     DryRunComplete,
     check,
     from_command_tag,
+    preview_rows,
 )
 from gantry.sql.capabilities import SQLCapabilities
 from gantry.sql.classification import SQLOperation
@@ -117,6 +119,7 @@ class PostgresAdapter:
             statement_timeout=True,
             row_limit=True,
             affected_row_limit=True,
+            returning=True,
             query_metrics=True,
             create_table_as=True,
             create_view_as=True,
@@ -325,8 +328,9 @@ class PostgresAdapter:
             metadata=metadata,
         )
         dry_run = context.metadata.get(DRY_RUN) is True
+        preview = _preview_size(context.metadata.get(DRY_RUN_PREVIEW))
         self._jobs[gantry_id] = asyncio.create_task(
-            self._execute(handle, sql, policy, dry_run=dry_run)
+            self._execute(handle, sql, policy, dry_run=dry_run, preview=preview)
         )
         return handle
 
@@ -387,6 +391,7 @@ class PostgresAdapter:
         policy: SQLPolicy,
         *,
         dry_run: bool = False,
+        preview: int = 0,
     ) -> ExecutionResult:
         started = asyncio.get_running_loop().time()
         outputs: tuple[OutputRef, ...]
@@ -415,7 +420,9 @@ class PostgresAdapter:
                     outputs = (output,)
                     rows_read = len(rows)
                 elif operation in ROW_WRITES:
-                    rows_written, returned = await _write(connection, sql, policy, dry_run)
+                    rows_written, returned = await _write(
+                        connection, sql, policy, dry_run, preview=preview
+                    )
                     outputs = (
                         ()
                         if returned is None
@@ -446,6 +453,7 @@ class PostgresAdapter:
             # Likewise rolled back: the statement ran, was counted, and is gone.
             return ExecutionResult.succeeded(
                 handle,
+                outputs=_preview_output(handle, counted),
                 metrics=ExecutionMetrics(
                     rows_written=counted.affected,
                     runtime_seconds=asyncio.get_running_loop().time() - started,
@@ -520,7 +528,12 @@ def _quoted(identifier: str) -> str:
 
 
 async def _write(
-    connection: _Connection, sql: str, policy: SQLPolicy, dry_run: bool = False
+    connection: _Connection,
+    sql: str,
+    policy: SQLPolicy,
+    dry_run: bool = False,
+    *,
+    preview: int = 0,
 ) -> tuple[int, InlineRows | None]:
     """Run an `INSERT`, `UPDATE`, `DELETE` or `MERGE`, counted and bounded.
 
@@ -546,7 +559,11 @@ async def _write(
             raise DryRunComplete(from_command_tag(statement.get_statusmsg()))
         counted = await (await statement.cursor()).fetch(DRY_RUN_CEILING + 1)
         raise DryRunComplete(
-            min(len(counted), DRY_RUN_CEILING), at_least=len(counted) > DRY_RUN_CEILING
+            min(len(counted), DRY_RUN_CEILING),
+            at_least=len(counted) > DRY_RUN_CEILING,
+            preview=preview_rows(
+                tuple(attribute.name for attribute in attributes), counted, preview
+            ),
         )
     if not attributes:
         await statement.fetch()
@@ -564,6 +581,23 @@ async def _write(
             raise AffectedRowLimitError(limit)
     rows = tuple(tuple(value for value in row) for row in records[: policy.max_rows])
     return len(records), InlineRows(columns, rows, truncated=len(records) > policy.max_rows)
+
+
+def _preview_size(value: object) -> int:
+    """How many counted rows a dry run should keep: a small positive int, or none."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
+def _preview_output(handle: ExecutionHandle, counted: DryRunComplete) -> tuple[OutputRef, ...]:
+    if counted.preview is None:
+        return ()
+    return (
+        OutputRef(
+            OutputKind.INLINE,
+            f"inline://{handle.gantry_id}",
+            metadata={"inline": counted.preview},
+        ),
+    )
 
 
 def _destination_output(handle: ExecutionHandle) -> tuple[OutputRef, ...]:

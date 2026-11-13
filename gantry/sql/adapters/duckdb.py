@@ -19,10 +19,12 @@ from gantry.sql.adapter import SQLAdapter
 from gantry.sql.affected import (
     DRY_RUN,
     DRY_RUN_CEILING,
+    DRY_RUN_PREVIEW,
     ROW_WRITES,
     AffectedRowLimitError,
     DryRunComplete,
     check,
+    preview_rows,
 )
 from gantry.sql.capabilities import SQLCapabilities
 from gantry.sql.dialect import ConservativeDialect
@@ -86,6 +88,7 @@ class DuckDBAdapter(SQLAdapter):
             statement_timeout=True,
             row_limit=True,
             affected_row_limit=not self._read_only,
+            returning=not self._read_only,
             query_metrics=True,
             create_table_as=not self._read_only,
             create_view_as=not self._read_only,
@@ -208,6 +211,9 @@ class DuckDBAdapter(SQLAdapter):
             )
         if context.metadata.get(DRY_RUN) is True:
             metadata[DRY_RUN] = True
+            preview = context.metadata.get(DRY_RUN_PREVIEW)
+            if isinstance(preview, int) and not isinstance(preview, bool) and preview > 0:
+                metadata[DRY_RUN_PREVIEW] = preview
         handle = ExecutionHandle(
             gantry_id=gantry_id,
             engine="sql",
@@ -288,6 +294,7 @@ class DuckDBAdapter(SQLAdapter):
                             policy,
                             classification.returning,
                             handle.metadata.get(DRY_RUN) is True,
+                            _preview_size(handle.metadata.get(DRY_RUN_PREVIEW)),
                         ),
                         timeout=policy.timeout_seconds,
                     )
@@ -313,6 +320,17 @@ class DuckDBAdapter(SQLAdapter):
         except DryRunComplete as counted:
             return ExecutionResult.succeeded(
                 handle,
+                outputs=(
+                    ()
+                    if counted.preview is None
+                    else (
+                        OutputRef(
+                            OutputKind.INLINE,
+                            f"inline://{handle.gantry_id}",
+                            metadata={"inline": counted.preview},
+                        ),
+                    )
+                ),
                 metrics=ExecutionMetrics(
                     rows_written=counted.affected,
                     runtime_seconds=asyncio.get_running_loop().time() - started,
@@ -355,7 +373,12 @@ class DuckDBAdapter(SQLAdapter):
         )
 
     def _execute_write(
-        self, sql: str, policy: SQLPolicy, returning: bool, dry_run: bool = False
+        self,
+        sql: str,
+        policy: SQLPolicy,
+        returning: bool,
+        dry_run: bool = False,
+        preview: int = 0,
     ) -> tuple[int, InlineRows]:
         """Run a row write in a transaction, and undo it if it changed too much.
 
@@ -372,7 +395,13 @@ class DuckDBAdapter(SQLAdapter):
                 if returning:
                     seen = cursor.fetchmany(DRY_RUN_CEILING + 1)
                     raise DryRunComplete(
-                        min(len(seen), DRY_RUN_CEILING), at_least=len(seen) > DRY_RUN_CEILING
+                        min(len(seen), DRY_RUN_CEILING),
+                        at_least=len(seen) > DRY_RUN_CEILING,
+                        preview=preview_rows(
+                            tuple(str(column[0]) for column in (cursor.description or ())),
+                            seen,
+                            preview,
+                        ),
                     )
                 row = cursor.fetchone()
                 raise DryRunComplete(int(row[0]) if row and isinstance(row[0], int) else 0)
@@ -421,3 +450,8 @@ def _quoted_ref(reference: TableRef) -> str:
 def _materialization_kind(handle: ExecutionHandle) -> str:
     operation = handle.metadata.get("gantry.sql.materialization.operation")
     return "view" if operation == "CREATE_VIEW_AS" else "table"
+
+
+def _preview_size(value: object) -> int:
+    """How many counted rows a dry run should keep: a small positive int, or none."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0

@@ -31,6 +31,8 @@ class SQLCapabilities:
     statement_timeout: bool = False
     row_limit: bool = False
     affected_row_limit: bool = False
+    returning: bool = False
+    """Writes can say `RETURNING`, so a dry run can show the rows it would change."""
     cost_estimate: bool = False
     cost_limit: bool = False
     bytes_scanned: bool = False
