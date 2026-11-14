@@ -96,10 +96,22 @@ class RunRecorder:
         check could not be evaluated has to record which one — otherwise the
         record says it was rejected and cannot say what for, which is the
         question anyone reading it later has.
+
+        Most refusals come before anything runs, and leave no execution. A
+        check that could not be evaluated, or contradicted another, can only be
+        found once the engine has answered — so a run refused then did execute,
+        and its execution is closed as finished rather than left "RUNNING"
+        with no finish time, as though the work were still in flight.
         """
+        started = self.run.execution
         return self._save(
             status,
             admission=admission_record(False, reasons=reasons, decision=decision, request=request),
+            **(
+                {"execution": self._finished("SUCCEEDED")}
+                if started is not None and started.status == "RUNNING"
+                else {}
+            ),
             **({"verification": verification} if verification is not None else {}),
             **({"evidence": evidence} if evidence is not None else {}),
         )

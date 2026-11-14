@@ -66,6 +66,8 @@ async def test_conflicting_count_contract_stops_before_execution(tmp_path: Path)
     assert result.failure is not None
     assert result.failure.kind is FailureKind.VERIFICATION_CONFLICT
     assert result.handle is None
+    stored = gantry.runs.get(result.id)
+    assert stored is not None and stored.execution is None, "nothing ran, so nothing is recorded"
 
 
 async def test_agent_cannot_spoof_provenance_or_request_provider_incompatible_check(
@@ -97,6 +99,12 @@ async def test_agent_check_that_cannot_be_measured_fails_as_unsupported(
     assert result.failure.kind is FailureKind.VERIFICATION_UNSUPPORTED
     assert result.verification is not None
     assert result.verification.unsupported_checks[0].source is CheckSource.AGENT
+    # The query ran; only the check could not be measured. Its execution is
+    # finished, not left "RUNNING" with no end, as though it never stopped.
+    stored = gantry.runs.get(result.id)
+    assert stored is not None and stored.execution is not None
+    assert stored.execution.status == "SUCCEEDED"
+    assert stored.execution.finished_at is not None
 
 
 def test_public_check_constructors_do_not_expose_source() -> None:

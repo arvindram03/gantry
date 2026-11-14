@@ -125,6 +125,22 @@ async def test_a_write_is_refused_before_it_reaches_the_database(
     assert stored is not None and stored.execution is None, stored and stored.execution
 
 
+async def test_a_query_whose_check_cannot_be_measured_ran_and_finished(
+    db: gantry.sql.SQLConnection,
+) -> None:
+    """Refused after the engine answered: it ran, so its execution is closed."""
+    query = db.query(read_only=True, max_rows=1)
+    result = await query(
+        "SELECT generate_series(1, 5) AS n", verify=[gantry.verify.row_count(min=1)]
+    )
+
+    assert result.status is RunStatus.VERIFICATION_UNSUPPORTED
+    stored = gantry.runs.get(result.id)
+    assert stored is not None and stored.execution is not None
+    assert stored.execution.status == "SUCCEEDED"
+    assert stored.execution.finished_at is not None
+
+
 async def test_explain_runs_against_the_engine(db: gantry.sql.SQLConnection) -> None:
     plan = await db.explain("SELECT 1")
     assert plan is not None
