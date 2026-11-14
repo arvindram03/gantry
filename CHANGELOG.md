@@ -3,7 +3,7 @@
 Notable changes. Dates are release dates; the format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## Unreleased
+## 0.7.1 — 2026-11-14
 
 ### Fixed
 
@@ -13,6 +13,13 @@ Notable changes. Dates are release dates; the format follows
   execution `RUNNING` since its submission and never started or finished. It
   never reached the engine, so it now has no execution at all, as a run the
   policy refused before submission already had.
+- **A run refused after it ran has a finished execution.** A query,
+  materialization or Flink job whose check could not be evaluated
+  (`VERIFICATION_UNSUPPORTED`) or contradicted another
+  (`VERIFICATION_CONFLICT`) once the engine had answered was left with its
+  execution `RUNNING` and no finish time. The work did run, so its execution
+  is now closed as `SUCCEEDED` with its finish time; a stream's stays running,
+  as it does when accepted.
 
 ## 0.7.0 — 2026-11-13
 
