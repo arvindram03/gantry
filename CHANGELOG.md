@@ -3,6 +3,17 @@
 Notable changes. Dates are release dates; the format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Fixed
+
+- **A refused SQL run no longer reads as running.** A query or write the
+  adapter refused at validation — a read-only query given a write, a statement
+  the engine would not plan — was stored as `POLICY_REJECTED` but with an
+  execution `RUNNING` since its submission and never started or finished. It
+  never reached the engine, so it now has no execution at all, as a run the
+  policy refused before submission already had.
+
 ## 0.7.0 — 2026-11-13
 
 ### Added

@@ -310,7 +310,10 @@ class SQLConnection:
         proposal against the same already-admitted run.
         """
         result = await self.execute(sql, policy=policy, context=context, verify=verifiers)
-        recorder.running(result.handle)
+        if result.status is not ResultStatus.REJECTED:
+            # Refused at validation means it never reached the engine: no
+            # execution to record, rather than one left "RUNNING" forever.
+            recorder.running(result.handle)
         inline = _find_inline(result, policy.max_rows)
         base = _source_existing(result.verification, CheckSource.TRUSTED)
         verification = _merge(

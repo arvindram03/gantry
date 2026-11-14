@@ -119,6 +119,10 @@ async def test_a_write_is_refused_before_it_reaches_the_database(
     assert result.status is RunStatus.POLICY_REJECTED
     assert result.failure is not None
     assert "read-only" in result.failure.message
+    # Nothing ran, so nothing is recorded as running: a refused run with an
+    # execution "RUNNING" since its submission reads as work in flight.
+    stored = gantry.runs.get(result.id)
+    assert stored is not None and stored.execution is None, stored and stored.execution
 
 
 async def test_explain_runs_against_the_engine(db: gantry.sql.SQLConnection) -> None:

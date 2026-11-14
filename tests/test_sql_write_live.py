@@ -32,6 +32,13 @@ MYSQL = os.environ.get("GANTRY_TEST_MYSQL_URL", "mysql://gantry:gantry@127.0.0.1
 # ------------------------------------------------------------------ postgres
 
 
+def _never_ran(run: object) -> None:
+    """A refused run has no execution: one "RUNNING" since submission reads as work in flight."""
+    stored = gantry.runs.get(run.id)  # type: ignore[attr-defined]
+    assert stored is not None
+    assert stored.execution is None, stored.execution
+
+
 async def _postgres() -> object:
     asyncpg = pytest.importorskip("asyncpg")
     try:
@@ -150,6 +157,7 @@ async def test_postgres_refuses_a_write_that_reads_what_it_was_not_given(raw: ob
         run = await write(sql)
         assert run.status is RunStatus.POLICY_REJECTED, sql
         assert run.failure is not None
+        _never_ran(run)
         assert "write_private.secrets" in run.failure.message
 
     assert await _count(raw, "write_scratch.archive") == 0
@@ -168,6 +176,7 @@ async def test_postgres_refuses_a_data_modifying_cte_as_two_writes(raw: object) 
     assert run.status is RunStatus.POLICY_REJECTED
     assert run.failure is not None
     assert "write_scratch.notes, write_scratch.archive" in run.failure.message
+    _never_ran(run)
     assert await _count(raw, "write_scratch.notes") == 50
 
 
@@ -223,6 +232,7 @@ async def test_a_read_cannot_reach_past_the_policy(raw: object, sql: str) -> Non
 
     assert run.status is RunStatus.POLICY_REJECTED, f"{sql} -> {run.rows}"
     assert not run.rows
+    _never_ran(run)
     assert "hunter2" not in str(run.as_tool_result())
 
 
@@ -325,6 +335,7 @@ async def test_mysql_refuses_an_update_through_a_join_it_was_not_given(mysql: ob
     assert run.status is RunStatus.POLICY_REJECTED
     assert run.failure is not None
     assert "analytics.write_other" in run.failure.message
+    _never_ran(run)
 
 
 # -------------------------------------------------------- counting, for real
@@ -370,3 +381,16 @@ async def test_mysql_counts_a_dry_run_and_leaves_the_rows(mysql: object) -> None
     assert previewed["would_change"] == 4 and previewed["previewed"] is False, (
         "MySQL has no RETURNING: the count, and an honest no"
     )
+
+
+async def test_postgres_refuses_a_write_it_cannot_plan_and_records_nothing_ran(
+    raw: object,
+) -> None:
+    """Refused by the engine at validation: not run, so no execution is kept."""
+    write = _db().write(destinations=["write_scratch.*"])
+
+    run = await write("UPDATE write_scratch.notes SET no_such_column = 1 WHERE id = 1")
+
+    assert run.status is RunStatus.POLICY_REJECTED
+    assert run.failure is not None
+    _never_ran(run)

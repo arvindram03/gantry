@@ -456,15 +456,16 @@ class SQLWrite:
         connection = self._connection
         bounds = self._policy.bounds()
         result = await connection.execute(sql, policy=bounds, context=context)
-        recorder.running(result.handle)
         if result.status is ResultStatus.REJECTED:
             # Refused at validation: a bound the adapter cannot enforce, or the
-            # engine rejecting the statement before running it.
+            # engine rejecting the statement before running it. Nothing ran, so
+            # no execution is recorded, rather than one left "RUNNING" forever.
             failure = result.failure
             return recorder.rejected(
                 (failure.message,) if failure is not None else ("the statement was refused",),
                 status=RunStatus.POLICY_REJECTED,
             ).with_failure(failure)
+        recorder.running(result.handle)
         if result.status is not ResultStatus.ACCEPTED:
             # Includes a statement over its row limit, which was rolled back.
             return recorder.execution_failed(result.failure)
