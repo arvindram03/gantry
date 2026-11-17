@@ -16,7 +16,7 @@ answer is too many.
 
 from __future__ import annotations
 
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
 from hashlib import sha256
@@ -33,6 +33,8 @@ from gantry.runs.status import RunStatus
 from gantry.sql.affected import DRY_RUN, DRY_RUN_PREVIEW
 from gantry.sql.classification import SQLClassification, SQLObjectRef, SQLOperation
 from gantry.sql.inspection import write_request
+from gantry.sql.load import ROW_LOAD, RowLoad
+from gantry.sql.load import problem as load_problem
 from gantry.sql.output import InlineRows
 from gantry.sql.policy import SQLPolicy
 from gantry.tool import Tool
@@ -163,6 +165,97 @@ class SQLWrite:
 
         async def run() -> Run:
             return await self._execute(sql, classification, context=context, recorder=recorder)
+
+        return await gate(recorder, policy=connection.policy, request=request, resume=run)
+
+    async def insert_rows(
+        self,
+        table: str,
+        columns: Sequence[str],
+        rows: Sequence[Sequence[object]],
+        *,
+        context: Context | None = None,
+    ) -> Run:
+        """Insert rows the caller already has, as parameters, and record the run.
+
+        For moving data a program holds (rows read from another database, a
+        file) rather than data a statement computes. Governed exactly as a
+        statement is: it is an `INSERT` into `table`, so it needs `insert`
+        among this operation's statements and `table` among its destinations,
+        a denied table is refused, and the connection's policy decides it.
+        All the rows go in one transaction, or none do, and there may be no
+        more of them than `max_rows_affected`.
+
+        The values are never written into SQL: the adapter binds them as
+        parameters. Table and column names must be plain identifiers, and are
+        quoted by the adapter. The run records the statement with `?` for the
+        values and a digest of the values, not the values.
+
+        A rule that asks for confirmation refuses it instead: the rows exist
+        only in this call, so there would be nothing to run once a person said
+        yes. Allow these writes without asking, by actor, for the program
+        that makes them.
+        """
+        connection = self._connection
+        given = tuple(tuple(row) for row in rows)
+        named = tuple(columns)
+        trouble = load_problem(table, named, given)
+        load = RowLoad(table, named, given) if trouble is None else None
+        recorder = RunRecorder(
+            kind=OperationKind.WRITE,
+            engine="sql",
+            provider=connection.provider,
+            proposal=(
+                f"INSERT INTO {table} ({', '.join(named)}) VALUES (?)"
+                if load is None
+                else load.proposal
+            ),
+        )
+        if load is None:
+            return _refuse(recorder, FailureKind.VALIDATION_ERROR, trouble or "")
+        if not connection.capabilities().row_loads:
+            return _refuse(
+                recorder,
+                FailureKind.UNSUPPORTED_POLICY_REQUIREMENT,
+                f"{connection.provider} cannot insert rows passed as values",
+            )
+        classification = connection._dialect.classify(load.proposal)
+        refusal = self._refusal(classification)
+        if refusal is not None:
+            return _refuse(recorder, *refusal)
+        limit = self._policy.max_rows_affected
+        if len(given) > limit:
+            return _refuse(
+                recorder,
+                FailureKind.ROW_LIMIT_EXCEEDED,
+                f"{len(given)} rows were given; at most {limit} may be inserted at once",
+            )
+        request = write_request(
+            classification, provider=connection.provider, policy=self._policy.bounds()
+        )
+        if connection.policy is not None:
+            from gantry.policy.evaluator import evaluate
+
+            decision = evaluate(connection.policy, request)
+            if decision.allowed and decision.confirmation.required:
+                return _refuse(
+                    recorder,
+                    FailureKind.OPERATION_NOT_ALLOWED,
+                    "a rule asks a person to confirm writes to "
+                    f"{classification.write_targets[0].qualified_name}, and rows passed as "
+                    "values cannot wait for that; allow these writes without asking",
+                )
+
+        async def run() -> Run:
+            loading = Context(metadata={**(context.metadata if context else {}), ROW_LOAD: load})
+            return await self._execute(
+                load.proposal,
+                classification,
+                context=loading,
+                recorder=recorder,
+                expected=len(given),
+                digest=load.digest,
+            )
 
         return await gate(recorder, policy=connection.policy, request=request, resume=run)
 
@@ -447,6 +540,8 @@ class SQLWrite:
         *,
         context: Context | None,
         recorder: RunRecorder,
+        expected: int | None = None,
+        digest: str | None = None,
     ) -> Run:
         """Everything after admission: run it bounded, then record what it did.
 
@@ -480,13 +575,23 @@ class SQLWrite:
                 "the adapter did not report how many rows the statement changed",
             )
             return recorder.execution_failed(failure)
+        if expected is not None and affected != expected:
+            # Rows passed in are inserted one each. Any other count means the
+            # engine did something other than what was asked.
+            return recorder.execution_failed(
+                Failure(
+                    FailureKind.VERIFICATION_FAILED,
+                    False,
+                    f"{expected} rows were given but the engine reported {affected} inserted",
+                )
+            )
 
         inline = _returned(result, self._policy.max_rows)
         target = classification.write_targets[0]
         recorder.verifying()
         return recorder.decided(
             verification=None,
-            evidence=_evidence(sql, result, affected, inline),
+            evidence=_evidence(sql, result, affected, inline, digest),
             outputs=(ResourceRef(system=connection.provider, resource=target.qualified_name),),
             result_ref=QueryResultRef(
                 rows=0 if inline is None else len(inline.rows),
@@ -536,7 +641,11 @@ def _returned(result: Result, max_rows: int) -> InlineRows | None:
 
 
 def _evidence(
-    sql: str, result: Result, affected: int, inline: InlineRows | None
+    sql: str,
+    result: Result,
+    affected: int,
+    inline: InlineRows | None,
+    values_digest: str | None = None,
 ) -> EvidenceBundle | None:
     """A write's evidence, in the shape a query and a materialization emit."""
     handle = result.handle
@@ -559,6 +668,10 @@ def _evidence(
                 unit="seconds",
             )
         )
+    if values_digest is not None:
+        # What was inserted, without the record holding it: the same rows
+        # always give the same digest.
+        observations.append(Observation("values_sha256", values_digest, ObservationSource.OUTPUT))
     if inline is not None:
         observations.append(
             Observation("rows_returned", len(inline.rows), ObservationSource.OUTPUT, unit="rows")

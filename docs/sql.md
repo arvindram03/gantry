@@ -181,6 +181,49 @@ What is and is not covered:
 - **A function can still write elsewhere.** Classification reads the statement,
   not the bodies of the functions it calls. The database role is the boundary.
 
+### Rows you already have
+
+When the rows come from your program rather than from a statement (read from
+another database, say), `insert_rows` puts them into a table without the values
+ever becoming SQL. The adapter binds them as parameters, so no value can change
+what the statement does, whatever it contains:
+
+```python
+write = db.write(destinations=["warehouse.orders"], max_rows_affected=500)
+
+run = await write.insert_rows(
+    "warehouse.orders",
+    ["id", "customer", "total", "placed_at"],
+    rows,  # a sequence of tuples, one value per column
+)
+run.rows_affected  # len(rows)
+```
+
+It is governed as the `INSERT` it is: `insert` must be among the statements,
+the table among the destinations, a denied table is refused, and the policy
+decides it. All the rows go in one transaction, or none do, and there may be no
+more of them than `max_rows_affected`, so a large copy is a series of calls of
+at most that many rows each.
+
+- **Names are plain identifiers.** The table is `name` or `schema.name`, and
+  every name is letters, digits and underscores, not starting with a digit. The
+  adapter quotes them in its own dialect, so a column called `order` works; a
+  name outside that is refused rather than escaped.
+- **Values are the driver's types**: `None`, `bool`, `int`, `float`, `str`,
+  `bytes`, `Decimal`, `datetime`, `date`, `time`, `timedelta` and `UUID`. Anything
+  else is refused before anything runs. PostgreSQL also takes what another engine sends where
+  nothing is lost: MySQL's `0` and `1` into a `boolean`, and a timestamp with no
+  zone into a `timestamptz`, as UTC.
+- **It cannot wait for a person.** The rows exist only in the call, so a rule
+  that asks for confirmation refuses it instead. Allow these writes by actor,
+  for the program that makes them.
+- **The run keeps a digest, not the rows.** The proposal reads `INSERT INTO
+  warehouse.orders (id, customer, total, placed_at) VALUES (?, ?, ?, ?)`, and
+  the evidence carries `values_sha256`, so two loads can be compared without
+  the record holding the data.
+- **Where it runs:** PostgreSQL (and Neon and Supabase), MySQL and DuckDB
+  declare the `row_loads` capability. Elsewhere it is refused.
+
 ## Bounded and reconnectable results
 
 Adapters fetch at most `max_rows + 1` records to detect truncation. `SQLResult.inline` therefore

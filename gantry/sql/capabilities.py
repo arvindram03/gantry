@@ -33,6 +33,8 @@ class SQLCapabilities:
     affected_row_limit: bool = False
     returning: bool = False
     """Writes can say `RETURNING`, so a dry run can show the rows it would change."""
+    row_loads: bool = False
+    """Rows passed in as values can be inserted as parameters (`SQLWrite.insert_rows`)."""
     cost_estimate: bool = False
     cost_limit: bool = False
     bytes_scanned: bool = False

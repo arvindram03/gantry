@@ -29,6 +29,7 @@ from gantry.sql.affected import (
 from gantry.sql.capabilities import SQLCapabilities
 from gantry.sql.dialect import ConservativeDialect
 from gantry.sql.explain import ExplainResult
+from gantry.sql.load import RowLoad, load_of
 from gantry.sql.materialization import MaterializationPlan, TableRef
 from gantry.sql.output import InlineRows
 from gantry.sql.policy import SQLPolicy
@@ -48,7 +49,9 @@ class _Cursor(Protocol):
 
 
 class _Connection(Protocol):
-    def execute(self, query: str) -> _Cursor: ...
+    def execute(self, query: str, parameters: Sequence[object] | None = None) -> _Cursor: ...
+
+    def executemany(self, query: str, parameters: Sequence[Sequence[object]]) -> _Cursor: ...
 
     def interrupt(self) -> None: ...
 
@@ -75,6 +78,7 @@ class DuckDBAdapter(SQLAdapter):
         self._read_only = read_only
         self._lock = asyncio.Lock()
         self._jobs: dict[str, asyncio.Task[ExecutionResult]] = {}
+        self._loads: dict[str, RowLoad] = {}
 
     def capabilities(self) -> SQLCapabilities:
         return SQLCapabilities(
@@ -89,6 +93,7 @@ class DuckDBAdapter(SQLAdapter):
             row_limit=True,
             affected_row_limit=not self._read_only,
             returning=not self._read_only,
+            row_loads=not self._read_only,
             query_metrics=True,
             create_table_as=not self._read_only,
             create_view_as=not self._read_only,
@@ -133,8 +138,19 @@ class DuckDBAdapter(SQLAdapter):
         context: Context,
         policy: SQLPolicy,
     ) -> ValidationResult:
+        load = load_of(context.metadata)
         try:
-            await self._query_all(f"EXPLAIN {sql}")
+            if load is not None:
+                # DuckDB will not explain a statement with unbound parameters,
+                # so it explains the first row's: planned, not run.
+                statement = _load_statement(load)
+                first = load.rows[0]
+                async with self._lock:
+                    await asyncio.to_thread(
+                        lambda: self._connection.execute(f"EXPLAIN {statement}", first).fetchall()
+                    )
+            else:
+                await self._query_all(f"EXPLAIN {sql}")
         except Exception as error:
             return ValidationResult.rejected(str(error))
         return ValidationResult.accepted()
@@ -221,6 +237,9 @@ class DuckDBAdapter(SQLAdapter):
             native_id=f"duckdb_{uuid4().hex}",
             metadata=metadata,
         )
+        load = load_of(context.metadata)
+        if load is not None:
+            self._loads[gantry_id] = load
         self._jobs[gantry_id] = asyncio.create_task(self._execute(handle, sql, policy))
         return handle
 
@@ -284,9 +303,16 @@ class DuckDBAdapter(SQLAdapter):
         classification = ConservativeDialect().classify(sql)
         writes = classification.operation in ROW_WRITES
         rows_written: int | None = None
+        load = self._loads.pop(handle.gantry_id, None)
         try:
             async with self._lock:
-                if writes:
+                if load is not None:
+                    rows_written = await asyncio.wait_for(
+                        asyncio.to_thread(self._execute_load, load, policy),
+                        timeout=policy.timeout_seconds,
+                    )
+                    inline = InlineRows((), ())
+                elif writes:
                     rows_written, inline = await asyncio.wait_for(
                         asyncio.to_thread(
                             self._execute_write,
@@ -427,6 +453,19 @@ class DuckDBAdapter(SQLAdapter):
         self._connection.execute("COMMIT")
         return affected, inline
 
+    def _execute_load(self, load: RowLoad, policy: SQLPolicy) -> int:
+        """Insert a load's rows as parameters in one transaction, bounded before it starts."""
+        affected = len(load.rows)
+        check(policy.max_rows_affected, affected)
+        self._connection.execute("BEGIN TRANSACTION")
+        try:
+            self._connection.executemany(_load_statement(load), load.rows)
+        except BaseException:
+            self._connection.execute("ROLLBACK")
+            raise
+        self._connection.execute("COMMIT")
+        return affected
+
     def _execute_bounded(self, sql: str, max_rows: int) -> InlineRows:
         cursor = self._connection.execute(sql)
         description = cursor.description or ()
@@ -437,6 +476,10 @@ class DuckDBAdapter(SQLAdapter):
     async def _query_all(self, sql: str) -> list[tuple[object, ...]]:
         async with self._lock:
             return await asyncio.to_thread(lambda: self._connection.execute(sql).fetchall())
+
+
+def _load_statement(load: RowLoad) -> str:
+    return load.statement(lambda name: '"' + name.replace('"', '""') + '"', lambda _index: "?")
 
 
 def _quoted_ref(reference: TableRef) -> str:

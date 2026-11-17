@@ -42,6 +42,7 @@ from gantry.sql.capabilities import SQLCapabilities
 from gantry.sql.classification import SQLOperation
 from gantry.sql.dialect import MySQLDialect
 from gantry.sql.explain import ExplainResult
+from gantry.sql.load import RowLoad, load_of
 from gantry.sql.materialization import (
     _DESTINATION_METADATA,
     _OPERATION_METADATA,
@@ -84,6 +85,7 @@ class MySQLAdapter:
         self._config = _connect_kwargs(target.config)
         self._jobs: dict[str, asyncio.Task[ExecutionResult]] = {}
         self._threads: dict[str, int] = {}
+        self._loads: dict[str, RowLoad] = {}
 
     def capabilities(self) -> SQLCapabilities:
         return SQLCapabilities(
@@ -94,6 +96,7 @@ class MySQLAdapter:
             statement_timeout=True,
             row_limit=True,
             affected_row_limit=True,
+            row_loads=True,
             query_metrics=True,
             create_table_as=True,
             create_view_as=True,
@@ -175,6 +178,11 @@ class MySQLAdapter:
         so the driver does the quoting; building a `PREPARE ... FROM '...'`
         string here would mean escaping caller SQL by hand.
         """
+        load = load_of(context.metadata)
+        if load is not None:
+            # The statement as it will run, with MySQL's own `?` placeholders,
+            # so the names in it are resolved against the real table.
+            sql = load.statement(_quoted, lambda _index: "?")
         connection = await self._open()
         try:
             async with connection.cursor() as cursor:
@@ -220,6 +228,9 @@ class MySQLAdapter:
             f"mysql_{uuid4().hex}",
             metadata=metadata,
         )
+        load = load_of(context.metadata)
+        if load is not None:
+            self._loads[gantry_id] = load
         self._jobs[gantry_id] = asyncio.create_task(self._execute(handle, sql, policy))
         return handle
 
@@ -360,6 +371,7 @@ class MySQLAdapter:
             return ExecutionResult.failed(handle, _failure(error))
         finally:
             self._threads.pop(handle.gantry_id, None)
+            self._loads.pop(handle.gantry_id, None)
             if connection is not None:
                 await self._close(connection)
         runtime = asyncio.get_running_loop().time() - started
@@ -385,6 +397,18 @@ class MySQLAdapter:
                 "START TRANSACTION READ ONLY" if policy.read_only else "START TRANSACTION"
             )
             try:
+                load = self._loads.get(handle.gantry_id)
+                if load is not None:
+                    # Bound before sending: one row per row, so the count is
+                    # known. The values go as parameters; the driver quotes them.
+                    check(policy.max_rows_affected, len(load.rows))
+                    await cursor.executemany(
+                        load.statement(_quoted, lambda _index: "%s"), load.rows
+                    )
+                    affected = max(0, int(cursor.rowcount))
+                    check(policy.max_rows_affected, affected)
+                    await connection.commit()
+                    return (), None, affected
                 await cursor.execute(sql)
                 if operation in ROW_WRITES:
                     # Counted before the commit, so a statement over its limit

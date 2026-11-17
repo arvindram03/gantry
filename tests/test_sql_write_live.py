@@ -394,3 +394,129 @@ async def test_postgres_refuses_a_write_it_cannot_plan_and_records_nothing_ran(
     assert run.status is RunStatus.POLICY_REJECTED
     assert run.failure is not None
     _never_ran(run)
+
+
+# ------------------------------------------------------- rows as parameters
+
+HOSTILE = "x'); DROP TABLE write_scratch.loaded; --"
+
+
+async def test_postgres_inserts_rows_as_parameters_with_their_types(raw: object) -> None:
+    from datetime import UTC, date, datetime
+    from decimal import Decimal
+
+    for statement in (
+        "DROP TABLE IF EXISTS write_scratch.loaded",
+        'CREATE TABLE write_scratch.loaded (id int PRIMARY KEY, "order" int, body text, '
+        "amount numeric(10, 2), seen_at timestamptz, born date, ok boolean, note text)",
+    ):
+        await raw.execute(statement)  # type: ignore[attr-defined]
+    write = _db().write(destinations=["write_scratch.*"], max_rows_affected=10)
+    rows = [
+        (
+            1,
+            7,
+            HOSTILE,
+            Decimal("12.50"),
+            datetime(2026, 1, 2, tzinfo=UTC),
+            date(1990, 1, 1),
+            True,
+            None,
+        ),
+        (
+            2,
+            8,
+            "plain",
+            Decimal("0.10"),
+            datetime(2026, 1, 3, tzinfo=UTC),
+            date(1991, 2, 2),
+            False,
+            "n",
+        ),
+    ]
+
+    run = await write.insert_rows(
+        "write_scratch.loaded",
+        ("id", "order", "body", "amount", "seen_at", "born", "ok", "note"),
+        rows,
+    )
+
+    assert run.status is RunStatus.ACCEPTED, run.failure
+    assert run.rows_affected == 2
+    stored = await raw.fetch("SELECT * FROM write_scratch.loaded ORDER BY id")  # type: ignore[attr-defined]
+    assert [tuple(row) for row in stored] == rows
+
+
+async def test_postgres_inserts_nothing_when_a_load_fails_part_way(raw: object) -> None:
+    write = _db().write(destinations=["write_scratch.*"], max_rows_affected=10)
+
+    run = await write.insert_rows(
+        "write_scratch.archive", ("id", "body"), [(1, "a"), (2, "b"), (1, "again")]
+    )
+
+    assert run.status is not RunStatus.ACCEPTED
+    assert await _count(raw, "write_scratch.archive") == 0
+
+
+async def test_postgres_refuses_a_load_into_a_column_that_does_not_exist(raw: object) -> None:
+    """Prepared before anything runs, so the engine's answer comes back as a refusal."""
+    write = _db().write(destinations=["write_scratch.*"])
+
+    run = await write.insert_rows("write_scratch.archive", ("id", "nope"), [(1, "a")])
+
+    assert run.status is RunStatus.POLICY_REJECTED
+    assert run.failure is not None and "nope" in run.failure.message
+    assert await _count(raw, "write_scratch.archive") == 0
+
+
+async def test_mysql_inserts_rows_as_parameters(mysql: object) -> None:
+    async with mysql.cursor() as cursor:  # type: ignore[attr-defined]
+        await cursor.execute("DROP TABLE IF EXISTS analytics.write_loaded")
+        await cursor.execute(
+            "CREATE TABLE analytics.write_loaded (id INT PRIMARY KEY, `order` INT, body TEXT, "
+            "amount DECIMAL(10, 2)) ENGINE=InnoDB"
+        )
+    from decimal import Decimal
+
+    db = gantry.sql.connect("mysql", url=MYSQL)
+    write = db.write(destinations=["analytics.write_*"], max_rows_affected=10)
+    rows = [(1, 7, HOSTILE, Decimal("12.50")), (2, 8, "plain", Decimal("0.10"))]
+
+    run = await write.insert_rows("analytics.write_loaded", ("id", "order", "body", "amount"), rows)
+
+    assert run.status is RunStatus.ACCEPTED, run.failure
+    assert run.rows_affected == 2
+    async with mysql.cursor() as cursor:  # type: ignore[attr-defined]
+        await cursor.execute("SELECT * FROM analytics.write_loaded ORDER BY id")
+        assert [tuple(row) for row in await cursor.fetchall()] == rows
+
+    failed = await write.insert_rows(
+        "analytics.write_loaded", ("id", "body"), [(3, "a"), (1, "duplicate")]
+    )
+    assert failed.status is not RunStatus.ACCEPTED
+    async with mysql.cursor() as cursor:  # type: ignore[attr-defined]
+        await cursor.execute("SELECT COUNT(*) FROM analytics.write_loaded")
+        assert (await cursor.fetchone())[0] == 2, "the failed load left nothing behind"
+
+
+async def test_postgres_takes_another_engine_s_booleans_and_zoneless_times(raw: object) -> None:
+    """MySQL has no boolean and keeps no zone: 1 is true, and a bare time is UTC."""
+    from datetime import UTC, datetime
+
+    for statement in (
+        "DROP TABLE IF EXISTS write_scratch.converted",
+        "CREATE TABLE write_scratch.converted (id int PRIMARY KEY, ok boolean, at timestamptz)",
+    ):
+        await raw.execute(statement)  # type: ignore[attr-defined]
+    write = _db().write(destinations=["write_scratch.*"])
+
+    run = await write.insert_rows(
+        "write_scratch.converted",
+        ("id", "ok", "at"),
+        [(1, 1, datetime(2026, 1, 2, 3, 4)), (2, 0, datetime(2026, 1, 2, 3, 4, tzinfo=UTC))],
+    )
+
+    assert run.status is RunStatus.ACCEPTED, run.failure
+    stored = await raw.fetch("SELECT ok, at FROM write_scratch.converted ORDER BY id")  # type: ignore[attr-defined]
+    assert [row["ok"] for row in stored] == [True, False]
+    assert stored[0]["at"] == datetime(2026, 1, 2, 3, 4, tzinfo=UTC)

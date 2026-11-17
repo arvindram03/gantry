@@ -36,6 +36,7 @@ from gantry.sql.capabilities import SQLCapabilities
 from gantry.sql.classification import SQLOperation
 from gantry.sql.dialect import ConservativeDialect
 from gantry.sql.explain import ExplainResult
+from gantry.sql.load import RowLoad, load_of
 from gantry.sql.materialization import (
     _DESTINATION_METADATA,
     _OPERATION_METADATA,
@@ -57,8 +58,16 @@ class _Attribute(Protocol):
     name: str
 
 
+class _Type(Protocol):
+    name: str
+
+
 class _PreparedStatement(Protocol):
     def get_attributes(self) -> Sequence[_Attribute]: ...
+
+    def get_parameters(self) -> Sequence[_Type]: ...
+
+    async def executemany(self, args: Sequence[Sequence[object]]) -> None: ...
 
     def get_statusmsg(self) -> str: ...
 
@@ -86,6 +95,7 @@ class _Connection(Protocol):
     def transaction(self, *, readonly: bool = False) -> _Transaction: ...
 
     async def execute(self, query: str) -> str: ...
+
 
     async def fetch(self, query: str) -> Sequence[Sequence[object]]: ...
 
@@ -120,6 +130,7 @@ class PostgresAdapter:
             row_limit=True,
             affected_row_limit=True,
             returning=True,
+            row_loads=True,
             query_metrics=True,
             create_table_as=True,
             create_view_as=True,
@@ -263,9 +274,13 @@ class PostgresAdapter:
         context: Context,
         policy: SQLPolicy,
     ) -> ValidationResult:
+        load = load_of(context.metadata)
         connection = await self._open()
         try:
-            if _explainable(sql):
+            if load is not None:
+                # Parsed and resolved, types and all, without running it.
+                await connection.prepare(_load_statement(load))
+            elif _explainable(sql):
                 async with connection.transaction(readonly=policy.read_only):
                     await self._set_timeout(connection, policy)
                     await connection.fetch(f"EXPLAIN (FORMAT JSON) {sql}")
@@ -330,7 +345,14 @@ class PostgresAdapter:
         dry_run = context.metadata.get(DRY_RUN) is True
         preview = _preview_size(context.metadata.get(DRY_RUN_PREVIEW))
         self._jobs[gantry_id] = asyncio.create_task(
-            self._execute(handle, sql, policy, dry_run=dry_run, preview=preview)
+            self._execute(
+                handle,
+                sql,
+                policy,
+                dry_run=dry_run,
+                preview=preview,
+                load=load_of(context.metadata),
+            )
         )
         return handle
 
@@ -392,6 +414,7 @@ class PostgresAdapter:
         *,
         dry_run: bool = False,
         preview: int = 0,
+        load: RowLoad | None = None,
     ) -> ExecutionResult:
         started = asyncio.get_running_loop().time()
         outputs: tuple[OutputRef, ...]
@@ -419,6 +442,10 @@ class PostgresAdapter:
                     )
                     outputs = (output,)
                     rows_read = len(rows)
+                elif load is not None:
+                    rows_written = await _load(connection, load, policy)
+                    outputs = ()
+                    rows_read = None
                 elif operation in ROW_WRITES:
                     rows_written, returned = await _write(
                         connection, sql, policy, dry_run, preview=preview
@@ -521,6 +548,44 @@ def _schema_filter(reference: TableRef) -> str:
     if reference.schema is None:
         return ""
     return f"AND c.table_schema = '{_escaped(reference.schema)}'"
+
+
+def _load_statement(load: RowLoad) -> str:
+    return load.statement(_quoted, lambda index: f"${index}")
+
+
+async def _load(connection: _Connection, load: RowLoad, policy: SQLPolicy) -> int:
+    """Insert a load's rows as parameters, inside the caller's transaction.
+
+    The bound is checked before anything is sent: one row per row, so the
+    count is known in advance. It is checked again by `check` for the same
+    reason every write is: the transaction is what makes it a ceiling.
+    """
+    affected = len(load.rows)
+    check(policy.max_rows_affected, affected)
+    statement = await connection.prepare(_load_statement(load))
+    kinds = [parameter.name for parameter in statement.get_parameters()]
+    await statement.executemany([_as_column(row, kinds) for row in load.rows])
+    return affected
+
+
+def _as_column(row: Sequence[object], kinds: Sequence[str]) -> tuple[object, ...]:
+    """A row's values as PostgreSQL's columns take them, where that loses nothing.
+
+    Rows often come from another engine. MySQL has no boolean, so a `0` or `1`
+    is one; a timestamp with no zone, written to a `timestamptz`, is read as
+    UTC. Anything else is passed as it is, and PostgreSQL says if it does not
+    fit.
+    """
+    converted: list[object] = []
+    for value, kind in zip(row, kinds, strict=True):
+        if kind == "bool" and isinstance(value, int) and not isinstance(value, bool):
+            if value in (0, 1):
+                value = bool(value)
+        elif kind == "timestamptz" and isinstance(value, datetime) and value.tzinfo is None:
+            value = value.replace(tzinfo=UTC)
+        converted.append(value)
+    return tuple(converted)
 
 
 def _quoted(identifier: str) -> str:
