@@ -60,6 +60,8 @@ class OperationKind(StrEnum):
     QUERY = "query"
     WRITE = "write"
     MATERIALIZE = "materialize"
+    SCHEMA = "schema"
+    """Creating or changing a schema object: a table, index, view, function, trigger…"""
     BATCH = "batch"
     STREAM = "stream"
 

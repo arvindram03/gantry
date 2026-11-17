@@ -84,6 +84,28 @@ def materialize(
     )
 
 
+def schema(
+    *,
+    destinations: Sequence[str] | None = None,
+    name: str | None = None,
+    actors: Sequence[str] | None = None,
+    engines: Sequence[str] | None = None,
+    environments: Sequence[str] | None = None,
+    constraints: Mapping[str, float] | None = None,
+) -> PolicyRule:
+    """Deny schema changes matching this rule."""
+    return _deny(
+        OperationKind.SCHEMA,
+        name=name,
+        actors=actors,
+        engines=engines,
+        sources=None,
+        destinations=destinations,
+        environments=environments,
+        constraints=constraints,
+    )
+
+
 def batch(
     *,
     destinations: Sequence[str] | None = None,
@@ -153,4 +175,4 @@ def anything(
     )
 
 
-__all__ = ["anything", "batch", "materialize", "query", "stream"]
+__all__ = ["anything", "batch", "materialize", "query", "schema", "stream", "write"]

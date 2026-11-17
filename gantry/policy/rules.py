@@ -21,6 +21,7 @@ from gantry.runs.model import OperationKind
 WRITING = (
     OperationKind.WRITE,
     OperationKind.MATERIALIZE,
+    OperationKind.SCHEMA,
     OperationKind.BATCH,
     OperationKind.STREAM,
 )

@@ -44,6 +44,8 @@ python scripts/capability_matrix.py --write
 | `affected_row_limit` | yes | yes | no | no | writable conn |
 | `returning` | yes | no | no | no | writable conn |
 | `row_loads` | yes | yes | no | no | writable conn |
+| `schema_snapshot` | yes | yes | no | no | no |
+| `schema_changes` | yes | yes | no | no | no |
 | `cost_estimate` | no | no | conditional | no | no |
 | `cost_limit` | no | no | conditional | no | no |
 | `bytes_scanned` | no | no | yes | no | no |

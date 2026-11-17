@@ -224,6 +224,48 @@ at most that many rows each.
 - **Where it runs:** PostgreSQL (and Neon and Supabase), MySQL and DuckDB
   declare the `row_loads` capability. Elsewhere it is refused.
 
+## Schema changes
+
+Moving a database is mostly moving its schema: types, sequences, tables,
+constraints, indexes, views, functions, triggers and row-level security. Two
+calls do it.
+
+`snapshot` reads every object in the schemas named, with the engine's own
+definition of each, so moving between two databases of the same engine loses
+nothing. It reads structure, never rows.
+
+```python
+read = await source.snapshot(["app"])
+for item in read.objects:
+    item.kind, item.qualified_name, item.definition
+read.find(ObjectKind.TABLE, "app.people").columns  # names, types, defaults, identity
+```
+
+`schema_change` applies one `SchemaStep` at a time: the statement and the
+object it changes, named. The decision is made on the name, because a parser
+cannot reliably say what a trigger or a function body changes; the statement is
+still read and refused unless it is one schema statement whose every table the
+parser can name lies within the schemas allowed.
+
+```python
+change = destination.schema_change(schemas=["app"])
+run = await change(SchemaStep(ObjectKind.TABLE, "app", "people", item.definition))
+```
+
+- **Policy decides it** as `OperationKind.SCHEMA`: allow it with
+  `gantry.allow.schema(destinations=["app.*"])`. Extensions are database-wide,
+  so creating one must be allowed by name, with `extensions=[...]`.
+- **Each step is a run**, in its own transaction, and validated first by running
+  it in a transaction that is rolled back.
+- **It cannot wait for a person.** Steps are applied in order as one plan, and a
+  plan cannot wait half built, so a rule that asks for confirmation refuses the
+  step instead. Approve the plan, then allow its steps by actor.
+- **Where it runs:** PostgreSQL (and Neon and Supabase) and MySQL declare
+  `schema_snapshot` and `schema_changes`. MySQL's snapshot carries each table's
+  `SHOW CREATE TABLE` and reads the rest from `information_schema`. Its schema
+  changes are not transactional, so each step is checked first by preparing it,
+  which never runs it, and then applied.
+
 ## Bounded and reconnectable results
 
 Adapters fetch at most `max_rows + 1` records to detect truncation. `SQLResult.inline` therefore

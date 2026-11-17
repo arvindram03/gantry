@@ -53,6 +53,8 @@ from gantry.sql.materialization import (
 from gantry.sql.output import InlineRows
 from gantry.sql.policy import SQLPolicy
 from gantry.sql.schema import Column, DatabaseSchema, Table
+from gantry.sql.snapshot import Column as SnapshotColumn
+from gantry.sql.snapshot import ObjectKind, SchemaObject, SchemaSnapshot
 from gantry.sql.target import SQLTarget
 
 # Databases that belong to the server rather than to anyone using it.
@@ -97,6 +99,8 @@ class MySQLAdapter:
             row_limit=True,
             affected_row_limit=True,
             row_loads=True,
+            schema_snapshot=True,
+            schema_changes=True,
             query_metrics=True,
             create_table_as=True,
             create_view_as=True,
@@ -285,6 +289,33 @@ class MySQLAdapter:
             ExecutionState.CANCELLED,
             failure=Failure(FailureKind.CANCELLED, False, f"MySQL statement cancelled ({mode})"),
         )
+
+    async def snapshot(self, schemas: Sequence[str]) -> SchemaSnapshot:
+        """Every table, constraint, index, view, trigger and routine in `schemas` (databases).
+
+        Tables carry MySQL's own `SHOW CREATE TABLE`; the rest are read from
+        `information_schema` and written in MySQL's dialect. MySQL's schema
+        changes are not transactional, so this is read as it stands, object by
+        object.
+        """
+        wanted = list(schemas)
+        marks = ", ".join(["%s"] * len(wanted))
+        connection = await self._open()
+        try:
+            rows = {
+                name: await self._fetch(connection, query.format(marks=marks), wanted)
+                for name, query in _SNAPSHOT_QUERIES.items()
+            }
+            created: dict[tuple[str, str], str] = {}
+            for schema, table in rows["tables"]:
+                found = await self._fetch(
+                    connection,
+                    f"SHOW CREATE TABLE {_quoted(_text(schema))}.{_quoted(_text(table))}",
+                )
+                created[(_text(schema), _text(table))] = _text(found[0][1])
+        finally:
+            await self._close(connection)
+        return SchemaSnapshot("mysql", tuple(wanted), _snapshot_objects(rows, created, wanted))
 
     async def inspect_table(
         self,
@@ -567,3 +598,180 @@ def _unknown(handle: ExecutionHandle, message: str) -> Execution:
     return Execution(
         handle, ExecutionState.UNKNOWN, failure=Failure(FailureKind.UNKNOWN, False, message)
     )
+
+
+# ------------------------------------------------------------------ snapshot
+
+_SNAPSHOT_QUERIES: dict[str, str] = {
+    "tables": (
+        "SELECT TABLE_SCHEMA, TABLE_NAME FROM information_schema.TABLES "
+        "WHERE TABLE_TYPE = 'BASE TABLE' AND TABLE_SCHEMA IN ({marks}) ORDER BY 1, 2"
+    ),
+    "columns": (
+        "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, "
+        "COLUMN_DEFAULT, EXTRA, GENERATION_EXPRESSION FROM information_schema.COLUMNS "
+        "WHERE TABLE_SCHEMA IN ({marks}) ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION"
+    ),
+    "constraints": (
+        "SELECT c.TABLE_SCHEMA, c.TABLE_NAME, c.CONSTRAINT_NAME, c.CONSTRAINT_TYPE, "
+        "GROUP_CONCAT(k.COLUMN_NAME ORDER BY k.ORDINAL_POSITION), "
+        "MAX(k.REFERENCED_TABLE_SCHEMA), MAX(k.REFERENCED_TABLE_NAME), "
+        "GROUP_CONCAT(k.REFERENCED_COLUMN_NAME ORDER BY k.ORDINAL_POSITION) "
+        "FROM information_schema.TABLE_CONSTRAINTS c "
+        "LEFT JOIN information_schema.KEY_COLUMN_USAGE k ON k.CONSTRAINT_SCHEMA = "
+        "c.CONSTRAINT_SCHEMA AND k.TABLE_NAME = c.TABLE_NAME AND k.CONSTRAINT_NAME = "
+        "c.CONSTRAINT_NAME WHERE c.TABLE_SCHEMA IN ({marks}) "
+        "GROUP BY c.TABLE_SCHEMA, c.TABLE_NAME, c.CONSTRAINT_NAME, c.CONSTRAINT_TYPE "
+        "ORDER BY 1, 2, 3"
+    ),
+    "indexes": (
+        "SELECT TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, MAX(NON_UNIQUE), "
+        "GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) FROM information_schema.STATISTICS "
+        "WHERE TABLE_SCHEMA IN ({marks}) GROUP BY TABLE_SCHEMA, TABLE_NAME, INDEX_NAME "
+        "ORDER BY 1, 2, 3"
+    ),
+    "views": (
+        "SELECT TABLE_SCHEMA, TABLE_NAME, VIEW_DEFINITION FROM information_schema.VIEWS "
+        "WHERE TABLE_SCHEMA IN ({marks}) ORDER BY 1, 2"
+    ),
+    "triggers": (
+        "SELECT TRIGGER_SCHEMA, EVENT_OBJECT_TABLE, TRIGGER_NAME, ACTION_TIMING, "
+        "EVENT_MANIPULATION, ACTION_STATEMENT FROM information_schema.TRIGGERS "
+        "WHERE TRIGGER_SCHEMA IN ({marks}) ORDER BY 1, 2, 3"
+    ),
+    "routines": (
+        "SELECT ROUTINE_SCHEMA, ROUTINE_NAME, ROUTINE_TYPE FROM information_schema.ROUTINES "
+        "WHERE ROUTINE_SCHEMA IN ({marks}) ORDER BY 1, 2"
+    ),
+}
+
+_CONSTRAINT_TYPES = {
+    "PRIMARY KEY": "primary key",
+    "UNIQUE": "unique",
+    "FOREIGN KEY": "foreign key",
+    "CHECK": "check",
+}
+
+
+def _snapshot_objects(
+    rows: Mapping[str, Sequence[Sequence[object]]],
+    created: Mapping[tuple[str, str], str],
+    schemas: Sequence[str],
+) -> tuple[SchemaObject, ...]:
+    q = _quoted
+    found: list[SchemaObject] = [
+        SchemaObject(ObjectKind.SCHEMA, name, name, f"CREATE DATABASE IF NOT EXISTS {q(name)}")
+        for name in schemas
+    ]
+    columns: dict[tuple[str, str], list[SnapshotColumn]] = {}
+    for schema, table, name, kind, nullable, default, extra, expression in rows["columns"]:
+        extra_text = _text(extra).lower()
+        generated = "generated" in extra_text and "default_generated" not in extra_text
+        columns.setdefault((_text(schema), _text(table)), []).append(
+            SnapshotColumn(
+                name=_text(name),
+                data_type=_text(kind),
+                nullable=_text(nullable) == "YES",
+                default=None if default is None or generated else _text(default),
+                identity="by default" if "auto_increment" in extra_text else None,
+                generated=_text(expression) if generated and expression else None,
+            )
+        )
+    for schema, table in rows["tables"]:
+        key = (_text(schema), _text(table))
+        found.append(
+            SchemaObject(
+                ObjectKind.TABLE,
+                key[0],
+                key[1],
+                created.get(key),
+                columns=tuple(columns.get(key, ())),
+            )
+        )
+    constraint_names: set[tuple[str, str, str]] = set()
+    for schema, table, name, kind, names, ref_schema, ref_table, ref_names in rows["constraints"]:
+        kind_text = _CONSTRAINT_TYPES.get(_text(kind), "check")
+        listed = ", ".join(q(part) for part in _text(names).split(",") if part)
+        if kind_text == "primary key":
+            body = f"PRIMARY KEY ({listed})"
+        elif kind_text == "unique":
+            body = f"UNIQUE ({listed})"
+        elif kind_text == "foreign key":
+            referenced = ", ".join(q(part) for part in _text(ref_names).split(",") if part)
+            body = (
+                f"FOREIGN KEY ({listed}) REFERENCES {q(_text(ref_schema))}."
+                f"{q(_text(ref_table))} ({referenced})"
+            )
+        else:
+            body = "CHECK"
+        constraint_names.add((_text(schema), _text(table), _text(name)))
+        found.append(
+            SchemaObject(
+                ObjectKind.CONSTRAINT,
+                _text(schema),
+                _text(name),
+                f"ALTER TABLE {q(_text(schema))}.{q(_text(table))} ADD CONSTRAINT "
+                f"{q(_text(name))} {body}",
+                table=_text(table),
+                details={
+                    "type": kind_text,
+                    "columns": [part for part in _text(names).split(",") if part],
+                    "references": None
+                    if ref_table is None
+                    else f"{_text(ref_schema)}.{_text(ref_table)}",
+                },
+            )
+        )
+    for schema, table, name, non_unique, names in rows["indexes"]:
+        index = (_text(schema), _text(table), _text(name))
+        if index[2] == "PRIMARY" or index in constraint_names:
+            continue
+        listed = ", ".join(q(part) for part in _text(names).split(",") if part)
+        unique = "" if int(cast(int, non_unique)) else "UNIQUE "
+        found.append(
+            SchemaObject(
+                ObjectKind.INDEX,
+                index[0],
+                index[2],
+                f"CREATE {unique}INDEX {q(index[2])} ON {q(index[0])}.{q(index[1])} ({listed})",
+                table=index[1],
+                details={"columns": [part for part in _text(names).split(",") if part]},
+            )
+        )
+    for schema, name, definition in rows["views"]:
+        found.append(
+            SchemaObject(
+                ObjectKind.VIEW,
+                _text(schema),
+                _text(name),
+                f"CREATE VIEW {q(_text(schema))}.{q(_text(name))} AS {_text(definition)}",
+            )
+        )
+    for schema, routine, kind in rows["routines"]:
+        found.append(
+            SchemaObject(
+                ObjectKind.FUNCTION,
+                _text(schema),
+                _text(routine),
+                details={"procedure": _text(kind) == "PROCEDURE"},
+            )
+        )
+    for schema, table, name, timing, event, statement in rows["triggers"]:
+        found.append(
+            SchemaObject(
+                ObjectKind.TRIGGER,
+                _text(schema),
+                _text(name),
+                f"CREATE TRIGGER {q(_text(name))} {_text(timing)} {_text(event)} ON "
+                f"{q(_text(schema))}.{q(_text(table))} FOR EACH ROW {_text(statement)}",
+                table=_text(table),
+            )
+        )
+    return tuple(found)
+
+
+def _text(value: object) -> str:
+    """A catalog value as text: the driver hands some back as bytes."""
+    if value is None:
+        return ""
+    return value.decode() if isinstance(value, bytes) else str(value)

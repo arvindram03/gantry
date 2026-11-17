@@ -47,6 +47,9 @@ from gantry.sql.materialization import (
 from gantry.sql.output import InlineRows
 from gantry.sql.policy import SQLPolicy
 from gantry.sql.schema import Column, DatabaseSchema, Table
+from gantry.sql.schema_change import SCHEMA_CHANGE
+from gantry.sql.snapshot import Column as SnapshotColumn
+from gantry.sql.snapshot import ObjectKind, SchemaObject, SchemaSnapshot
 from gantry.sql.target import SQLTarget
 
 
@@ -96,8 +99,7 @@ class _Connection(Protocol):
 
     async def execute(self, query: str) -> str: ...
 
-
-    async def fetch(self, query: str) -> Sequence[Sequence[object]]: ...
+    async def fetch(self, query: str, *args: object) -> Sequence[Sequence[object]]: ...
 
     async def prepare(self, query: str) -> _PreparedStatement: ...
 
@@ -131,6 +133,8 @@ class PostgresAdapter:
             affected_row_limit=True,
             returning=True,
             row_loads=True,
+            schema_snapshot=True,
+            schema_changes=True,
             query_metrics=True,
             create_table_as=True,
             create_view_as=True,
@@ -172,6 +176,25 @@ class PostgresAdapter:
             schemas=tuple(dict.fromkeys(table.schema for table in tables if table.schema)),
             tables=tables,
         )
+
+    async def snapshot(self, schemas: Sequence[str]) -> SchemaSnapshot:
+        """Every object in `schemas`, with PostgreSQL's own definition of each.
+
+        Read in one read-only transaction, so the objects are of one moment.
+        Objects an extension created are left to the extension: it makes them
+        again when it is created.
+        """
+        wanted = list(schemas)
+        connection = await self._open()
+        try:
+            async with connection.transaction(readonly=True):
+                rows = {
+                    name: await connection.fetch(query, *([wanted] if "$1" in query else []))
+                    for name, query in _SNAPSHOT_QUERIES.items()
+                }
+        finally:
+            await connection.close()
+        return SchemaSnapshot("postgres", tuple(wanted), _snapshot_objects(rows, wanted))
 
     async def inspect_table(
         self,
@@ -280,6 +303,9 @@ class PostgresAdapter:
             if load is not None:
                 # Parsed and resolved, types and all, without running it.
                 await connection.prepare(_load_statement(load))
+            elif context.metadata.get(SCHEMA_CHANGE) is True:
+                # Schema changes are transactional here: run it, roll it back.
+                await self._dry_run(connection, sql, policy)
             elif _explainable(sql):
                 async with connection.transaction(readonly=policy.read_only):
                     await self._set_timeout(connection, policy)
@@ -744,3 +770,303 @@ def _apply_transaction_pooling(provider: str, url: str, config: dict[str, object
         # An unparseable port is the connect call's problem to report, not this
         # helper's to guess about.
         return
+
+
+# ------------------------------------------------------------------ snapshot
+#
+# One query per kind of object, each taking the schemas as $1. Every
+# definition comes from PostgreSQL's own pg_get_*def functions, so what is
+# created elsewhere is what PostgreSQL itself would write.
+
+#: Objects an extension owns: made again by `CREATE EXTENSION`, not by us.
+_NOT_FROM_EXTENSION = (
+    "NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid = {oid} AND d.deptype = 'e')"
+)
+
+_SNAPSHOT_QUERIES: dict[str, str] = {
+    "extensions": (
+        "SELECT e.extname, n.nspname FROM pg_extension e "
+        "JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname <> 'plpgsql' "
+        "ORDER BY e.extname"
+    ),
+    "enums": (
+        "SELECT n.nspname, t.typname, array_agg(e.enumlabel ORDER BY e.enumsortorder) "
+        "FROM pg_type t JOIN pg_enum e ON e.enumtypid = t.oid "
+        "JOIN pg_namespace n ON n.oid = t.typnamespace "
+        "WHERE n.nspname = ANY($1) AND "
+        + _NOT_FROM_EXTENSION.format(oid="t.oid")
+        + " GROUP BY n.nspname, t.typname ORDER BY 1, 2"
+    ),
+    "sequences": (
+        "SELECT n.nspname, c.relname, s.seqtypid::regtype::text, s.seqstart, s.seqincrement, "
+        "s.seqmin, s.seqmax, s.seqcycle, owner.relname, owner_col.attname, "
+        "EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid = c.oid AND d.deptype = 'i') "
+        "FROM pg_sequence s JOIN pg_class c ON c.oid = s.seqrelid "
+        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "LEFT JOIN pg_depend dep ON dep.objid = c.oid AND dep.deptype IN ('a', 'i') "
+        "AND dep.refobjsubid > 0 "
+        "LEFT JOIN pg_class owner ON owner.oid = dep.refobjid "
+        "LEFT JOIN pg_attribute owner_col ON owner_col.attrelid = dep.refobjid "
+        "AND owner_col.attnum = dep.refobjsubid "
+        "WHERE n.nspname = ANY($1) AND "
+        + _NOT_FROM_EXTENSION.format(oid="c.oid")
+        + " ORDER BY 1, 2"
+    ),
+    "tables": (
+        "SELECT n.nspname, c.relname, c.relrowsecurity, c.relforcerowsecurity "
+        "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE c.relkind IN ('r', 'p') AND n.nspname = ANY($1) AND "
+        + _NOT_FROM_EXTENSION.format(oid="c.oid")
+        + " ORDER BY 1, 2"
+    ),
+    "columns": (
+        "SELECT n.nspname, c.relname, a.attname, format_type(a.atttypid, a.atttypmod), "
+        "a.attnotnull, pg_get_expr(ad.adbin, ad.adrelid), a.attidentity, a.attgenerated "
+        "FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
+        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum "
+        "WHERE c.relkind IN ('r', 'p') AND n.nspname = ANY($1) AND a.attnum > 0 "
+        "AND NOT a.attisdropped ORDER BY 1, 2, a.attnum"
+    ),
+    "constraints": (
+        "SELECT n.nspname, c.relname, k.conname, k.contype, pg_get_constraintdef(k.oid, true), "
+        "rn.nspname, rc.relname "
+        "FROM pg_constraint k JOIN pg_class c ON c.oid = k.conrelid "
+        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "LEFT JOIN pg_class rc ON rc.oid = k.confrelid "
+        "LEFT JOIN pg_namespace rn ON rn.oid = rc.relnamespace "
+        "WHERE n.nspname = ANY($1) AND k.contype IN ('p', 'u', 'c', 'f', 'x') "
+        "ORDER BY 1, 2, k.contype, 3"
+    ),
+    "indexes": (
+        "SELECT n.nspname, t.relname, i.relname, pg_get_indexdef(x.indexrelid) "
+        "FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid "
+        "JOIN pg_class t ON t.oid = x.indrelid JOIN pg_namespace n ON n.oid = t.relnamespace "
+        "WHERE n.nspname = ANY($1) AND t.relkind IN ('r', 'p', 'm') "
+        "AND NOT EXISTS (SELECT 1 FROM pg_constraint k WHERE k.conindid = x.indexrelid) "
+        "ORDER BY 1, 2, 3"
+    ),
+    "views": (
+        "SELECT n.nspname, c.relname, c.relkind, pg_get_viewdef(c.oid, true) "
+        "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE c.relkind IN ('v', 'm') AND n.nspname = ANY($1) AND "
+        + _NOT_FROM_EXTENSION.format(oid="c.oid")
+        + " ORDER BY c.oid"
+    ),
+    "functions": (
+        "SELECT n.nspname, p.proname, pg_get_function_identity_arguments(p.oid), "
+        "pg_get_functiondef(p.oid), l.lanname, p.prokind "
+        "FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+        "JOIN pg_language l ON l.oid = p.prolang "
+        "WHERE n.nspname = ANY($1) AND p.prokind IN ('f', 'p') AND "
+        + _NOT_FROM_EXTENSION.format(oid="p.oid")
+        + " ORDER BY p.oid"
+    ),
+    "triggers": (
+        "SELECT n.nspname, c.relname, t.tgname, pg_get_triggerdef(t.oid, true) "
+        "FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid "
+        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE NOT t.tgisinternal AND n.nspname = ANY($1) ORDER BY 1, 2, 3"
+    ),
+    "policies": (
+        "SELECT schemaname, tablename, policyname, permissive, roles::text[], cmd, qual, "
+        "with_check FROM pg_policies WHERE schemaname = ANY($1) ORDER BY 1, 2, 3"
+    ),
+}
+
+
+def _snapshot_objects(
+    rows: Mapping[str, Sequence[Sequence[object]]], schemas: Sequence[str]
+) -> tuple[SchemaObject, ...]:
+    """The catalog's rows as objects, in the order a schema is built."""
+    q = _quoted
+    found: list[SchemaObject] = []
+    for name, home in rows["extensions"]:
+        found.append(
+            SchemaObject(
+                ObjectKind.EXTENSION,
+                str(home),
+                str(name),
+                f"CREATE EXTENSION IF NOT EXISTS {q(str(name))}",
+                details={"schema": str(home)},
+            )
+        )
+    for namespace in schemas:
+        found.append(
+            SchemaObject(
+                ObjectKind.SCHEMA,
+                namespace,
+                namespace,
+                f"CREATE SCHEMA IF NOT EXISTS {q(namespace)}",
+            )
+        )
+    for schema, name, labels in rows["enums"]:
+        values = ", ".join(_literal(str(label)) for label in cast(Sequence[object], labels))
+        found.append(
+            SchemaObject(
+                ObjectKind.ENUM,
+                str(schema),
+                str(name),
+                f"CREATE TYPE {q(str(schema))}.{q(str(name))} AS ENUM ({values})",
+                details={"labels": [str(label) for label in cast(Sequence[object], labels)]},
+            )
+        )
+    for (
+        schema,
+        name,
+        kind,
+        start,
+        increment,
+        low,
+        high,
+        cycle,
+        owner,
+        owner_column,
+        identity,
+    ) in rows["sequences"]:
+        if identity:
+            # An identity column's sequence is the column's: made with it.
+            continue
+        found.append(
+            SchemaObject(
+                ObjectKind.SEQUENCE,
+                str(schema),
+                str(name),
+                f"CREATE SEQUENCE {q(str(schema))}.{q(str(name))} AS {kind} "
+                f"INCREMENT BY {increment} MINVALUE {low} MAXVALUE {high} START WITH {start}"
+                + (" CYCLE" if cycle else ""),
+                details={
+                    "owned_by": None if owner is None else f"{schema}.{owner}.{owner_column}",
+                },
+            )
+        )
+    columns: dict[tuple[str, str], list[SnapshotColumn]] = {}
+    for schema, table, column, kind, not_null, default, identity, generated in rows["columns"]:
+        columns.setdefault((str(schema), str(table)), []).append(
+            SnapshotColumn(
+                name=str(column),
+                data_type=str(kind),
+                nullable=not not_null,
+                default=None if default is None or _char(generated) == "s" else str(default),
+                identity={"a": "always", "d": "by default"}.get(_char(identity)),
+                generated=str(default) if _char(generated) == "s" and default is not None else None,
+            )
+        )
+    for schema, name, security, forced in rows["tables"]:
+        listed = tuple(columns.get((str(schema), str(name)), ()))
+        found.append(
+            SchemaObject(
+                ObjectKind.TABLE,
+                str(schema),
+                str(name),
+                f"CREATE TABLE {q(str(schema))}.{q(str(name))} ("
+                + ", ".join(_column_definition(column) for column in listed)
+                + ")",
+                columns=listed,
+                details={"row_security": bool(security), "force_row_security": bool(forced)},
+            )
+        )
+    for schema, name, language, definition, kind in (
+        (row[0], row[1], row[4], row[3], row[5]) for row in rows["functions"]
+    ):
+        found.append(
+            SchemaObject(
+                ObjectKind.FUNCTION,
+                str(schema),
+                str(name),
+                str(definition),
+                details={"language": str(language), "procedure": _char(kind) == "p"},
+            )
+        )
+    for schema, table, name, kind, definition, ref_schema, ref_table in rows["constraints"]:
+        found.append(
+            SchemaObject(
+                ObjectKind.CONSTRAINT,
+                str(schema),
+                str(name),
+                f"ALTER TABLE {q(str(schema))}.{q(str(table))} ADD CONSTRAINT {q(str(name))} "
+                f"{definition}",
+                table=str(table),
+                details={
+                    "type": {
+                        "p": "primary key",
+                        "u": "unique",
+                        "c": "check",
+                        "f": "foreign key",
+                    }.get(_char(kind), "exclusion"),
+                    "references": None if ref_table is None else f"{ref_schema}.{ref_table}",
+                },
+            )
+        )
+    for schema, table, name, definition in rows["indexes"]:
+        found.append(
+            SchemaObject(
+                ObjectKind.INDEX, str(schema), str(name), str(definition), table=str(table)
+            )
+        )
+    for schema, name, kind, definition in rows["views"]:
+        materialized = _char(kind) == "m"
+        body = str(definition).strip().rstrip(";")
+        found.append(
+            SchemaObject(
+                ObjectKind.MATERIALIZED_VIEW if materialized else ObjectKind.VIEW,
+                str(schema),
+                str(name),
+                f"CREATE {'MATERIALIZED VIEW' if materialized else 'VIEW'} "
+                f"{q(str(schema))}.{q(str(name))} AS {body}",
+            )
+        )
+    for schema, table, name, definition in rows["triggers"]:
+        found.append(
+            SchemaObject(
+                ObjectKind.TRIGGER, str(schema), str(name), str(definition), table=str(table)
+            )
+        )
+    for schema, table, name, permissive, roles, command, using, with_check in rows["policies"]:
+        clauses = [
+            f"CREATE POLICY {q(str(name))} ON {q(str(schema))}.{q(str(table))}",
+            f"AS {str(permissive).upper()}",
+            f"FOR {str(command).upper()}",
+            "TO " + ", ".join(str(role) for role in cast(Sequence[object], roles or ["public"])),
+        ]
+        if using is not None:
+            clauses.append(f"USING ({using})")
+        if with_check is not None:
+            clauses.append(f"WITH CHECK ({with_check})")
+        found.append(
+            SchemaObject(
+                ObjectKind.POLICY,
+                str(schema),
+                str(name),
+                " ".join(clauses),
+                table=str(table),
+                details={"roles": [str(role) for role in cast(Sequence[object], roles or [])]},
+            )
+        )
+    return tuple(found)
+
+
+def _column_definition(column: SnapshotColumn) -> str:
+    """One column as `CREATE TABLE` writes it: constraints are added on their own."""
+    parts = [_quoted(column.name), column.data_type]
+    if column.generated is not None:
+        parts.append(f"GENERATED ALWAYS AS ({column.generated}) STORED")
+    elif column.identity is not None:
+        parts.append(f"GENERATED {column.identity.upper()} AS IDENTITY")
+    elif column.default is not None:
+        parts.append(f"DEFAULT {column.default}")
+    if not column.nullable:
+        parts.append("NOT NULL")
+    return " ".join(parts)
+
+
+def _char(value: object) -> str:
+    """A catalog `"char"` column, which the driver hands back as bytes; NUL is empty."""
+    if value is None:
+        return ""
+    text = value.decode() if isinstance(value, bytes) else str(value)
+    return text.strip("\x00")
+
+
+def _literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"

@@ -37,6 +37,25 @@ time, with a ceiling on how many rows it may change.
     cannot do that refuses the operation — see `affected_row_limit` in the
     [capability matrix](capabilities.md).
 
+## Schemas
+
+Reading every object in some schemas, and creating them again a governed step
+at a time. See [Schema changes](../sql.md#schema-changes).
+
+::: gantry.sql.SchemaSnapshot
+
+::: gantry.sql.SchemaObject
+
+::: gantry.sql.SnapshotColumn
+
+::: gantry.sql.ObjectKind
+
+::: gantry.sql.SQLSchemaChange
+
+::: gantry.sql.SchemaStep
+
+::: gantry.sql.SchemaChangePolicy
+
 ## Materialization
 
 Create-only: one `CREATE TABLE AS` or `CREATE VIEW AS`, to a schema-qualified

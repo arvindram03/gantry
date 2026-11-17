@@ -35,6 +35,10 @@ class SQLCapabilities:
     """Writes can say `RETURNING`, so a dry run can show the rows it would change."""
     row_loads: bool = False
     """Rows passed in as values can be inserted as parameters (`SQLWrite.insert_rows`)."""
+    schema_snapshot: bool = False
+    """Every object in some schemas can be read, with how to create it (`snapshot`)."""
+    schema_changes: bool = False
+    """Schema objects can be created and changed in a transaction (`schema_change`)."""
     cost_estimate: bool = False
     cost_limit: bool = False
     bytes_scanned: bool = False

@@ -118,6 +118,38 @@ def materialize(
     )
 
 
+def schema(
+    *,
+    destinations: Sequence[str],
+    name: str | None = None,
+    require_confirmation: bool = False,
+    confirmation_code: ConfirmationReasonCode | str | None = None,
+    confirmation_message: str | None = None,
+    actors: Sequence[str] | None = None,
+    engines: Sequence[str] | None = None,
+    environments: Sequence[str] | None = None,
+    constraints: Mapping[str, float] | None = None,
+) -> PolicyRule:
+    """Allow schema changes (tables, indexes, views, functions, triggers…) in `destinations`.
+
+    A destination names the object changed, `schema.name`; a pattern like
+    `app.*` allows every object in a schema.
+    """
+    return _allow(
+        OperationKind.SCHEMA,
+        name=name,
+        require_confirmation=require_confirmation,
+        confirmation_code=confirmation_code,
+        confirmation_message=confirmation_message,
+        actors=actors,
+        engines=engines,
+        sources=None,
+        destinations=destinations,
+        environments=environments,
+        constraints=constraints,
+    )
+
+
 def batch(
     *,
     destinations: Sequence[str],
@@ -176,4 +208,4 @@ def stream(
     )
 
 
-__all__ = ["batch", "materialize", "query", "stream"]
+__all__ = ["batch", "materialize", "query", "schema", "stream", "write"]

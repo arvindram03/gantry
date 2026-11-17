@@ -39,6 +39,7 @@ from gantry.sql.resultset import (
     unsupported_for_query,
 )
 from gantry.sql.schema import DatabaseSchema, Table
+from gantry.sql.snapshot import SchemaSnapshot
 from gantry.sql.target import SQLTarget
 from gantry.store import MemoryExecutionStore
 from gantry.target import ExecutionTarget
@@ -49,6 +50,7 @@ if TYPE_CHECKING:
     from gantry.sql.capabilities import SQLCapabilities
     from gantry.sql.materialization import SQLMaterializer, TableRef
     from gantry.sql.query import SQLQuery
+    from gantry.sql.schema_change import SQLSchemaChange
     from gantry.sql.write import SQLWrite
     from gantry.verify import MaterializationCheck
 
@@ -415,6 +417,36 @@ class SQLConnection:
                     ),
                 )
             await asyncio.sleep(poll_interval_seconds)
+
+    async def snapshot(self, schemas: Sequence[str]) -> SchemaSnapshot:
+        """Every object in `schemas`, with how the engine would create each.
+
+        Structure only, never rows. See `gantry.sql.snapshot`.
+        """
+        if not schemas:
+            raise ValueError("name the schemas to read")
+        if not self._adapter.capabilities().schema_snapshot:
+            raise NotImplementedError(f"{self.provider} cannot read a whole schema yet")
+        snapshot: SchemaSnapshot = await self._adapter.snapshot(list(schemas))  # type: ignore[attr-defined]
+        return snapshot
+
+    def schema_change(
+        self,
+        *,
+        schemas: Sequence[str],
+        extensions: Sequence[str] = (),
+        timeout: float = 60,
+    ) -> SQLSchemaChange:
+        """Configure governed schema changes in `schemas`. See `gantry.sql.schema_change`.
+
+        `extensions` names the extensions that may be created; none by default.
+        """
+        from gantry.sql.schema_change import SchemaChangePolicy, SQLSchemaChange
+
+        return SQLSchemaChange(
+            self,
+            SchemaChangePolicy(schemas=schemas, extensions=extensions, timeout_seconds=timeout),
+        )
 
     def write(
         self,

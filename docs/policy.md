@@ -125,6 +125,20 @@ A rule that bounds something the operation did not bound cannot apply: nothing
 would hold the ceiling, so the request is denied with `CONSTRAINT_EXCEEDED`.
 Trusted constraints compose toward less authority, never more.
 
+### Schema changes
+
+Creating or changing a table, index, view, function, trigger or row-level
+security policy is its own operation, `schema`, so a rule that allows writes does
+not allow it:
+
+```python
+gantry.allow.schema(destinations=["app.*"], actors=["service:migration:*"])
+gantry.deny.schema(destinations=["billing.*"])
+```
+
+A destination names the object changed as `schema.table` (or `schema.name`), and
+an extension as `extension:<name>`. See [Schema changes](sql.md#schema-changes).
+
 ## Asking before it happens
 
 Some operations are allowed and still deserve a question first. A rule can say so

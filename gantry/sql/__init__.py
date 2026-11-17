@@ -27,6 +27,9 @@ from gantry.sql.query import SQLQuery
 from gantry.sql.registry import providers, register, register_dialect, register_provider
 from gantry.sql.result import SQLResult
 from gantry.sql.schema import Column, DatabaseSchema, Table
+from gantry.sql.schema_change import SchemaChangePolicy, SchemaStep, SQLSchemaChange
+from gantry.sql.snapshot import Column as SnapshotColumn
+from gantry.sql.snapshot import ObjectKind, SchemaObject, SchemaSnapshot
 from gantry.sql.target import SQLTarget
 from gantry.sql.write import SQLWrite, WritePolicy
 
@@ -47,6 +50,7 @@ __all__ = [
     "MaterializationProposal",
     "MaterializationResult",
     "MySQLDialect",
+    "ObjectKind",
     "ParsedSQL",
     "SQLAdapter",
     "SQLCapabilities",
@@ -59,8 +63,14 @@ __all__ = [
     "SQLPolicy",
     "SQLQuery",
     "SQLResult",
+    "SQLSchemaChange",
     "SQLTarget",
     "SQLWrite",
+    "SchemaChangePolicy",
+    "SchemaObject",
+    "SchemaSnapshot",
+    "SchemaStep",
+    "SnapshotColumn",
     "Table",
     "TableRef",
     "WritePolicy",
