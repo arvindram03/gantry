@@ -3,6 +3,44 @@
 Notable changes. Dates are release dates; the format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.8.0 — 2026-11-16
+
+### Added
+
+- **Read a whole schema.** `SQLConnection.snapshot(schemas)` returns every
+  object in the schemas named (extensions, enums, sequences and the column that
+  owns each, tables with their columns, defaults, identity and generated
+  columns, constraints, indexes, views, materialized views, functions, triggers,
+  and row-level security with its policies), each with the engine's own
+  definition. Structure only, never rows. On PostgreSQL a schema read and built
+  again in an empty database reads back the same.
+- **Governed schema changes.** `SQLConnection.schema_change(schemas=[...])`
+  applies one `SchemaStep` at a time, decided on the object it names as the new
+  `OperationKind.SCHEMA`, with `gantry.allow.schema(...)` and
+  `gantry.deny.schema(...)`. The statement must be one schema statement whose
+  every named table lies within the schemas allowed; extensions must be allowed
+  by name. Each step is a run, validated by running it in a transaction that is
+  rolled back, then applied in its own. A rule that asks for confirmation
+  refuses a step, as a plan cannot wait half built.
+- The `schema_snapshot` and `schema_changes` SQL capabilities, declared by
+  PostgreSQL and MySQL. MySQL's schema changes are not transactional: each step
+  is checked first by preparing it, then applied.
+
+- **Insert rows you already have, as parameters.** `SQLWrite.insert_rows(table,
+  columns, rows)` puts rows a program holds (copied from another database, say)
+  into a table without the values ever becoming SQL: the adapter binds them as
+  parameters, so no value can change what the statement does. It is governed as
+  the `INSERT` it is (statements, destinations, denied tables, the policy), runs
+  in one transaction with at most `max_rows_affected` rows, and records the
+  statement with `?` for the values and their digest, `values_sha256`, in the
+  evidence. Table and column names must be plain identifiers and are quoted by
+  the adapter, so reserved words work. A rule that asks for confirmation refuses
+  it, since rows passed in cannot wait for a person. PostgreSQL takes another engine's
+  values where nothing is lost: a `0` or `1` into a `boolean`, and a timestamp
+  with no zone into a `timestamptz`, read as UTC.
+- The `row_loads` SQL capability, declared by PostgreSQL, MySQL and DuckDB, and
+  `gantry.sql.load` with `RowLoad` and the `ROW_LOAD` context key for adapters.
+
 ## 0.7.1 — 2026-11-14
 
 ### Fixed
