@@ -3,7 +3,10 @@
 Notable changes. Dates are release dates; the format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## 0.8.0 — 2026-11-16
+## 0.8.1 — 2026-11-17
+
+0.8.0 was tagged but never published: its release stopped on a type check in
+a test. Everything it was to carry ships here.
 
 ### Added
 
