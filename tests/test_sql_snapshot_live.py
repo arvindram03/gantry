@@ -73,7 +73,9 @@ ORDER = (
 
 
 async def _execute(url: str, *statements: str) -> None:
-    import asyncpg  # type: ignore[import-untyped]
+    import importlib
+
+    asyncpg = importlib.import_module("asyncpg")
 
     try:
         connection = await asyncpg.connect(url, timeout=5)
