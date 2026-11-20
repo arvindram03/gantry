@@ -3,6 +3,19 @@
 Notable changes. Dates are release dates; the format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.9.2 — 2026-11-20
+
+### Added
+
+- **Redaction for MongoDB.** `NoSQLConnection.query(redaction=...)` masks the
+  fields it names, nested ones by dotted path, with a `$set` the engine puts
+  in front of the agent's pipeline and of every `$lookup` into a redacted
+  collection, so no stage the agent writes can see a value. `hide` and `hash`
+  (MongoDB 7.0+). A materialization from a collection with redacted fields is
+  refused. `$set` and `$addFields` are now allowed read stages.
+- **`NoSQLConnection.describe_fields(collection)`** lists the fields a sample
+  of documents holds, nested ones as dotted paths.
+
 ## 0.9.1 — 2026-11-20
 
 ### Changed

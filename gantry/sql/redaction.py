@@ -92,13 +92,13 @@ class Redaction:
         normalized: dict[str, RedactionMode] = {}
         for pattern, mode in self.columns.items():
             parts = pattern.strip().lower().split(".")
-            if len(parts) != 3 or not all(_PART.match(part) for part in parts):
+            # schema.table.column; a document store's field may be a dotted path.
+            if len(parts) < 3 or not all(_PART.match(part) for part in parts):
                 raise ValueError(f"a redacted column is schema.table.column: {pattern!r}")
             normalized[".".join(parts)] = RedactionMode(mode)
         if RedactionMode.HASH in normalized.values() and not _KEY.match(self.key):
             raise ValueError("hashing needs a key of 16 to 128 letters, digits, - or _")
         object.__setattr__(self, "columns", normalized)
-        _parser()  # fail at configuration, not at the first query
 
     def mode_for(self, schema: str | None, table: str, column: str) -> RedactionMode | None:
         name = f"{schema or ''}.{table}.{column}".lower()
@@ -546,6 +546,7 @@ def _read_dialect(dialect: str) -> str:
 
 
 def _one_statement(sql: str, dialect: str) -> exp.Expression:
+    _parser()
     try:
         statements = [found for found in sqlglot.parse(sql, read=dialect) if found is not None]
     except Exception as error:

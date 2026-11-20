@@ -10,7 +10,11 @@ from enum import StrEnum
 
 Pipeline = Mapping[str, object] | Sequence[Mapping[str, object]]
 
-_READ_STAGES = frozenset({"$match", "$project", "$group", "$sort", "$limit", "$unwind", "$lookup"})
+#: `$set` (and its older name `$addFields`) computes fields from what the
+#: document already holds; it reads nothing new. Redaction puts its masks in one.
+_READ_STAGES = frozenset(
+    {"$match", "$project", "$group", "$sort", "$limit", "$unwind", "$lookup", "$set", "$addFields"}
+)
 _WRITE_STAGES = frozenset({"$out", "$merge"})
 _MERGE_WHEN_MATCHED = frozenset({"merge", "replace"})
 

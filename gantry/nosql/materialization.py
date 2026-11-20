@@ -27,6 +27,7 @@ from gantry.result import ResultStatus
 from gantry.runs.model import Run
 from gantry.runs.status import RunStatus
 from gantry.runtime import SubmissionError
+from gantry.sql.redaction import Redaction
 from gantry.tool import Tool
 from gantry.verifier import CheckResult, CheckSource, VerificationResult
 from gantry.verify import (
@@ -197,6 +198,7 @@ class NoSQLMaterializer:
     _connection: _MaterializerConnection
     _policy: MaterializationPolicy
     _verify: Sequence[DocumentCheck]
+    _redaction: Redaction | None
     _plans: dict[str, MaterializationPlan] = field(default_factory=dict, init=False)
     _agent_checks: dict[str, tuple[DocumentCheck, ...]] = field(default_factory=dict, init=False)
     _proposal_hashes: dict[str, str] = field(default_factory=dict, init=False)
@@ -206,7 +208,10 @@ class NoSQLMaterializer:
         connection: _MaterializerConnection,
         policy: MaterializationPolicy,
         verify: Sequence[DocumentCheck],
+        *,
+        redaction: Redaction | None = None,
     ) -> None:
+        self._redaction = redaction
         for check in verify:
             if not isinstance(check, DocumentCheck):
                 raise TypeError("verify checks must implement the DocumentCheck protocol")
@@ -437,6 +442,18 @@ class NoSQLMaterializer:
                 error.failure,
                 recorder=recorder,
             )
+
+        if self._redaction is not None:
+            from gantry.nosql.redaction import fields_for
+
+            database = self._connection.database
+            for source in (collection, *(ref.name for ref in plan.sources)):
+                if fields_for(source, database, self._redaction):
+                    message = (
+                        f"redaction: {source} has redacted fields, and a collection made from "
+                        "it would hold them"
+                    )
+                    return _refuse(message, RunStatus.POLICY_REJECTED, recorder=recorder)
 
         request = self._policy_request(collection, pipeline, plan=plan)
 

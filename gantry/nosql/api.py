@@ -24,7 +24,7 @@ from gantry.nosql.materialization import (
     NoSQLMaterializer,
 )
 from gantry.nosql.output import InlineDocuments
-from gantry.nosql.pipeline import CollectionRef, Pipeline, pipeline_text
+from gantry.nosql.pipeline import CollectionRef, Pipeline, normalize_pipeline, pipeline_text
 from gantry.nosql.policy import NoSQLPolicy
 from gantry.nosql.query import NoSQLQuery
 from gantry.nosql.registry import resolve_provider
@@ -39,6 +39,7 @@ from gantry.runs.model import OperationKind, QueryResultRef, Run
 from gantry.runs.service import gate
 from gantry.runs.status import RunStatus
 from gantry.runtime import ControlPlane
+from gantry.sql.redaction import Redaction, RedactionError
 from gantry.target import ExecutionTarget
 from gantry.verifier import CheckResult, CheckSource, VerificationResult, Verifier
 from gantry.verify import check_config, check_type, sourced_result
@@ -93,8 +94,13 @@ class NoSQLConnection:
         max_cost_usd: float | None = None,
         checks: Sequence[Verifier | DocumentCheck] = (),
         verify: Sequence[Verifier | DocumentCheck] | None = None,
+        redaction: Redaction | None = None,
     ) -> NoSQLQuery:
-        """Configure a governed query operation."""
+        """Configure a governed query operation.
+
+        `redaction` masks fields before the agent's pipeline runs: see
+        `gantry.nosql.redaction`.
+        """
 
         policy = NoSQLPolicy(
             read_only=read_only,
@@ -108,7 +114,7 @@ class NoSQLConnection:
         if verify is not None and checks:
             raise TypeError("pass trusted checks with checks= (verify= is a compatibility alias)")
         trusted = checks if verify is None else verify
-        return NoSQLQuery(self, policy, tuple(trusted))
+        return NoSQLQuery(self, policy, tuple(trusted), redaction)
 
     def materialize(
         self,
@@ -120,6 +126,7 @@ class NoSQLConnection:
         max_cost_usd: float | None = None,
         checks: Sequence[DocumentCheck] = (),
         verify: Sequence[DocumentCheck] | None = None,
+        redaction: Redaction | None = None,
     ) -> NoSQLMaterializer:
         """Configure a governed, create-only MongoDB materialization operation."""
 
@@ -133,7 +140,7 @@ class NoSQLConnection:
         if verify is not None and checks:
             raise TypeError("pass trusted checks with checks= (verify= is a compatibility alias)")
         trusted = checks if verify is None else verify
-        return NoSQLMaterializer(self, policy, tuple(trusted))
+        return NoSQLMaterializer(self, policy, tuple(trusted), redaction=redaction)
 
     async def _query(
         self,
@@ -144,6 +151,7 @@ class NoSQLConnection:
         context: Context | None = None,
         trusted_verify: Sequence[Verifier | DocumentCheck] = (),
         agent_verify: Sequence[DocumentCheck] = (),
+        redaction: Redaction | None = None,
     ) -> Run:
         """Execute a pipeline for a configured query operation, and record the run.
 
@@ -186,6 +194,7 @@ class NoSQLConnection:
                 verifiers=verifiers,
                 trusted_checks=trusted_checks,
                 agent_verify=agent_verify,
+                redaction=redaction,
             )
 
         return await gate(recorder, policy=self._policy, request=request, resume=run)
@@ -201,11 +210,36 @@ class NoSQLConnection:
         verifiers: Sequence[Verifier],
         trusted_checks: Sequence[DocumentCheck],
         agent_verify: Sequence[DocumentCheck],
+        redaction: Redaction | None = None,
     ) -> Run:
-        """Everything after admission: run the pipeline, verify, record."""
+        """Everything after admission: run the pipeline, verify, record.
+
+        With `redaction`, what runs is the pipeline with masking stages in front;
+        the record keeps the agent's, and the key is scrubbed from any error.
+        """
+        executed: Pipeline = pipeline
+        if redaction is not None:
+            from gantry.nosql.redaction import redact_pipeline
+
+            try:
+                executed, _ = redact_pipeline(
+                    collection,
+                    normalize_pipeline(pipeline),
+                    database=self.database,
+                    redaction=redaction,
+                )
+            except RedactionError as error:
+                message = f"redaction: {error}"
+                return recorder.rejected((message,), status=RunStatus.POLICY_REJECTED).with_failure(
+                    Failure(FailureKind.POLICY_REJECTED, False, message)
+                )
         raw = await self._execute_result(
-            collection, pipeline, policy=policy, context=context, verify=verifiers
+            collection, executed, policy=policy, context=context, verify=verifiers
         )
+        if redaction is not None and raw.failure is not None:
+            from gantry.sql.api import _scrubbed
+
+            raw = replace(raw, failure=_scrubbed(raw.failure, redaction))
         result = _from_engine_result(raw, policy.max_documents)
         base = _source_existing(result.verification, CheckSource.TRUSTED)
         extra = (
@@ -347,6 +381,19 @@ class NoSQLConnection:
         if not isinstance(self._adapter, DescribableAdapter):
             raise NotImplementedError(f"{self.provider} cannot list its collections")
         return await self._adapter.collections(self._target)
+
+    async def describe_fields(self, collection: str) -> tuple[str, ...]:
+        """The fields a sample of `collection` holds, nested ones as dotted paths.
+
+        For a host choosing what to redact. Read with the adapter's own sample,
+        not a governed query: like `describe`, it is about shape, and a host
+        reading it is configuring access rather than using it.
+        """
+        sample = getattr(self._adapter, "field_paths", None)
+        if sample is None:
+            raise NotImplementedError(f"{self.provider} cannot list a collection's fields")
+        paths: tuple[str, ...] = await sample(collection, self._target)
+        return paths
 
     async def _inspect_collection(
         self,

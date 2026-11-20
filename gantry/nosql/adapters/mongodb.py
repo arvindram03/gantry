@@ -78,6 +78,20 @@ class MongoAdapter:
         del target  # the database is fixed when the adapter is built
         return tuple(sorted(await self._database.list_collection_names()))
 
+    async def field_paths(self, collection: str, target: NoSQLTarget) -> tuple[str, ...]:
+        """The fields a sample of the collection holds, nested ones as dotted paths.
+
+        A document store has no list of its fields, so this is what a sample
+        shows: enough to choose fields to redact from, not a schema. A field
+        holding an array is listed as itself, not what is inside it.
+        """
+        del target
+        cursor = await self._database[collection].aggregate([{"$sample": {"size": _SAMPLE_SIZE}}])
+        found: set[str] = set()
+        for document in await cursor.to_list(length=_SAMPLE_SIZE):
+            _paths(document, "", found)
+        return tuple(sorted(found))
+
     async def inspect_collection(
         self,
         reference: CollectionRef,
@@ -242,3 +256,11 @@ def _json_safe(value: object) -> Any:
     if isinstance(value, list):
         return [_json_safe(item) for item in value]
     return value
+
+
+def _paths(document: Mapping[str, object], prefix: str, found: set[str]) -> None:
+    for key, value in document.items():
+        path = f"{prefix}{key}"
+        found.add(path)
+        if isinstance(value, Mapping):
+            _paths(value, f"{path}.", found)

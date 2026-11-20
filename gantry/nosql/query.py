@@ -12,6 +12,7 @@ from gantry.nosql.policy import NoSQLPolicy
 from gantry.nosql.verify import DocumentCheck
 from gantry.runs.model import Run
 from gantry.runs.status import RunStatus
+from gantry.sql.redaction import Redaction
 from gantry.tool import Tool
 from gantry.verifier import Verifier
 from gantry.verify import (
@@ -43,6 +44,7 @@ class NoSQLQuery:
     _connection: _QueryConnection
     _policy: NoSQLPolicy
     _verify: Sequence[Verifier | DocumentCheck]
+    _redaction: Redaction | None = None
     _agent_capabilities = frozenset({"not_empty", "document_count", "required_fields"})
 
     async def __call__(
@@ -65,6 +67,9 @@ class NoSQLQuery:
             return _refused(self._connection, error, RunStatus.VERIFICATION_CONFLICT)
         except VerificationInputError as error:
             return _refused(self._connection, error, RunStatus.POLICY_REJECTED)
+        # Passed only when set, so a connection written before redaction
+        # existed still takes the call.
+        extra = {} if self._redaction is None else {"redaction": self._redaction}
         return await self._connection._query(
             collection,
             pipeline,
@@ -72,6 +77,7 @@ class NoSQLQuery:
             context=context,
             trusted_verify=self._verify,
             agent_verify=agent_checks,  # type: ignore[arg-type]
+            **extra,
         )
 
     @property

@@ -217,6 +217,10 @@ class SQLConnection:
         if verify is not None and checks:
             raise TypeError("pass trusted checks with checks= (verify= is a compatibility alias)")
         trusted = checks if verify is None else verify
+        if redaction is not None:
+            from gantry.sql.redaction import _parser
+
+            _parser()  # fail at configuration, not at the first query
         return SQLQuery(self, configured_policy, tuple(trusted), redaction, stats_only)
 
     async def _query(
