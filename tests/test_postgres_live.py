@@ -98,6 +98,24 @@ async def test_describe_reads_a_real_information_schema(
     assert table.kind, "and its kind, which is what the broken query was reaching for"
 
 
+async def test_describe_reads_each_table_s_primary_key(
+    db: gantry.sql.SQLConnection,
+) -> None:
+    """In key order, and none for a table without one."""
+    await _raw_execute(
+        "CREATE SCHEMA IF NOT EXISTS gantry_keys",
+        "DROP TABLE IF EXISTS gantry_keys.pair, gantry_keys.loose",
+        "CREATE TABLE gantry_keys.pair (b int, a int, note text, PRIMARY KEY (b, a))",
+        "CREATE TABLE gantry_keys.loose (note text)",
+    )
+
+    schema = await db.describe()
+
+    found = {table.name: table for table in schema.tables if table.schema == "gantry_keys"}
+    assert found["pair"].primary_key == ("b", "a")
+    assert found["loose"].primary_key == ()
+
+
 async def test_a_read_only_query_returns_bounded_rows(
     db: gantry.sql.SQLConnection,
 ) -> None:

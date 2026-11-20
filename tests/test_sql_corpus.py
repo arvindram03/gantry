@@ -320,3 +320,23 @@ def test_a_select_that_is_not_a_read_says_why() -> None:
     # "DELETE is not allowed by read-only policy" already says everything.
     assert dialect.classify("SELECT 1").read_only_reason is None
     assert dialect.classify("DELETE FROM t").read_only_reason is None
+
+
+def test_a_select_reads_what_its_ctes_read_but_not_the_ctes() -> None:
+    dialect = ConservativeDialect()
+
+    used_in_a_filter = dialect.classify(
+        "WITH buyers AS (SELECT person_id FROM shop.orders) "
+        "SELECT count(*) FROM shop.people WHERE id NOT IN (SELECT person_id FROM buyers)"
+    )
+    shadowing_a_qualified_name = dialect.classify(
+        "WITH contacts AS (SELECT 1 AS id) SELECT * FROM contacts, secret.contacts"
+    )
+
+    assert {table.qualified_name for table in used_in_a_filter.tables} == {
+        "shop.orders",
+        "shop.people",
+    }
+    assert {table.qualified_name for table in shadowing_a_qualified_name.tables} == {
+        "secret.contacts"
+    }, "a schema-qualified name is the table, never the CTE"

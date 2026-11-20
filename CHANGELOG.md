@@ -3,6 +3,19 @@
 Notable changes. Dates are release dates; the format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.8.2 — 2026-11-20
+
+### Fixed
+
+- **`describe()` reads primary keys** on PostgreSQL and MySQL, in key order.
+  `Table.primary_key` was always empty there, and so was `primary_key` in
+  `describe_schema`.
+- **A SELECT's own CTEs are not tables.** A name the top-level `WITH` defines
+  was counted among what the statement reads, so a policy refused
+  `WITH x AS (...) SELECT ... WHERE id IN (SELECT ... FROM x)` for reading
+  `x`. Writes already left them out; reads now do too. What the CTE itself
+  reads is still checked, and a schema-qualified name is always the table.
+
 ## 0.8.1 — 2026-11-17
 
 0.8.0 was tagged but never published: its release stopped on a type check in

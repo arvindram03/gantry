@@ -123,6 +123,25 @@ class MySQLAdapter:
             """,
             _SYSTEM_DATABASES,
         )
+        # Each table's primary key, in key order. A view has none.
+        keyed = await self._fetch_all(
+            f"""
+            SELECT k.table_schema, k.table_name, k.column_name
+            FROM information_schema.table_constraints AS c
+            JOIN information_schema.key_column_usage AS k
+              ON k.constraint_schema = c.constraint_schema
+             AND k.constraint_name = c.constraint_name
+             AND k.table_schema = c.table_schema
+             AND k.table_name = c.table_name
+            WHERE c.constraint_type = 'PRIMARY KEY'
+              AND k.table_schema NOT IN ({placeholders})
+            ORDER BY k.table_schema, k.table_name, k.ordinal_position
+            """,
+            _SYSTEM_DATABASES,
+        )
+        keys: dict[tuple[str, str], list[str]] = {}
+        for schema, table, column in keyed:
+            keys.setdefault((str(schema), str(table)), []).append(str(column))
         grouped: dict[tuple[str, str, str], list[Column]] = {}
         for schema, table, kind, name, data_type, nullable in rows:
             key = (str(schema), str(table), str(kind).lower())
@@ -131,7 +150,14 @@ class MySQLAdapter:
             )
         tables = tuple(
             # No catalog: MySQL reports `def` for every row, which names nothing.
-            Table(name, schema, None, tuple(columns), kind=kind)
+            Table(
+                name,
+                schema,
+                None,
+                tuple(columns),
+                primary_key=tuple(keys.get((schema, name), ())),
+                kind=kind,
+            )
             for (schema, name, kind), columns in grouped.items()
         )
         return DatabaseSchema(

@@ -158,6 +158,20 @@ class PostgresAdapter:
                 ORDER BY c.table_catalog, c.table_schema, c.table_name, c.ordinal_position
                 """
             )
+            # Each table's primary key, in key order. A view has none.
+            keyed = await connection.fetch(
+                """
+                SELECT k.table_schema, k.table_name, k.column_name
+                FROM information_schema.table_constraints AS c
+                JOIN information_schema.key_column_usage AS k
+                  ON k.constraint_schema = c.constraint_schema
+                 AND k.constraint_name = c.constraint_name
+                 AND k.table_schema = c.table_schema
+                 AND k.table_name = c.table_name
+                WHERE c.constraint_type = 'PRIMARY KEY'
+                ORDER BY k.table_schema, k.table_name, k.ordinal_position
+                """
+            )
         finally:
             await connection.close()
         grouped: dict[tuple[str, str, str, str], list[Column]] = {}
@@ -167,8 +181,18 @@ class PostgresAdapter:
             grouped.setdefault(key, []).append(
                 Column(str(name), str(data_type), str(nullable).upper() == "YES")
             )
+        keys: dict[tuple[str, str], list[str]] = {}
+        for schema, table, column in keyed:
+            keys.setdefault((str(schema), str(table)), []).append(str(column))
         tables = tuple(
-            Table(name, schema, catalog, tuple(columns), kind=kind)
+            Table(
+                name,
+                schema,
+                catalog,
+                tuple(columns),
+                primary_key=tuple(keys.get((schema, name), ())),
+                kind=kind,
+            )
             for (catalog, schema, name, kind), columns in grouped.items()
         )
         return DatabaseSchema(

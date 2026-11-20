@@ -100,6 +100,7 @@ async def test_describe_reads_a_real_information_schema(db: gantry.sql.SQLConnec
     assert customers.catalog is None
     assert {column.name for column in customers.columns} == {"id", "plan", "status"}
     assert customers.kind == "base table"
+    assert customers.primary_key == ("id",), "a join is counted apart by it"
 
 
 async def test_a_governed_query_returns_bounded_rows(db: gantry.sql.SQLConnection) -> None:

@@ -261,6 +261,21 @@ class ConservativeDialect:
         if operation in _DML:
             return self._classify_write(operation, code, functions)
         tables = self.referenced_objects(statement)
+        if operation is SQLOperation.SELECT:
+            # As for a write: a name the top-level `WITH` defines is not a
+            # table, wherever the statement uses it, and what the CTE itself
+            # reads is still among `tables`. Refusing it refused every
+            # `WITH x AS (...) ... WHERE id IN (SELECT ... FROM x)`.
+            defined = _cte_names(_tokens(code))
+            tables = tuple(
+                reference
+                for reference in tables
+                if not (
+                    reference.schema is None
+                    and reference.catalog is None
+                    and reference.name.lower() in defined
+                )
+            )
         write_targets = tables[:1] if operation is SQLOperation.DDL else ()
         reason = _why_not_read_only(words, functions) if operation is SQLOperation.SELECT else None
         return SQLClassification(
