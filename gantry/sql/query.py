@@ -24,6 +24,7 @@ from gantry.verify import (
 
 if TYPE_CHECKING:
     from gantry.sql.api import SQLConnection
+    from gantry.sql.redaction import Redaction
     from gantry.verify import MaterializationCheck
 
 
@@ -34,6 +35,7 @@ class SQLQuery:
     _connection: SQLConnection = field(repr=False)
     _policy: SQLPolicy = field(repr=False)
     _verify: tuple[Verifier | MaterializationCheck, ...] = field(default=(), repr=False)
+    _redaction: Redaction | None = field(default=None, repr=False)
 
     _agent_capabilities = frozenset({"not_empty", "row_count", "required_columns", "null_rate"})
 
@@ -51,6 +53,7 @@ class SQLQuery:
             context=context,
             trusted_verify=self._verify,
             agent_verify=tuple(verify),
+            redaction=self._redaction,
         )
 
     async def resume(self, run: Run) -> Run:
@@ -67,6 +70,7 @@ class SQLQuery:
             trusted_checks=tuple(item for item in self._verify if not isinstance(item, Verifier)),
             agent_checks=(),
             agent_verify=(),
+            redaction=self._redaction,
         )
 
     def tool(

@@ -3,6 +3,21 @@
 Notable changes. Dates are release dates; the format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.9.0 — 2026-11-20
+
+### Added
+
+- **Column redaction.** `db.query(redaction=Redaction({...}, key=...))` masks
+  the columns it names at their source: each statement is rewritten before it
+  runs, every column resolved to its table through `*`, aliases, CTEs, joins
+  and subqueries, and each redacted one replaced by `[redacted]` (`hide`) or
+  a keyed token (`hash`) that still joins and counts. A statement the rewrite
+  cannot follow is refused: a whole-row reference, an unlisted table, a
+  function it does not model. Writes may set a redacted column but not read
+  one, and return it masked; a materialization that reads one is refused. The
+  key is never recorded. Needs the new `redaction` extra. See
+  [Redaction](docs/redaction.md).
+
 ## 0.8.2 — 2026-11-20
 
 ### Fixed

@@ -31,6 +31,7 @@ from gantry.sql.explain import ExplainResult
 from gantry.sql.inspection import query_request
 from gantry.sql.output import InlineRows
 from gantry.sql.policy import SQLPolicy
+from gantry.sql.redaction import Redaction, RedactionError, Rewritten, scrub
 from gantry.sql.registry import resolve_dialect, resolve_provider
 from gantry.sql.result import SQLResult
 from gantry.sql.resultset import (
@@ -182,12 +183,17 @@ class SQLConnection:
         allow_multiple_statements: bool = False,
         checks: Sequence[Verifier | MaterializationCheck] = (),
         verify: Sequence[Verifier | MaterializationCheck] | None = None,
+        redaction: Redaction | None = None,
     ) -> SQLQuery:
         """Configure a governed query operation.
 
         `checks` takes the same `gantry.verify` checks a materialization takes,
         evaluated against the rows the query returns rather than a destination,
         plus any `Verifier` that inspects the execution itself.
+
+        `redaction` masks columns at their source: see `gantry.sql.redaction`.
+        Each statement is then rewritten before it runs, and one the rewrite
+        cannot vouch for is refused.
         """
 
         from gantry.sql.query import SQLQuery
@@ -206,7 +212,7 @@ class SQLConnection:
         if verify is not None and checks:
             raise TypeError("pass trusted checks with checks= (verify= is a compatibility alias)")
         trusted = checks if verify is None else verify
-        return SQLQuery(self, configured_policy, tuple(trusted))
+        return SQLQuery(self, configured_policy, tuple(trusted), redaction)
 
     async def _query(
         self,
@@ -217,6 +223,7 @@ class SQLConnection:
         trusted_verify: Sequence[Verifier | MaterializationCheck] = (),
         agent_verify: Sequence[MaterializationCheck] = (),
         agent_capabilities: frozenset[str] = frozenset(),
+        redaction: Redaction | None = None,
     ) -> Run:
         """Execute SQL for a configured query operation, and record the run.
 
@@ -289,6 +296,7 @@ class SQLConnection:
                 trusted_checks=trusted_checks,
                 agent_checks=agent_checks_validated,
                 agent_verify=agent_verify,
+                redaction=redaction,
             )
 
         return await gate(recorder, policy=self._policy, request=request, resume=run)
@@ -304,14 +312,31 @@ class SQLConnection:
         trusted_checks: Sequence[MaterializationCheck],
         agent_checks: Sequence[MaterializationCheck],
         agent_verify: Sequence[MaterializationCheck],
+        redaction: Redaction | None = None,
     ) -> Run:
         """Everything after admission: execute, verify, decide, record.
 
         Split out so the gate can hold it back. A confirmation that parks the
         run parks exactly this, and resuming runs it unchanged — the same
         proposal against the same already-admitted run.
+
+        With `redaction`, what runs is the statement rewritten so redacted
+        columns are masked at their source. The record keeps the proposal as
+        the agent wrote it: the rewrite carries the hashing key, which is never
+        stored and never shown, and is scrubbed from any error the engine gives.
         """
-        result = await self.execute(sql, policy=policy, context=context, verify=verifiers)
+        executed = sql
+        if redaction is not None:
+            try:
+                executed = (await self._redacted(sql, redaction)).sql
+            except RedactionError as error:
+                message = f"redaction: {error}"
+                return recorder.rejected((message,), status=RunStatus.POLICY_REJECTED).with_failure(
+                    Failure(FailureKind.POLICY_REJECTED, False, message)
+                )
+        result = await self.execute(executed, policy=policy, context=context, verify=verifiers)
+        if redaction is not None and result.failure is not None:
+            result = replace(result, failure=_scrubbed(result.failure, redaction))
         if result.status is not ResultStatus.REJECTED:
             # Refused at validation means it never reached the engine: no
             # execution to record, rather than one left "RUNNING" forever.
@@ -359,6 +384,53 @@ class SQLConnection:
             else QueryResultRef(rows=len(inline.rows), inline=True, truncated=inline.truncated),
             inline=inline,
         ).with_failure(failure)
+
+    async def _redaction_reads(self, sql: str, redaction: Redaction) -> tuple[str, ...]:
+        """The redacted columns a write or materialization would read."""
+        from gantry.sql.redaction import reads_redacted
+
+        schema = await self.describe()
+        return reads_redacted(
+            sql,
+            dialect=self.dialect,
+            tables=schema.tables,
+            redaction=redaction,
+            default_schema=self._default_schema(),
+        )
+
+    async def _redaction_hidden(self, table: str, redaction: Redaction) -> tuple[str, ...]:
+        """The redacted columns of `table` (`schema.name` or `name`), to mask in returned rows."""
+        schema = await self.describe()
+        wanted_schema, _, name = table.lower().rpartition(".")
+        wanted_schema = wanted_schema or (self._default_schema() or "").lower()
+        for found in schema.tables:
+            if found.name.lower() == name and (found.schema or "").lower() == wanted_schema:
+                return tuple(redaction.masked_in(found))
+        return ()
+
+    async def _redacted(self, sql: str, redaction: Redaction) -> Rewritten:
+        """`sql` with its redacted columns masked, resolved against this connection's tables."""
+        from gantry.sql.redaction import rewrite
+
+        schema = await self.describe()
+        return rewrite(
+            sql,
+            dialect=self.dialect,
+            tables=schema.tables,
+            redaction=redaction,
+            default_schema=self._default_schema(),
+        )
+
+    def _default_schema(self) -> str | None:
+        """Where an unqualified table name is looked for, as the engine itself does."""
+        if self.provider == "mysql":
+            from gantry.sql.adapters.mysql import _connect_kwargs
+
+            database = _connect_kwargs(self._target.config).get("db")
+            return database if isinstance(database, str) else None
+        if self.provider == "duckdb":
+            return "main"
+        return "public"
 
     async def status(self, handle: ExecutionHandle) -> Execution:
         return await self._adapter.status(handle)
@@ -459,6 +531,7 @@ class SQLConnection:
         require_where: bool = True,
         max_rows: int = 100,
         timeout: float = 30,
+        redaction: Redaction | None = None,
     ) -> SQLWrite:
         """Configure a governed write: `INSERT`, `UPDATE` and `DELETE` on named tables.
 
@@ -471,6 +544,9 @@ class SQLConnection:
 
         An adapter that cannot roll a write back refuses the operation rather
         than running it unbounded.
+
+        With `redaction`, a statement may set a redacted column but not read
+        one, and what it returns shows redacted columns as `[redacted]`.
         """
 
         from gantry.sql.write import SQLWrite, WritePolicy
@@ -487,6 +563,7 @@ class SQLConnection:
                 max_rows=max_rows,
                 timeout_seconds=timeout,
             ),
+            redaction,
         )
 
     def materialize(
@@ -500,8 +577,13 @@ class SQLConnection:
         timeout: float = 300,
         checks: Sequence[MaterializationCheck] = (),
         verify: Sequence[MaterializationCheck] | None = None,
+        redaction: Redaction | None = None,
     ) -> SQLMaterializer:
-        """Configure a governed, create-only native SQL materialization operation."""
+        """Configure a governed, create-only native SQL materialization operation.
+
+        With `redaction`, a materialization that reads a redacted column is
+        refused: what it creates would hold the column, or for a view, the key.
+        """
 
         from gantry.sql.materialization import (
             MaterializationPolicy,
@@ -525,7 +607,7 @@ class SQLConnection:
             max_bytes_scanned=max_bytes_scanned,
             max_cost_usd=max_cost_usd,
         )
-        return SQLMaterializer(self, policy, trusted_checks)
+        return SQLMaterializer(self, policy, trusted_checks, redaction=redaction)
 
     async def _inspect_table(
         self,
@@ -803,4 +885,20 @@ def _from_engine_result(result: ExecutionResult, max_rows: int) -> SQLResult:
         outputs=result.outputs,
         metrics=result.metrics,
         failure=result.failure,
+    )
+
+
+def _scrubbed(failure: Failure, redaction: Redaction) -> Failure:
+    """The failure with the hashing key taken out of every word of it."""
+
+    def clean(value: object) -> object:
+        return scrub(value, redaction) if isinstance(value, str) else value
+
+    return replace(
+        failure,
+        message=scrub(failure.message, redaction),
+        native_message=None
+        if failure.native_message is None
+        else scrub(failure.native_message, redaction),
+        native={key: clean(value) for key, value in failure.native.items()},
     )

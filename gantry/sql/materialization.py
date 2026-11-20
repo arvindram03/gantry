@@ -45,6 +45,7 @@ from gantry.verify import (
 
 if TYPE_CHECKING:
     from gantry.sql.api import SQLConnection
+    from gantry.sql.redaction import Redaction
 
 
 _PLAN_METADATA = "gantry.sql.materialization.plan"
@@ -345,11 +346,14 @@ class SQLMaterializer:
         connection: SQLConnection,
         policy: MaterializationPolicy,
         verify: Sequence[MaterializationCheck],
+        *,
+        redaction: Redaction | None = None,
     ) -> None:
         if any(not isinstance(check, MaterializationCheck) for check in verify):
             raise TypeError("verify must contain materialization verification checks")
         self._connection = connection
         self._policy = policy
+        self._redaction = redaction
         self._trusted_checks = tuple(verify)
         self._plans: dict[str, MaterializationPlan] = {}
         self._proposals: dict[str, str] = {}
@@ -601,12 +605,36 @@ class SQLMaterializer:
         except (TypeError, ValueError) as error:
             return _refuse(recorder, error, RunStatus.POLICY_REJECTED)
 
+        refusal = await self._redaction_refusal(body)
+        if refusal is not None:
+            failure = Failure(FailureKind.POLICY_REJECTED, False, refusal)
+            return recorder.rejected((refusal,), status=RunStatus.POLICY_REJECTED).with_failure(
+                failure
+            )
+
         request = self._policy_request(plan)
 
         async def run() -> Run:
             return await self._execute_materialization(proposal, verify=verify, recorder=recorder)
 
         return await gate(recorder, policy=self._connection.policy, request=request, resume=run)
+
+    async def _redaction_refusal(self, sql: str) -> str | None:
+        """Why a materialization is refused for reading a redacted column, or `None`."""
+        if self._redaction is None:
+            return None
+        from gantry.sql.redaction import RedactionError
+
+        try:
+            read = await self._connection._redaction_reads(sql, self._redaction)
+        except RedactionError as error:
+            return f"redaction: {error}"
+        if not read:
+            return None
+        return (
+            f"redaction: the statement reads {', '.join(read)}, and a table made from it "
+            "would hold them; leave those columns out"
+        )
 
     async def resume(self, run: Run) -> Run:
         """Continue a confirmed run from the store. See `SQLWrite.resume`."""

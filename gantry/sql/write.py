@@ -17,7 +17,7 @@ answer is too many.
 from __future__ import annotations
 
 from collections.abc import Collection, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from fnmatch import fnmatchcase
 from hashlib import sha256
 from typing import TYPE_CHECKING
@@ -41,6 +41,7 @@ from gantry.tool import Tool
 
 if TYPE_CHECKING:
     from gantry.sql.api import SQLConnection
+    from gantry.sql.redaction import Redaction
 
 #: The statements a write operation can be configured to allow, by the word a
 #: person would use for them.
@@ -133,6 +134,7 @@ class SQLWrite:
 
     _connection: SQLConnection = field(repr=False)
     _policy: WritePolicy = field(repr=False)
+    _redaction: Redaction | None = field(default=None, repr=False)
 
     async def __call__(self, sql: str, *, context: Context | None = None) -> Run:
         """Run one governed write, and record the run.
@@ -158,6 +160,9 @@ class SQLWrite:
         refusal = self._refusal(classification)
         if refusal is not None:
             return _refuse(recorder, *refusal)
+        redacted = await self._redaction_refusal(sql)
+        if redacted is not None:
+            return _refuse(recorder, FailureKind.POLICY_REJECTED, redacted)
 
         request = write_request(
             classification, provider=connection.provider, policy=self._policy.bounds()
@@ -302,6 +307,9 @@ class SQLWrite:
         answer["would_change"] = None
         if answer["allowed"] is False:
             return answer
+        redacted = await self._redaction_refusal(sql)
+        if redacted is not None:
+            return {**answer, "allowed": False, "reasons": [redacted]}
         bounds = self._policy.bounds()
         metadata: dict[str, object] = {DRY_RUN: True}
         run_sql = sql
@@ -335,9 +343,41 @@ class SQLWrite:
             answer["previewed"] = shown is not None
             if shown is not None:
                 answer["columns"] = list(shown.columns)
-                answer["rows"] = [list(row) for row in shown.rows]
+                answer["rows"] = await self._masked(sql, shown)
                 answer["preview_truncated"] = shown.truncated
         return answer
+
+    async def _redaction_refusal(self, sql: str) -> str | None:
+        """Why a write is refused for reading a redacted column, or `None`."""
+        if self._redaction is None:
+            return None
+        from gantry.sql.redaction import RedactionError
+
+        try:
+            read = await self._connection._redaction_reads(sql, self._redaction)
+        except RedactionError as error:
+            return f"redaction: {error}"
+        if read:
+            return (
+                f"redaction: the statement reads {', '.join(read)}; a write may set a "
+                "redacted column but not read one"
+            )
+        return None
+
+    async def _masked(self, sql: str, shown: InlineRows) -> list[list[object]]:
+        """Returned rows with the written table's redacted columns as `[redacted]`."""
+        rows = [list(row) for row in shown.rows]
+        if self._redaction is None:
+            return rows
+        from gantry.sql.redaction import mask_rows
+
+        targets = self._connection._dialect.classify(sql).write_targets
+        hidden: list[str] = []
+        for target in targets:
+            hidden.extend(
+                await self._connection._redaction_hidden(target.qualified_name, self._redaction)
+            )
+        return mask_rows(shown.columns, rows, hidden)
 
     def _returning(self, sql: str) -> str | None:
         """The statement as a dry run should run it to see its rows, or `None` if it cannot.
@@ -588,6 +628,10 @@ class SQLWrite:
 
         inline = _returned(result, self._policy.max_rows)
         target = classification.write_targets[0]
+        if inline is not None and self._redaction is not None:
+            inline = replace(
+                inline, rows=tuple(tuple(row) for row in await self._masked(sql, inline))
+            )
         recorder.verifying()
         return recorder.decided(
             verification=None,
