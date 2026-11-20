@@ -429,6 +429,19 @@ class SQLConnection:
             keys = primary_keys(checked.sources, listed.tables, self._default_schema())
         return guard(checked, self.dialect, keys)
 
+    async def _redacted_write(self, sql: str, redaction: Redaction) -> Rewritten:
+        """A write matching each redacted column it filters on by the column's mask."""
+        from gantry.sql.redaction import rewrite_write
+
+        schema = await self.describe()
+        return rewrite_write(
+            sql,
+            dialect=self.dialect,
+            tables=schema.tables,
+            redaction=redaction,
+            default_schema=self._default_schema(),
+        )
+
     async def _redaction_reads(self, sql: str, redaction: Redaction) -> tuple[str, ...]:
         """The redacted columns a write or materialization would read."""
         from gantry.sql.redaction import reads_redacted

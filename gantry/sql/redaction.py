@@ -341,6 +341,159 @@ def reads_redacted(
     return tuple(found)
 
 
+def rewrite_write(
+    sql: str,
+    *,
+    dialect: str,
+    tables: Sequence[Table],
+    redaction: Redaction,
+    default_schema: str | None,
+) -> Rewritten:
+    """A write with each redacted column it filters on masked, or a refusal.
+
+    A write finds its rows the way a query does: `WHERE email = 'h_3f9a...'`
+    compares the column's mask with the token the agent was shown, so it
+    changes exactly the rows it saw under that token, in this call or any
+    later one, and the value itself never leaves the database. Without the key
+    a token cannot be made for a guess, so this is no way to test a value.
+
+    Refused instead: a redacted value that would be copied (a SET value, what
+    an INSERT ... SELECT inserts, an explicit RETURNING), which would land
+    where it is not redacted; and a filter on a hidden column, which has no
+    token to match.
+    """
+    read = _read_dialect(dialect)
+    tree = _one_statement(sql, read)
+    if not isinstance(tree, exp.Update | exp.Delete | exp.Insert):
+        raise RedactionError("only INSERT, UPDATE and DELETE are written here")
+    _refuse_unmodelled(tree)
+    known = _known(tables)
+    _listed_only(tree, known, default_schema)
+    types = {
+        ((table.schema or "").lower(), table.name.lower(), column.name.lower()): column.type
+        for table in tables
+        for column in table.columns
+    }
+    try:
+        qualified = qualify(
+            tree,
+            schema=_schema_of(tables),
+            db=default_schema,
+            dialect=read,
+            quote_identifiers=False,
+        )
+    except Exception as error:
+        raise RedactionError(
+            f"the statement's columns could not be resolved: {_short(error)}"
+        ) from error
+    for whole in qualified.find_all(exp.TableColumn):
+        raise RedactionError(f"{whole.sql(read)} reads a whole row; name its columns")
+
+    targets = _set_targets(qualified)
+    copied = _copied_parts(qualified)
+    top = _top_level_tables(qualified, known, default_schema)
+    in_scope: dict[int, tuple[str, str]] = {}
+    for scope in traverse_scope(qualified):
+        for column in scope.columns:
+            source = _source_of(scope, column.table) if column.table else None
+            if isinstance(source, exp.Table):
+                schema, _ = _table_of(source, known, default_schema)
+                in_scope[id(column)] = (schema, source.name)
+
+    masked: dict[str, None] = {}
+    replacements: list[tuple[exp.Column, exp.Expression]] = []
+    for column in list(qualified.find_all(exp.Column)):
+        if id(column) in targets:
+            continue
+        owner = in_scope.get(id(column)) or _resolve_top(column, top)
+        if owner is None:
+            continue  # a CTE's or derived table's column: masked at its source above
+        schema, table = owner
+        mode = redaction.mode_for(schema, table, column.name)
+        if mode is None:
+            continue
+        name = f"{schema}.{table}.{column.name}"
+        if any(ancestor in copied for ancestor in _ancestors(column)):
+            raise RedactionError(
+                f"the statement copies {name}, which is redacted; a write may set it, "
+                "or find rows by it, but not copy it"
+            )
+        if mode is RedactionMode.HIDE:
+            raise RedactionError(
+                f"{name} is hidden, so there is no value to find rows by; use the row's id"
+            )
+        masked[name] = None
+        kind = types.get((schema.lower(), table.lower(), column.name.lower()))
+        replacements.append((column, _mask(column, mode, read, redaction.key, kind)))
+    for column, mask in replacements:
+        column.replace(mask)
+    return Rewritten(sql=qualified.sql(dialect=read), masked=tuple(masked))
+
+
+def _copied_parts(tree: exp.Expression) -> set[int]:
+    """The ids of the parts of a write whose values are written or returned."""
+    parts: set[int] = set()
+    if isinstance(tree, exp.Update):
+        for assignment in tree.expressions:
+            if isinstance(assignment, exp.EQ):
+                parts.add(id(assignment.expression))
+    if isinstance(tree, exp.Insert):
+        source = tree.expression
+        if isinstance(source, exp.Select):
+            parts.update(id(projection) for projection in source.expressions)
+        elif source is not None:
+            parts.add(id(source))
+    returning = tree.args.get("returning")
+    if returning is not None:
+        parts.add(id(returning))
+    return parts
+
+
+def _ancestors(node: exp.Expression) -> list[int]:
+    found = []
+    current: Any = node
+    while current is not None:
+        found.append(id(current))
+        current = current.parent
+    return found
+
+
+def _top_level_tables(
+    tree: exp.Expression,
+    known: Mapping[tuple[str, str], tuple[str, list[str]]],
+    default_schema: str | None,
+) -> dict[str, tuple[str, str, list[str]]]:
+    """The tables the write itself names, outside any subquery, by alias."""
+    found: dict[str, tuple[str, str, list[str]]] = {}
+    for source in tree.find_all(exp.Table):
+        if source.find_ancestor(exp.Select) is not None:
+            continue
+        if not isinstance(source.this, exp.Identifier):
+            continue
+        schema, columns = _table_of(source, known, default_schema, strict=False)
+        found[source.alias_or_name.lower()] = (schema, source.name, columns)
+    return found
+
+
+def _resolve_top(
+    column: exp.Column, top: Mapping[str, tuple[str, str, list[str]]]
+) -> tuple[str, str] | None:
+    """Which of the write's own tables a column outside any subquery belongs to."""
+    if column.find_ancestor(exp.Select) is not None:
+        return None
+    if column.table:
+        held = top.get(column.table.lower())
+        return None if held is None else (held[0], held[1])
+    having = [
+        (schema, name)
+        for schema, name, columns in top.values()
+        if column.name.lower() in {item.lower() for item in columns}
+    ]
+    if len(having) > 1:
+        raise RedactionError(f"{column.name} is in more than one table here; qualify it")
+    return having[0] if having else None
+
+
 def _set_targets(tree: exp.Expression) -> set[int]:
     """The columns a write assigns to, which it does not read."""
     targets: set[int] = set()
@@ -472,5 +625,6 @@ __all__ = [
     "mask_rows",
     "reads_redacted",
     "rewrite",
+    "rewrite_write",
     "scrub",
 ]

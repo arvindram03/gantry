@@ -59,10 +59,25 @@ Anything the rewrite cannot follow is refused, not guessed at:
 
 ## Writes and materializations
 
-A write may set a redacted column (`SET email = 'new@example.com'`) but not
-read one: `SET notes = email` would copy it out, and `WHERE email = ...`
-would test it. Rows it returns, and the rows of a `dry_run` preview, show the
-written table's redacted columns as `[redacted]`.
+A write finds rows by the token a query showed. An agent that read
+`h_3f9a0c41b7e2d815` for someone's email can, in that call or any later one:
+
+```sql
+UPDATE public.users SET plan = 'pro' WHERE email = 'h_3f9a0c41b7e2d815'
+UPDATE public.users SET email = 'new@example.com' WHERE email = 'h_3f9a0c41b7e2d815'
+```
+
+The WHERE is rewritten as a query's is, so the column's mask is compared
+with the token inside the database and the value never comes out. A real
+value in its place matches nothing, and without the key a token cannot be
+made for a guess. A token belongs to the value: once the email changes, the
+person has a new one.
+
+Refused: copying a redacted value anywhere it would not be redacted (a SET
+value, what an `INSERT ... SELECT` inserts, an explicit `RETURNING email`),
+and finding rows by a hidden column, which has no token; use the row's id.
+Rows a write returns, and the rows of a `dry_run` preview, show the written
+table's redacted columns as `[redacted]`.
 
 A materialization that reads a redacted column is refused. What it created
 would hold the column, or for a view, the key.

@@ -37,6 +37,7 @@ from gantry.sql.load import ROW_LOAD, RowLoad
 from gantry.sql.load import problem as load_problem
 from gantry.sql.output import InlineRows
 from gantry.sql.policy import SQLPolicy
+from gantry.sql.redaction import scrub
 from gantry.tool import Tool
 
 if TYPE_CHECKING:
@@ -318,13 +319,19 @@ class SQLWrite:
             run_sql = returning
             metadata[DRY_RUN_PREVIEW] = preview
         result = await self._connection.execute(
-            run_sql, policy=bounds, context=Context(metadata=metadata)
+            await self._as_run(run_sql), policy=bounds, context=Context(metadata=metadata)
         )
         if result.status is not ResultStatus.ACCEPTED:
             failure = result.failure
             return {
                 **answer,
-                "error": failure.message if failure is not None else "the dry run failed",
+                "error": (
+                    "the dry run failed"
+                    if failure is None
+                    else failure.message
+                    if self._redaction is None
+                    else scrub(failure.message, self._redaction)
+                ),
             }
         counted = result.metrics.rows_written
         answer = {
@@ -348,21 +355,26 @@ class SQLWrite:
         return answer
 
     async def _redaction_refusal(self, sql: str) -> str | None:
-        """Why a write is refused for reading a redacted column, or `None`."""
+        """Why a write is refused under redaction, or `None` if it can run."""
         if self._redaction is None:
             return None
         from gantry.sql.redaction import RedactionError
 
         try:
-            read = await self._connection._redaction_reads(sql, self._redaction)
+            await self._connection._redacted_write(sql, self._redaction)
         except RedactionError as error:
             return f"redaction: {error}"
-        if read:
-            return (
-                f"redaction: the statement reads {', '.join(read)}; a write may set a "
-                "redacted column but not read one"
-            )
         return None
+
+    async def _as_run(self, sql: str) -> str:
+        """What actually runs: with redaction, the statement matching by each column's mask.
+
+        Made again each time it runs, a resumed run included, and never
+        recorded: it holds the hashing key.
+        """
+        if self._redaction is None:
+            return sql
+        return (await self._connection._redacted_write(sql, self._redaction)).sql
 
     async def _masked(self, sql: str, shown: InlineRows) -> list[list[object]]:
         """Returned rows with the written table's redacted columns as `[redacted]`."""
@@ -590,7 +602,20 @@ class SQLWrite:
         """
         connection = self._connection
         bounds = self._policy.bounds()
-        result = await connection.execute(sql, policy=bounds, context=context)
+        executed = sql
+        if expected is None and self._redaction is not None:
+            # Rows passed in as values read nothing, and their parameters stay as written.
+            from gantry.sql.redaction import RedactionError
+
+            try:
+                executed = await self._as_run(sql)
+            except RedactionError as error:
+                return _refuse(recorder, FailureKind.POLICY_REJECTED, f"redaction: {error}")
+        result = await connection.execute(executed, policy=bounds, context=context)
+        if self._redaction is not None and result.failure is not None:
+            from gantry.sql.api import _scrubbed
+
+            result = replace(result, failure=_scrubbed(result.failure, self._redaction))
         if result.status is ResultStatus.REJECTED:
             # Refused at validation: a bound the adapter cannot enforce, or the
             # engine rejecting the statement before running it. Nothing ran, so

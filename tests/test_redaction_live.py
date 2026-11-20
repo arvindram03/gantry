@@ -190,7 +190,40 @@ async def test_the_key_never_reaches_a_run_even_in_an_error() -> None:
     assert gantry.runs.get(failed.id) is not None
 
 
-async def test_a_write_may_set_a_redacted_column_but_not_read_one() -> None:
+async def test_a_write_finds_rows_by_the_token_a_query_showed() -> None:
+    db = await _pg()
+    redaction = _redaction("redact_demo")
+    query = db.query(schemas=["redact_demo"], redaction=redaction)
+    write = db.write(destinations=["redact_demo.*"], sources=["redact_demo.*"], redaction=redaction)
+
+    # One call reads; a later, separate one writes with what it was shown.
+    [shown] = _rows(await query("SELECT email FROM redact_demo.people WHERE id = 1"))
+    token = shown["email"]
+    upgraded = await write(f"UPDATE redact_demo.people SET plan = 'team' WHERE email = '{token}'")
+    renamed = await write(
+        f"UPDATE redact_demo.people SET email = 'ada@new.example' WHERE email = '{token}' "
+        "AND id = 3 RETURNING *"
+    )
+    guessed = await write("UPDATE redact_demo.people SET plan = 'x' WHERE email = 'bo@example.com'")
+    plans = _rows(
+        await db.query(schemas=["redact_demo"])(
+            "SELECT id, plan FROM redact_demo.people ORDER BY id"
+        )
+    )
+
+    assert upgraded.status is RunStatus.ACCEPTED, upgraded.failure
+    assert upgraded.rows_affected == 2, "ada is in two rows"
+    assert renamed.status is RunStatus.ACCEPTED, renamed.failure
+    assert renamed.rows_affected == 1
+    returned = dict(zip(renamed.columns, renamed.rows[0], strict=True))
+    assert returned["email"] == HIDDEN and returned["salary"] == HIDDEN
+    assert guessed.rows_affected == 0, "a value is not a token"
+    assert [row["plan"] for row in plans] == ["team", "free", "team", "pro"]
+    for run in (upgraded, renamed, guessed):
+        assert _leaks(run) == []
+
+
+async def test_a_write_may_not_copy_a_redacted_value_or_match_a_hidden_one() -> None:
     db = await _pg()
     write = db.write(
         destinations=["redact_demo.*"],
@@ -198,22 +231,23 @@ async def test_a_write_may_set_a_redacted_column_but_not_read_one() -> None:
         redaction=_redaction("redact_demo"),
     )
 
-    changed = await write(
-        "UPDATE redact_demo.people SET email = 'new@example.com' WHERE id = 2 RETURNING *"
-    )
-    copied = await write("UPDATE redact_demo.people SET plan = email WHERE id = 1")
-    tested = await write("DELETE FROM redact_demo.people WHERE email = 'ada@example.com'")
+    for sql, said in [
+        ("UPDATE redact_demo.people SET plan = email WHERE id = 1", "copies"),
+        (
+            "UPDATE redact_demo.people SET plan = (SELECT email FROM redact_demo.people "
+            "WHERE id = 2) WHERE id = 1",
+            "copies",
+        ),
+        ("UPDATE redact_demo.people SET plan = 'x' WHERE id = 1 RETURNING email", "copies"),
+        ("UPDATE redact_demo.people SET plan = 'x' WHERE salary > 100000", "use the row's id"),
+    ]:
+        run = await write(sql)
+        assert run.status is RunStatus.POLICY_REJECTED, (sql, run.status)
+        assert run.failure is not None and said in run.failure.message, (sql, run.failure)
+
     preview = await write.dry_run(
         "UPDATE redact_demo.people SET plan = 'team' WHERE id = 4", preview=5
     )
-
-    assert changed.status is RunStatus.ACCEPTED, changed.failure
-    returned = dict(zip(changed.columns, changed.rows[0], strict=True))
-    assert returned["email"] == HIDDEN and returned["salary"] == HIDDEN
-    assert returned["plan"] == "free"
-    for refused in (copied, tested):
-        assert refused.status is RunStatus.POLICY_REJECTED, refused.failure
-        assert refused.failure is not None and "redaction" in refused.failure.message
     assert preview["would_change"] == 1
     columns = cast("list[str]", preview["columns"])
     rows = cast("list[list[object]]", preview["rows"])
@@ -288,3 +322,10 @@ async def test_on_mysql_too() -> None:
     assert _rows(by_email) == []
     assert distinct == [{"people": len(EMAILS)}]
     assert whole.status is RunStatus.ACCEPTED and _leaks(whole) == []
+
+    write = db.write(destinations=[f"{schema}.*"], redaction=_redaction(schema))
+    token = everything[0]["email"]
+    upgraded = await write(f"UPDATE {schema}.people SET plan = 'team' WHERE email = '{token}'")
+    copied = await write(f"UPDATE {schema}.people SET plan = email WHERE id = 1")
+    assert upgraded.rows_affected == 2, upgraded.failure
+    assert copied.status is RunStatus.POLICY_REJECTED

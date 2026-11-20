@@ -3,6 +3,17 @@
 Notable changes. Dates are release dates; the format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.9.1 — 2026-11-20
+
+### Changed
+
+- **A write finds rows by a redacted column's token.** `UPDATE ... WHERE
+  email = 'h_3f9a...'` now matches the rows a query showed under that token,
+  in the same call or a later one, instead of being refused: the write's
+  WHERE and ON are rewritten with the column's mask, as a query's are.
+  Copying a redacted value (a SET value, an `INSERT ... SELECT`, an explicit
+  `RETURNING`) and matching on a hidden column are still refused.
+
 ## 0.9.0 — 2026-11-20
 
 ### Added
