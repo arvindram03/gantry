@@ -41,6 +41,7 @@ from gantry.sql.resultset import (
 )
 from gantry.sql.schema import DatabaseSchema, Table
 from gantry.sql.snapshot import SchemaSnapshot
+from gantry.sql.stats_only import StatsError, StatsOnly
 from gantry.sql.target import SQLTarget
 from gantry.store import MemoryExecutionStore
 from gantry.target import ExecutionTarget
@@ -184,6 +185,7 @@ class SQLConnection:
         checks: Sequence[Verifier | MaterializationCheck] = (),
         verify: Sequence[Verifier | MaterializationCheck] | None = None,
         redaction: Redaction | None = None,
+        stats_only: StatsOnly | None = None,
     ) -> SQLQuery:
         """Configure a governed query operation.
 
@@ -194,6 +196,9 @@ class SQLConnection:
         `redaction` masks columns at their source: see `gantry.sql.redaction`.
         Each statement is then rewritten before it runs, and one the rewrite
         cannot vouch for is refused.
+
+        `stats_only` answers only aggregates, and refuses an answer in which
+        any group came from too few records: see `gantry.sql.stats_only`.
         """
 
         from gantry.sql.query import SQLQuery
@@ -212,7 +217,7 @@ class SQLConnection:
         if verify is not None and checks:
             raise TypeError("pass trusted checks with checks= (verify= is a compatibility alias)")
         trusted = checks if verify is None else verify
-        return SQLQuery(self, configured_policy, tuple(trusted), redaction)
+        return SQLQuery(self, configured_policy, tuple(trusted), redaction, stats_only)
 
     async def _query(
         self,
@@ -224,6 +229,7 @@ class SQLConnection:
         agent_verify: Sequence[MaterializationCheck] = (),
         agent_capabilities: frozenset[str] = frozenset(),
         redaction: Redaction | None = None,
+        stats_only: StatsOnly | None = None,
     ) -> Run:
         """Execute SQL for a configured query operation, and record the run.
 
@@ -297,6 +303,7 @@ class SQLConnection:
                 agent_checks=agent_checks_validated,
                 agent_verify=agent_verify,
                 redaction=redaction,
+                stats_only=stats_only,
             )
 
         return await gate(recorder, policy=self._policy, request=request, resume=run)
@@ -313,6 +320,7 @@ class SQLConnection:
         agent_checks: Sequence[MaterializationCheck],
         agent_verify: Sequence[MaterializationCheck],
         redaction: Redaction | None = None,
+        stats_only: StatsOnly | None = None,
     ) -> Run:
         """Everything after admission: execute, verify, decide, record.
 
@@ -326,9 +334,19 @@ class SQLConnection:
         stored and never shown, and is scrubbed from any error the engine gives.
         """
         executed = sql
+        if stats_only is not None:
+            try:
+                executed = await self._stats_guarded(sql)
+            except StatsError as error:
+                message = f"stats only: {error}"
+                return recorder.rejected((message,), status=RunStatus.POLICY_REJECTED).with_failure(
+                    Failure(FailureKind.POLICY_REJECTED, False, message)
+                )
         if redaction is not None:
             try:
-                executed = (await self._redacted(sql, redaction)).sql
+                # On the guarded statement: its record counts are masked too,
+                # and a hashed key still counts each record once.
+                executed = (await self._redacted(executed, redaction)).sql
             except RedactionError as error:
                 message = f"redaction: {error}"
                 return recorder.rejected((message,), status=RunStatus.POLICY_REJECTED).with_failure(
@@ -342,6 +360,20 @@ class SQLConnection:
             # execution to record, rather than one left "RUNNING" forever.
             recorder.running(result.handle)
         inline = _find_inline(result, policy.max_rows)
+        if stats_only is not None and inline is not None:
+            from gantry.sql.stats_only import too_small, without_counts
+
+            if too_small(inline.columns, inline.rows, min_group_size=stats_only.min_group_size):
+                message = (
+                    f"stats only: the answer has a group counted from fewer than "
+                    f"{stats_only.min_group_size} records, so none of it is returned. Group "
+                    "more coarsely (a longer time bucket, fewer columns) or filter less narrowly."
+                )
+                return recorder.rejected((message,), status=RunStatus.POLICY_REJECTED).with_failure(
+                    Failure(FailureKind.POLICY_REJECTED, False, message)
+                )
+            columns, rows = without_counts(inline.columns, inline.rows)
+            inline = InlineRows(columns, rows, inline.truncated)
         base = _source_existing(result.verification, CheckSource.TRUSTED)
         verification = _merge(
             base,
@@ -384,6 +416,18 @@ class SQLConnection:
             else QueryResultRef(rows=len(inline.rows), inline=True, truncated=inline.truncated),
             inline=inline,
         ).with_failure(failure)
+
+    async def _stats_guarded(self, sql: str) -> str:
+        """`sql` checked to return only aggregates, with each group's record counts added."""
+        from gantry.sql.stats_only import check, guard, primary_keys
+
+        checked = check(sql, self.dialect)
+        keys = None
+        if len(checked.sources) > 1:
+            # A join's records are counted apart by primary key.
+            listed = await self.describe()
+            keys = primary_keys(checked.sources, listed.tables, self._default_schema())
+        return guard(checked, self.dialect, keys)
 
     async def _redaction_reads(self, sql: str, redaction: Redaction) -> tuple[str, ...]:
         """The redacted columns a write or materialization would read."""

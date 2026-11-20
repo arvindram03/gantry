@@ -54,6 +54,7 @@ nav:
       - NoSQL: nosql.md
       - Policies: policy.md
       - Redaction: redaction.md
+      - Stats only: stats-only.md
       - Confirmation: confirmation.md
       - Materialization: materialization.md
       - Flink backends: flink.md

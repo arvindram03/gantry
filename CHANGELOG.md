@@ -17,6 +17,13 @@ Notable changes. Dates are release dates; the format follows
   one, and return it masked; a materialization that reads one is refused. The
   key is never recorded. Needs the new `redaction` extra. See
   [Redaction](docs/redaction.md).
+- **Stats only.** `db.query(stats_only=StatsOnly(min_group_size=10))` answers
+  the agent's own SQL, joins and subqueries included, only when everything it
+  returns is a group key or an aggregate (`count`, `sum`, `avg`, `stddev`,
+  `variance` of plain columns). Each group is counted in distinct records of
+  every table it reads, by primary key across a join, and the whole answer is
+  refused if any group came from fewer than the minimum. See
+  [Stats only](docs/stats-only.md).
 
 ## 0.8.2 — 2026-11-20
 

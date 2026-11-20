@@ -10,11 +10,11 @@ from gantry.sql.redaction import Redaction
 
 redaction = Redaction(
     {
-        "public.users.email": "hash",   # a stable token: h_3f9a0c...
-        "*.*.phone": "hide",            # [redacted]
+        "public.users.email": "hash",  # a stable token: h_3f9a0c...
+        "*.*.phone": "hide",  # [redacted]
         "hr.staff.salary": "hide",
     },
-    key=os.environ["REDACTION_KEY"],    # 16 to 128 letters, digits, - or _
+    key=os.environ["REDACTION_KEY"],  # 16 to 128 letters, digits, - or _
 )
 
 query = db.query(schemas=["public", "hr"], redaction=redaction)
