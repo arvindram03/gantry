@@ -264,6 +264,51 @@ rolled back if it changed more, so a `DELETE` that matched 40,000 rows under a
 limit of 25 deletes none. An `UPDATE` or `DELETE` with no `WHERE` is refused
 before it runs.
 
+## Columns and rows the agent never sees
+
+Two more bounds on `db.query(...)`, both enforced here in the open engine, not in
+a hosted layer. Both need `pip install 'data-gantry[redaction]'`.
+
+**Redaction** masks columns the agent may not see, while it still reads the rows:
+
+```python
+from gantry.sql.redaction import Redaction
+
+query = db.query(
+    schemas=["public"],
+    redaction=Redaction(
+        {"public.users.email": "hash", "*.*.salary": "hide"},
+        key=os.environ["REDACTION_KEY"],
+    ),
+)
+```
+
+Each statement is rewritten before it runs. Every column is traced to its table, through
+`*`, aliases, CTEs, joins, unions and correlated subqueries, and a redacted one is replaced
+by its mask wherever it is used. So `WHERE email LIKE 'a%'`, `ORDER BY salary`,
+`length(email)` and a failed `email::int` all act on the mask, never the value. A statement
+the rewrite cannot trace is refused: a whole-row reference, a table the connection does
+not list, a function the parser does not model. `hash` returns a stable keyed token that
+still joins and counts, and a write can find rows by it. MongoDB pipelines get the same
+masks, put in front of the agent's stages. The
+[tests](https://github.com/arvindram03/gantry/blob/main/tests/test_redaction_live.py) try
+each of these against real PostgreSQL and MySQL. [Redaction](https://arvindram03.github.io/gantry/redaction/)
+
+**Stats only** answers aggregates and nothing else:
+
+```python
+from gantry.sql.stats_only import StatsOnly
+
+query = db.query(schemas=["public"], stats_only=StatsOnly(min_group_size=10))
+```
+
+The agent writes its own SQL, joins included; anything that returns a row's own value is
+refused, and an answer with any group counted from fewer than `min_group_size` distinct
+records is refused whole. It stops accidental exposure. It does not stop a determined
+differencing attack (a group, then the same group minus one person); every query is a
+recorded run so such a series can be seen.
+[Stats only](https://arvindram03.github.io/gantry/stats-only/)
+
 ## It's a library, not a proxy — your data doesn't route through it
 
 You add an import, not a service. Gantry decides whether a statement may run and

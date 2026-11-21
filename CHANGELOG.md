@@ -3,6 +3,20 @@
 Notable changes. Dates are release dates; the format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.9.3 — 2026-11-20
+
+### Changed
+
+- **Hashed tokens are HMAC-SHA256.** Redaction's `hash` was the first 16 hex
+  digits of MD5 over the key and the value; it is now HMAC-SHA256 under the
+  key, built in the database from its own SHA-256 (PostgreSQL `sha256`,
+  MySQL `SHA2`), so nothing has to be installed. Tokens change once. The
+  values derived from the key are scrubbed from errors like the key.
+- **Views are read only once reviewed.** With redaction on, a statement that
+  reads a database view is refused unless the view is named in
+  `Redaction(views=...)`: a view can show a redacted column under a name no
+  pattern matches.
+
 ## 0.9.2 — 2026-11-20
 
 ### Added

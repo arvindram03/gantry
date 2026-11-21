@@ -88,6 +88,10 @@ async def _pg() -> gantry.sql.SQLConnection:
         await raw.execute(
             "CREATE TABLE redact_demo.orders (id int PRIMARY KEY, person_id int, total int)"
         )
+        await raw.execute(
+            "CREATE VIEW redact_demo.contacts AS "
+            "SELECT id, email AS contact FROM redact_demo.people"
+        )
         await raw.executemany("INSERT INTO redact_demo.people VALUES ($1, $2, $3, $4)", PEOPLE)
         await raw.executemany(
             "INSERT INTO redact_demo.orders VALUES ($1, $2, $3)",
@@ -277,6 +281,44 @@ async def test_a_materialization_that_reads_a_redacted_column_is_refused() -> No
     assert allowed.status is RunStatus.ACCEPTED, allowed.failure
 
 
+async def test_a_view_is_read_only_once_someone_has_reviewed_it() -> None:
+    db = await _pg()
+    unreviewed = db.query(schemas=["redact_demo"], redaction=_redaction("redact_demo"))
+    reviewed = db.query(
+        schemas=["redact_demo"],
+        redaction=Redaction(
+            {"redact_demo.people.email": "hash", "redact_demo.contacts.contact": "hash"},
+            key=KEY,
+            views=("redact_demo.contacts",),
+        ),
+    )
+
+    # The view shows email as `contact`, a column the people pattern does not name.
+    refused = await unreviewed("SELECT contact FROM redact_demo.contacts")
+    joined = await unreviewed(
+        "SELECT count(*) FROM redact_demo.people p JOIN redact_demo.contacts c ON c.id = p.id"
+    )
+    allowed = _rows(await reviewed("SELECT contact FROM redact_demo.contacts ORDER BY id"))
+
+    for run in (refused, joined):
+        assert run.status is RunStatus.POLICY_REJECTED, run.failure
+        assert run.failure is not None and "is a view" in run.failure.message
+    assert all(TOKEN.match(str(row["contact"])) for row in allowed)
+
+
+async def test_a_hashed_token_is_hmac_sha256_of_the_value() -> None:
+    import hashlib
+    import hmac
+
+    db = await _pg()
+    query = db.query(schemas=["redact_demo"], redaction=_redaction("redact_demo"))
+
+    [row] = _rows(await query("SELECT email FROM redact_demo.people WHERE id = 1"))
+
+    expected = hmac.new(KEY.encode(), b"ada@example.com", hashlib.sha256).hexdigest()[:16]
+    assert row["email"] == f"h_{expected}"
+
+
 # ------------------------------------------------------------------ MySQL
 
 
@@ -322,6 +364,11 @@ async def test_on_mysql_too() -> None:
     assert _rows(by_email) == []
     assert distinct == [{"people": len(EMAILS)}]
     assert whole.status is RunStatus.ACCEPTED and _leaks(whole) == []
+    import hashlib
+    import hmac
+
+    expected = hmac.new(KEY.encode(), b"ada@example.com", hashlib.sha256).hexdigest()[:16]
+    assert everything[0]["email"] == f"h_{expected}", "the same token as PostgreSQL gives"
 
     write = db.write(destinations=[f"{schema}.*"], redaction=_redaction(schema))
     token = everything[0]["email"]

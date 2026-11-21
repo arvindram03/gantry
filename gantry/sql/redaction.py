@@ -43,6 +43,7 @@ brings the parser.
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -83,10 +84,15 @@ class Redaction:
     `columns` maps `schema.table.column` patterns, with `*` and `?`
     wildcards, to a mode. Matching ignores case. `key` keys `hash` and is
     required when any column is hashed: 16 to 128 letters, digits, `-` or `_`.
+
+    `views` names the database views (`schema.view`, patterns allowed) someone
+    has reviewed. Any other view is refused: a view can show a redacted column
+    under another name, and its own column would not be masked.
     """
 
     columns: Mapping[str, RedactionMode | str]
     key: str = field(default="", repr=False)
+    views: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         normalized: dict[str, RedactionMode] = {}
@@ -98,7 +104,15 @@ class Redaction:
             normalized[".".join(parts)] = RedactionMode(mode)
         if RedactionMode.HASH in normalized.values() and not _KEY.match(self.key):
             raise ValueError("hashing needs a key of 16 to 128 letters, digits, - or _")
+        object.__setattr__(
+            self, "views", tuple(view.strip().lower() for view in self.views if view.strip())
+        )
         object.__setattr__(self, "columns", normalized)
+
+    def reviewed(self, schema: str | None, view: str) -> bool:
+        """Whether a host has looked at this view and allowed it to be read."""
+        name = f"{schema or ''}.{view}".lower()
+        return any(fnmatch.fnmatchcase(name, pattern) for pattern in self.views)
 
     def mode_for(self, schema: str | None, table: str, column: str) -> RedactionMode | None:
         name = f"{schema or ''}.{table}.{column}".lower()
@@ -144,7 +158,7 @@ def rewrite(
     _refuse_unmodelled(tree)
 
     known = _known(tables)
-    _listed_only(tree, known, default_schema)
+    _listed_only(tree, known, default_schema, tables=tables, redaction=redaction)
     types = {
         ((table.schema or "").lower(), table.name.lower(), column.name.lower()): column.type
         for table in tables
@@ -241,11 +255,33 @@ def _mask(
         if _is_output(column) or isinstance(column.parent, exp.Alias):
             return exp.Literal.string(HIDDEN)
         return _null(dialect, kind)
+    inner, outer = hmac_pads(key)
+    # HMAC-SHA256 built from each engine's own SHA-256, so nothing has to be
+    # installed: SHA256(key^opad || SHA256(key^ipad || value)), the first 16
+    # hex digits. The pads stand in for the key and are scrubbed like it.
     if dialect == "mysql":
-        template = f"CONCAT('h_', LEFT(MD5(CONCAT('{key}', {target})), 16))"
+        template = (
+            f"CONCAT('h_', LEFT(SHA2(CONCAT(UNHEX('{outer}'), UNHEX(SHA2(CONCAT("
+            f"UNHEX('{inner}'), {target}), 256))), 256), 16))"
+        )
     else:
-        template = f"('h_' || LEFT(MD5('{key}' || CAST({target} AS TEXT)), 16))"
+        template = (
+            f"('h_' || LEFT(ENCODE(SHA256(DECODE('{outer}', 'hex') || SHA256(DECODE("
+            f"'{inner}', 'hex') || CONVERT_TO(CAST({target} AS TEXT), 'UTF8'))), 'hex'), 16))"
+        )
     return cast("exp.Expression", sqlglot.parse_one(template, read=dialect))
+
+
+def hmac_pads(key: str) -> tuple[str, str]:
+    """The key XORed with HMAC's inner and outer pads, as hex, for SHA-256's 64-byte block."""
+    raw = key.encode()
+    if len(raw) > 64:
+        raw = hashlib.sha256(raw).digest()
+    raw = raw.ljust(64, b"\0")
+    return (
+        bytes(byte ^ 0x36 for byte in raw).hex(),
+        bytes(byte ^ 0x5C for byte in raw).hex(),
+    )
 
 
 def _null(dialect: str, kind: str | None) -> exp.Expression:
@@ -303,6 +339,7 @@ def reads_redacted(
         if not isinstance(source.this, exp.Identifier):
             continue
         schema, columns = _table_of(source, known, default_schema, strict=False)
+        _refuse_unreviewed_view(schema, source.name, tables, redaction)
         modes = {
             name: mode
             for name in columns
@@ -368,7 +405,7 @@ def rewrite_write(
         raise RedactionError("only INSERT, UPDATE and DELETE are written here")
     _refuse_unmodelled(tree)
     known = _known(tables)
-    _listed_only(tree, known, default_schema)
+    _listed_only(tree, known, default_schema, tables=tables, redaction=redaction)
     types = {
         ((table.schema or "").lower(), table.name.lower(), column.name.lower()): column.type
         for table in tables
@@ -524,8 +561,12 @@ def mask_rows(
 
 
 def scrub(message: str, redaction: Redaction) -> str:
-    """An error as the agent may see it: the key never appears in one."""
-    return message.replace(redaction.key, "[key]") if redaction.key else message
+    """An error as the agent may see it: neither the key nor what stands in for it."""
+    if not redaction.key:
+        return message
+    for secret in (redaction.key, *hmac_pads(redaction.key)):
+        message = message.replace(secret, "[key]").replace(secret.upper(), "[key]")
+    return message
 
 
 # ------------------------------------------------------------------ helpers
@@ -567,15 +608,38 @@ def _listed_only(
     tree: exp.Expression,
     known: Mapping[tuple[str, str], tuple[str, list[str]]],
     default_schema: str | None,
+    *,
+    tables: Sequence[Table] = (),
+    redaction: Redaction | None = None,
 ) -> None:
-    """Refuse a table the connection does not list, such as a system catalogue."""
+    """Refuse a table the connection does not list, and a view nobody has reviewed."""
     ctes = {cte.alias_or_name.lower() for cte in tree.find_all(exp.CTE)}
     for source in tree.find_all(exp.Table):
         if not isinstance(source.this, exp.Identifier):
             raise RedactionError(f"{source.sql()} is not a table redaction can follow")
         if not source.db and source.name.lower() in ctes:
             continue
-        _table_of(source, known, default_schema)
+        schema, _ = _table_of(source, known, default_schema)
+        if redaction is not None:
+            _refuse_unreviewed_view(schema, source.name, tables, redaction)
+
+
+def _refuse_unreviewed_view(
+    schema: str, name: str, tables: Sequence[Table], redaction: Redaction
+) -> None:
+    kind = next(
+        (
+            table.kind
+            for table in tables
+            if (table.schema or "").lower() == schema.lower() and table.name.lower() == name.lower()
+        ),
+        "",
+    )
+    if "view" in kind.lower() and not redaction.reviewed(schema, name):
+        raise RedactionError(
+            f"{schema}.{name} is a view, which can show a redacted column under another name; "
+            "it is read only once someone has reviewed it"
+        )
 
 
 def _known(tables: Sequence[Table]) -> dict[tuple[str, str], tuple[str, list[str]]]:

@@ -31,9 +31,12 @@ Install the parser it needs with `pip install 'data-gantry[redaction]'`.
 | `hide` | `[redacted]` where it is returned; NULL inside the statement | nothing on that column |
 | `hash` | `h_` and 16 hex digits, keyed with `key` | joins, `count(DISTINCT ...)`, `GROUP BY` |
 
+A token is HMAC-SHA256 of the value under `key`, its first 16 hex digits,
+computed in the database with its own SHA-256 so nothing has to be installed.
 The same value always gives the same token, and without the key a guess
 cannot be hashed to check it. Use `hash` for identifiers. On a column with
-few distinct values, a plan or a zip code, a token is as good as the value.
+few distinct values (a plan, a zip code, a birth date), a token tells as much
+as the value: hide it instead.
 
 ## Masked at the source
 
@@ -111,9 +114,22 @@ what a sample of documents holds, to choose from.
 
 A materialization from a collection with redacted fields is refused.
 
-## What it does not cover
+## Views
 
-A view in the database that exposes a redacted column under another name is
-a different column. Name it as well, or leave the view out of the schemas the
-connection reads. `SQLWrite.check`, which answers without the database,
+A view in the database can show a redacted column under another name, which
+the patterns would not match. So with redaction on, a statement that reads a
+view is refused unless the view is listed as reviewed:
+
+```python
+Redaction(
+    {"public.users.email": "hash", "public.contacts.contact": "hash"},
+    key=key,
+    views=("public.contacts",),
+)
+```
+
+Reviewing a view means naming its sensitive columns too, as above.
+
+## What it does not cover
+ `SQLWrite.check`, which answers without the database,
 does not know about redaction; the write itself and `dry_run` do.
